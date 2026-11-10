@@ -140,6 +140,9 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-rehome.ps1
 | `scripts/win-launcher.js` | 上游文件，修 `taskkill` 非零导致 relaunch 中途放弃（改为延迟复验后放行） | 中 |
 | `scripts/workbuddy-exe.json` | **本机专用**：客户端实际路径 `H:\\Program Files\\WorkBuddy\\WorkBuddy.exe`。换机器必须改 | 低 |
 | `scripts/fix-cdp.cmd` / `setup-rehome.ps1` / `stop-workdaddy.ps1` | 一次性运维脚本：修 CDP / 建 startup-route 硬链接 / 停服务。不参与常规运行 | 低 |
+| `deploy.cmd` / `deploy.ps1` | **一键部署**：定位安装目录 → 校验 12 文件 → 按时间戳备份 → 复制 → 绑 UI → 重启 daemon → 轮询 47832。上游升级后跑一次即恢复 | 低 — 幂等；改了要实测一遍再提交 |
+| `README.md` | **入门文档**（408 行），给不熟悉项目的人看：痛点 → 三步安装 → 托盘菜单 → FAQ | — |
+| `README_UPSTREAM.md` | 上游原版 README 存档，完整功能清单 | — |
 | `REHOME-README.md` | **主文档**，37 KB / 12 章，所有坑与实测都在里面 | — |
 
 **别碰**：`scripts/theme-patches.js`、`scripts/persona.js`、`scripts/growth-*.js` 等上游功能文件。
@@ -302,6 +305,15 @@ WorkDaddyTray.exe --autoon / --autooff
 
 上游发布版升级会**整目录覆盖** `%LOCALAPPDATA%\Programs\WorkDaddy\scripts`，本项目的改动会全部丢失（表现为切号不再接管、面板两个按钮变回原来的复选框）。
 
+**日常用法：双击仓库根目录的 `deploy.cmd`。** 它已经把下面的四步全部做完：定位安装目录 → 校验 12 个文件齐全 → 按时间戳备份 → 复制 → 绑面板 UI → 重启 daemon → 轮询 47832 最长 20 秒确认恢复。幂等，退出码 0 即成功。
+
+只有两种情况才需要看下面的手工步骤：
+
+- 脚本报「没找到安装目录」（WorkDaddy 装在非默认路径）→ 改用 `deploy.ps1 -TargetDir "<你的 scripts 目录>"`
+- 上游改动过大，覆盖后 daemon 起不来 → 需要手工并冲突
+
+手工方式（与 `deploy.cmd` 等价）：
+
 ```powershell
 $src='H:\AI工作区\wb账号同步\WorkDaddy\scripts'
 $dst='C:\Users\jmwan\AppData\Local\Programs\WorkDaddy\scripts'
@@ -376,7 +388,7 @@ b65367c feat(rehome): 归档与会话运行记录纳入接管，去重覆盖归�
 
 | 优先级 | 缺口 | 说明与建议 |
 | --- | --- | --- |
-| **P0** | **上游升级会冲掉全部补丁** | 升级后按 §6.4 恢复 12 个文件 + 重跑 `bind-rehome-ui.py`。建议做成一个 `restore-after-upgrade.ps1` 一键脚本（目前是手工 4 步） |
+| ~~P0~~ | ~~上游升级会冲掉全部补丁~~ | **已解决**：仓库根目录 `deploy.cmd` 一键恢复，升级后双击一次即可（见 §6.4） |
 | **P1** | `startup-route.json` 硬链接已断 | 三个 inode 各不相同（详见 §7），意味着三个账号打开的是不同会话，核心目标之一没达成。跑一次 `setup-rehome.ps1` 可恢复，之后切号会自动维持。**会以最新那份覆盖另外两个，先确认保留哪个落点** |
 | P2 | 回收站不同步 | 用户明确「删除暂时不需要」。代价：垃圾进谁的回收站取决于删除时归属；想清理得切回那个账号。要放开只需把 `WHERE` 的 `NOT_DELETED` 换成 `1`（**先确认客户端 UI 能承载 125 条**） |
 | P3 | 软删无 UI 恢复入口 | 客户端没有回收站页面。如需恢复只能 SQL 或覆盖备份库（§9） |
@@ -461,7 +473,8 @@ fsutil hardlink list "$env:USERPROFILE\.workbuddy\<uid>\startup-route.json"
 | **本文件** | 小 | **每次接手必读** |
 | `REHOME-README.md` | 37 KB / 12 章 | 需要细节时**按章节查**，别整份读。§1 原理、§7 风险、§8 CDP 故障、§11 去重、§12 托盘 |
 | `AGENTS.md` | 24 KB | 上游开发约定。只在要动上游代码时查 |
-| `README.md` / `_en` / `_ja` | 各 23–32 KB | 上游功能说明，交接**不需要**读 |
+| `README.md` | 16 KB / 408 行 | **入门版**（痛点 → 安装 → 托盘 → FAQ）。改功能或改部署流程时同步更新，这是仓库门面 |
+| `README_UPSTREAM.md` + `_en` / `_ja` | 各 23–32 KB | 上游功能说明存档，交接**不需要**读 |
 | `WorkBuddy三账号状态共享_可行性与需求规格.md` | 36 KB | 顶层目录。设计背景，**只在质疑方案时读** |
 | `WorkBuddy三账号状态共享_现成项目调研与选型推荐.md` | 52 KB | 顶层目录。选型对比，**不需要读** |
 
