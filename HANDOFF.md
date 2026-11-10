@@ -95,6 +95,30 @@ rehome-sessions.js run(newUid)
 
 `watcher` 是刻意用轮询而非 `fs.watch`：Windows 上原子替换的 watch 事件会丢。
 
+**工作区落点共享（第二条腿）**
+
+接管只管会话归属。要让三个账号「打开的是同一个会话」，还有两个文件用 **NTFS 硬链接**共享同一份内容：
+
+| 文件 | 作用 |
+| --- | --- |
+| `~/.workbuddy/<uid>/startup-route.json` | 客户端启动时打开的会话 |
+| `~/.workbuddy/user-<uid>-personal/MEMORY.md` | 用户级长期记忆 |
+
+首次建立用 `scripts/setup-rehome.ps1`（取内容最大/最新的那份当 master，其余换成硬链接，原件备份）。之后每 `fsutil hardlink list <path>` 应看到 3 条路径。
+
+客户端写这两个文件时若用「临时文件 + 原子替换」，硬链接会断。`alignStartupRoutes()` 会在每次切号后用 `fs.writeFileSync` **原地写**（保持 inode）把三个落点重新对齐 —— 但只在切号时触发，长期不切号就可能一直是断的（见 §7 实测）。
+
+检测与修复：
+
+```bash
+# 检测：三个 inode 应完全相同
+for d in /c/Users/jmwan/.workbuddy/*/; do ls -i "$d/startup-route.json" 2>/dev/null; done
+for d in /c/Users/jmwan/.workbuddy/*personal*/; do ls -i "$d/MEMORY.md" 2>/dev/null; done
+
+# 修复（会以最新的那份为准覆盖其余两个，原件自动备份）
+powershell -ExecutionPolicy Bypass -File scripts\setup-rehome.ps1
+```
+
 ---
 
 ## 4. 文件地图（改哪里）
@@ -112,6 +136,10 @@ rehome-sessions.js run(newUid)
 | `scripts/tray/*` | 托盘（C# 5 + `csc.exe`，无需 SDK） | 中 — 改 `.cs` 后必须 rebuild |
 | `tray/WorkDaddyTray.exe` | 20,992 B 预编译产物，**直接提交进仓库** | 低 |
 | `test/rehome-*.test.js` | 三组回归测试（纯临时库，不碰真实数据） | 低 |
+| `scripts/lib.js` | 上游文件，改了 2 处：① 读 `workbuddy-exe.json` 支持非 C 盘安装 ② CDP 明文兜底显示昵称 | 中 |
+| `scripts/win-launcher.js` | 上游文件，修 `taskkill` 非零导致 relaunch 中途放弃（改为延迟复验后放行） | 中 |
+| `scripts/workbuddy-exe.json` | **本机专用**：客户端实际路径 `H:\\Program Files\\WorkBuddy\\WorkBuddy.exe`。换机器必须改 | 低 |
+| `scripts/fix-cdp.cmd` / `setup-rehome.ps1` / `stop-workdaddy.ps1` | 一次性运维脚本：修 CDP / 建 startup-route 硬链接 / 停服务。不参与常规运行 | 低 |
 | `REHOME-README.md` | **主文档**，37 KB / 12 章，所有坑与实测都在里面 | — |
 
 **别碰**：`scripts/theme-patches.js`、`scripts/persona.js`、`scripts/growth-*.js` 等上游功能文件。
@@ -230,8 +258,10 @@ foreach ($p in 47832,47932) { Get-NetTCPConnection -LocalPort $p -State Listen -
 # 1) 改仓库源码
 #    H:\AI工作区\wb账号同步\WorkDaddy\scripts\...
 
-# 2) 跑回归测试（三组，纯临时库）
-$node = 'C:\Users\jmwan\.workbuddy\binaries\node\versions\22.22.2-6\node.exe'
+# 2) 跑回归测试（三组，纯临时库，不碰真实数据）
+#    node 用版本目录里最新的那个，不写死版本号
+$node = (Get-ChildItem "$env:USERPROFILE\.workbuddy\binaries\node\versions" -Directory |
+         Sort-Object Name -Descending | Select-Object -First 1).FullName + '\node.exe'
 Set-Location 'H:\AI工作区\wb账号同步\WorkDaddy'
 & $node test/rehome-sessions.test.js
 & $node test/rehome-watcher.test.js
@@ -268,6 +298,37 @@ WorkDaddyTray.exe --autoon / --autooff
 
 停止逻辑：WMI 查 `Win32_Process`，正则 `WorkDaddy\scripts\(watchdog|daemon)\.js`，先 watchdog 后 daemon、循环 4 轮压住自动重启；不会误伤 Codex / MCP 那些 `node.exe`。
 
+### 6.4 WorkDaddy 自身升级后怎么恢复（**每次升级必做**）
+
+上游发布版升级会**整目录覆盖** `%LOCALAPPDATA%\Programs\WorkDaddy\scripts`，本项目的改动会全部丢失（表现为切号不再接管、面板两个按钮变回原来的复选框）。
+
+```powershell
+$src='H:\AI工作区\wb账号同步\WorkDaddy\scripts'
+$dst='C:\Users\jmwan\AppData\Local\Programs\WorkDaddy\scripts'
+
+# 1) 恢复全部补丁文件（7 个新增 + 4 个上游修改版）
+$patched = @(
+  # 新增 —— 上游没有这些文件
+  'rehome-sessions.js','rehome-watcher.js','rehome_sessions.py',
+  'bind-rehome-ui.py','fix-cdp.cmd','setup-rehome.ps1','stop-workdaddy.ps1',
+  # 上游文件的修改版 —— 升级会覆盖成原版，必须盖回去
+  'daemon.js','inject.js','lib.js','win-launcher.js','workbuddy-exe.json'
+)
+foreach ($f in $patched) { Copy-Item "$src\$f" $dst -Force }
+
+# 2) 重新绑定 UI（inject.js 被覆盖后必须重跑，幂等）
+py "$dst\bind-rehome-ui.py"
+
+# 3) 重启 daemon
+Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'WorkDaddy[\\/]scripts[\\/]daemon\.js' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+
+# 4) 验证：dryRun 应返回 affected=0；端口 47832/47932 应恢复监听
+```
+
+`daemon.js` / `lib.js` / `win-launcher.js` / `inject.js` 是上游文件的**增量修改版**，升级后必须用仓库版覆盖 —— 只补新文件不够，否则 rehome 接入点、`/api/rehome/*` 路由、非 C 盘路径解析、taskkill 容错全都不存在。若上游改动较大导致覆盖后启动报错，用 `git diff <上游版本标签> -- scripts/daemon.js` 看冲突点手工并入。
+
+**换机器时额外要做**：改 `scripts/workbuddy-exe.json` 里的客户端路径；确认 `%USERPROFILE%\.workbuddy\binaries\node` 下有 ≥22.13 的 node（没有就改用手上的 node，托盘 `FindNode()` 会回退到 PATH）。
+
 ---
 
 ## 7. 当前数据状态（2026-11-10 20:55 快照）
@@ -281,6 +342,15 @@ WorkDaddyTray.exe --autoon / --autooff
 | 已删除 | 47 | 125 | 余 78 条属其它账号（**按约定不接管**） |
 
 **服务**：daemon PID 9496、watchdog 39068、托盘 1 个；47832 / 47932 均 LISTEN；9222 未监听（客户端当前未以调试端口启动）。
+
+**硬链接实测（21:05）**
+
+| 文件 | inode 是否一致 | 结论 |
+| --- | --- | --- |
+| `MEMORY.md` × 3 | 相同（`16044073672992589`） | 共享有效 |
+| `startup-route.json` × 3 | **各不相同** | **已断开**，三个账号各自指向不同会话 |
+
+`startup-route.json` 现状：`106cbbda` → `26964c04`（20:35，当前这个会话）、`721d1e45` → `d9682b3b`（15:58）、`a2099672` → `73041cde`（13:33）。修复命令见 §3，会以最新的 `106cbbda` 那份为准覆盖另外两个。
 
 **最近提交**
 
@@ -306,14 +376,16 @@ b65367c feat(rehome): 归档与会话运行记录纳入接管，去重覆盖归�
 
 | 优先级 | 缺口 | 说明与建议 |
 | --- | --- | --- |
-| P1 | 回收站不同步 | 用户明确「删除暂时不需要」。代价：垃圾进谁的回收站取决于删除时归属；想清理得切回那个账号。要放开只需把 `WHERE` 的 `NOT_DELETED` 换成 `1`（**先确认客户端 UI 能承载 125 条**） |
-| P2 | 软删无 UI 恢复入口 | 客户端没有回收站页面。如需恢复只能 SQL 或覆盖备份库（§9） |
-| P3 | `721d1e45` 不在 `account-display.json` | 昵称显示可能回退成 uid。下次该账号登录且 CDP 可用时会自动补写 |
-| P4 | 去重只在切号时触发 | 长期不切号会积累副本。可加定时任务，或手动 `POST /api/rehome/dedupe {"dryRun":true}` 先看 |
-| P5 | 无 CI | 测试靠手工跑三组 `node test/*.js`。上游有 `.github/`，可挂 workflow |
-| P6 | 托盘 exe 是提交的二进制 | 改 `.cs` 必须记得 rebuild 再 commit，否则仓库里的 exe 与源码不一致 |
+| **P0** | **上游升级会冲掉全部补丁** | 升级后按 §6.4 恢复 12 个文件 + 重跑 `bind-rehome-ui.py`。建议做成一个 `restore-after-upgrade.ps1` 一键脚本（目前是手工 4 步） |
+| **P1** | `startup-route.json` 硬链接已断 | 三个 inode 各不相同（详见 §7），意味着三个账号打开的是不同会话，核心目标之一没达成。跑一次 `setup-rehome.ps1` 可恢复，之后切号会自动维持。**会以最新那份覆盖另外两个，先确认保留哪个落点** |
+| P2 | 回收站不同步 | 用户明确「删除暂时不需要」。代价：垃圾进谁的回收站取决于删除时归属；想清理得切回那个账号。要放开只需把 `WHERE` 的 `NOT_DELETED` 换成 `1`（**先确认客户端 UI 能承载 125 条**） |
+| P3 | 软删无 UI 恢复入口 | 客户端没有回收站页面。如需恢复只能 SQL 或覆盖备份库（§9） |
+| P4 | `721d1e45` 不在 `account-display.json` | 昵称显示可能回退成 uid。下次该账号登录且 CDP 可用时会自动补写 |
+| P5 | 去重只在切号时触发 | 长期不切号会积累副本。可加定时任务，或手动 `POST /api/rehome/dedupe {"dryRun":true}` 先看 |
+| P6 | 无 CI | 测试靠手工跑三组 `node test/*.js`。上游有 `.github/`，可挂 workflow |
+| P7 | 托盘 exe 是提交的二进制 | 改 `.cs` 必须记得 rebuild 再 commit，否则仓库里的 exe 与源码不一致 |
 
-**若要继续做功能，优先级建议**：先把 P2 补上（一个只读的「最近软删」管理页最省事），再考虑 P1。
+**若要继续做功能，优先级建议**：先修 P1（一条命令就能验证核心目标是否达成），再把 P3 补上（一个只读的「最近软删」管理页最省事），P2 由用户决定。
 
 ---
 
@@ -350,7 +422,7 @@ Copy-Item '<备份>.db' 'C:\Users\jmwan\.workbuddy\workbuddy.db' -Force
 
 ---
 
-## 10. 开工自检（5 条命令，30 秒）
+## 10. 开工自检（6 条命令，30 秒）
 
 ```powershell
 # 1) 服务活着吗（应输出两个 True）
@@ -360,10 +432,13 @@ foreach ($p in 47832,47932) { "$p = " + [bool](Get-NetTCPConnection -LocalPort $
 Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'WorkDaddy' } | Select-Object ProcessId,CommandLine
 Get-Process WorkDaddyTray -ErrorAction SilentlyContinue
 
-# 3) 仓库与安装版是否一致（不一致 = 有人改了没同步）
+# 3) 仓库与安装版是否一致（输出任何 MISMATCH = 有人改了没同步，或上游刚升级）
 $src='H:\AI工作区\wb账号同步\WorkDaddy\scripts'; $dst='C:\Users\jmwan\AppData\Local\Programs\WorkDaddy\scripts'
-foreach ($f in 'rehome-sessions.js','rehome-watcher.js','rehome_sessions.py','inject.js','daemon.js') {
-  if ((Get-FileHash "$src\$f").Hash -ne (Get-FileHash "$dst\$f").Hash) { "MISMATCH: $f" }
+$patched = 'rehome-sessions.js','rehome-watcher.js','rehome_sessions.py','bind-rehome-ui.py','fix-cdp.cmd',
+           'setup-rehome.ps1','stop-workdaddy.ps1','daemon.js','inject.js','lib.js','win-launcher.js','workbuddy-exe.json'
+foreach ($f in $patched) {
+  if (-not (Test-Path "$dst\$f")) { "MISSING : $f" }
+  elseif ((Get-FileHash "$src\$f").Hash -ne (Get-FileHash "$dst\$f").Hash) { "MISMATCH: $f" }
 }
 
 # 4) 接管是否已全收敛（应为 0 或只有本轮预期变更）
@@ -371,6 +446,10 @@ foreach ($f in 'rehome-sessions.js','rehome-watcher.js','rehome_sessions.py','in
 
 # 5) 仓库状态
 Set-Location 'H:\AI工作区\wb账号同步\WorkDaddy'; git status --short; git log --oneline -3
+
+# 6) 落点硬链接（三个 inode 应一致；不一致 = 三账号打开不同会话，见 §3 与 §8-P1）
+#    Git Bash 下：for d in /c/Users/jmwan/.workbuddy/*/; do ls -i "$d/startup-route.json" 2>/dev/null; done
+fsutil hardlink list "$env:USERPROFILE\.workbuddy\<uid>\startup-route.json"
 ```
 
 ---
@@ -410,6 +489,7 @@ Set-Location 'H:\AI工作区\wb账号同步\WorkDaddy'; git status --short; git 
 4. 动生产库前先 dryRun，写入前会自动 VACUUM INTO 备份到 %APPDATA%\WorkDaddy\rehome-backups
 5. 改 inject.js 用 bind-rehome-ui.py，别手改 1.4 MB 文件
 6. 托盘是 C# 5 / .NET Framework 4.0，改 .cs 后必须跑 tray\build.cmd
+7. 「三账号打开同一会话」靠 startup-route.json 硬链接；当前 MEMORY.md 仍共享、startup-route 已断（见 HANDOFF §7 与 §8-P1）
 
 当前状态见 HANDOFF.md §7；已知缺口与优先级见 §8。
 本轮任务：<填>
