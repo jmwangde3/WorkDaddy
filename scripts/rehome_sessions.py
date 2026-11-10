@@ -4,7 +4,7 @@
 rehome_sessions.py — 切换 WorkBuddy 账号后，把本机会话归属原地改为当前登录账号。
 
 不复制会话、不改会话 ID、不动消息 JSONL / 工作区 / 产物。只 UPDATE sessions.user_id。
-与 workbuddy-session-sync 同口径：排除已删除、后台自动化任务、已归档会话。
+接管口径：除回收站（deleted_at 非空）外全部接管——含已归档会话与后台自动化任务运行记录。
 
 用法：
   python rehome_sessions.py                  # 干跑：只读，打印将影响的行数
@@ -40,12 +40,12 @@ DEFAULT_BACKUP_DIR = Path(os.environ.get(
     "WORKBUDDY_BACKUP_DIR", str(HOME / ".workbuddy" / "rehome-backups")
 ))
 
-# 只接管「未删除 + 非后台自动化 + 未归档」的普通会话
-WHERE = (
-    "deleted_at IS NULL "
-    "AND COALESCE(is_background_automation, 0) = 0 "
-    "AND COALESCE(status, '') <> 'archived'"
-)
+# 接管口径：除回收站（deleted_at 非空）外全部接管——含已归档会话、
+# 后台自动化任务运行记录。归档是翻历史的入口，必须跨账号可见。
+WHERE = "deleted_at IS NULL"
+
+# 去重口径：只动人工会话（含归档），跳过后台任务运行记录（真实执行历史，不是副本）。
+WHERE_DEDUPE = "deleted_at IS NULL AND COALESCE(is_background_automation, 0) = 0"
 
 
 def current_uid(auth_path: Path) -> str:

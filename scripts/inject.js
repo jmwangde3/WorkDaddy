@@ -9550,7 +9550,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '</div></div>' +
         '</div>' +
         '<div class="wbs-sess-toolbar">' +
-        '<button class="wbs-sess-auto-all" type="button" id="wbs-sess-auto-all" role="checkbox" aria-checked="false" aria-label="接管会话归属" title="切换账号时把本机会话原地改为当前账号：不复制、不改会话 ID，始终只有一份">' +
+        '<button class="wbs-sess-auto-all" type="button" id="wbs-sess-auto-all" role="checkbox" aria-checked="false" aria-label="接管会话归属" title="切换账号时把本机会话原地改为当前账号：不复制、不改会话 ID，始终只有一份。范围含活跃、已归档与定时任务运行记录；回收站不纳入，保持删除时归属">' +
         '<span class="wbs-sess-auto-all-box" aria-hidden="true"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="12" rx="2"/><path class="wbs-sess-auto-all-check" d="m4.5 8 2.2 2.2L11.5 5.5"/></svg></span>' +
         '<span class="wbs-sess-auto-all-label">接管会话归属</span>' +
         '</button>' +

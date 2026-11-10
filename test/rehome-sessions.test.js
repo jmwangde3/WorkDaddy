@@ -53,7 +53,7 @@ async function main() {
   const dry = await runner.run(A, { dryRun: true });
   assert.equal(dry.ok, true, 'dry run ok');
   assert.equal(dry.dryRun, true, 'dry run flagged');
-  assert.equal(dry.affected, 2, 'only s2 + s3 are rehomed');
+  assert.equal(dry.affected, 4, 's2 + s3 + s4(archived) + s6(automation) are rehomed, s5(deleted) is not');
   assert.equal(dry.backup, null, 'dry run makes no backup');
   const afterDry = await db.all('SELECT id, user_id FROM sessions ORDER BY id');
   assert.deepEqual(afterDry, before, 'dry run left data untouched');
@@ -61,7 +61,7 @@ async function main() {
   // real run
   const applied = await runner.run(A);
   assert.equal(applied.ok, true, 'apply ok: ' + (applied.error || ''));
-  assert.equal(applied.affected, 2, 'two rows changed');
+  assert.equal(applied.affected, 4, 'four rows changed');
   assert.ok(applied.backup && fs.existsSync(applied.backup), 'backup file created');
 
   const rows = await db.all('SELECT id, user_id FROM sessions ORDER BY id');
@@ -69,9 +69,9 @@ async function main() {
   assert.equal(byId.s1, A, 's1 keeps A');
   assert.equal(byId.s2, A, 's2 rehomed to A');
   assert.equal(byId.s3, A, 's3 rehomed to A');
-  assert.equal(byId.s4, B, 'archived row untouched');
-  assert.equal(byId.s5, B, 'deleted row untouched');
-  assert.equal(byId.s6, B, 'background automation untouched');
+  assert.equal(byId.s4, A, 'archived row is rehomed (归档也接管)');
+  assert.equal(byId.s5, B, 'deleted row untouched (回收站不接管)');
+  assert.equal(byId.s6, A, 'background automation row is rehomed (运行记录也接管)');
 
   // idempotent second run
   const second = await runner.run(A);

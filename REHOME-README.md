@@ -156,7 +156,11 @@ python 干跑：会话总数 179，接管范围 A=28 / C=26 / B=20，当前 A �
 - **备份**：每次写入前 `VACUUM INTO` 生成一致性快照到 `<DATA_DIR>/rehome-backups/`（Node 版）或 `%USERPROFILE%\.workbuddy\rehome-backups\`（Python 版）。恢复时用备份库覆盖 `workbuddy.db`（先完全退出 WorkBuddy）。
 - **失败隔离**：接管失败只记 `[rehome]` 日志，不阻断切号。
 - **硬链接断开（已自动兜底）**：`startup-route.json` 由客户端活跃时持续写入；若官方用「临时文件 + 原子替换」，硬链接会断。每次切号后 `alignStartupRoutes()` 都会用 `fs.writeFileSync` 原地写把三个账号的落点重新对齐（原地写保持 inode，硬链接不断），因此断开也会被自动修复；`setup-rehome.ps1` 只作为首次建立/手工重建手段。判定：`fsutil hardlink list` 只剩 1 条时，切一次号即恢复一致。
-- **排除项**：已归档（`status='archived'`）、已删除（`deleted_at` 非空）、后台自动化任务（`is_background_automation=1`）不接管；`automations.owner_user_id` 不跟随。
+- **接管范围**：除回收站外全部接管 —— 活跃会话、已归档（`status='archived'`）、后台自动化任务运行记录（`is_background_automation=1`）的 `user_id` 都改为当前账号；`deleted_at` 非空的回收站条目保持原归属，不接管。
+- **两层不同的「自动任务」**：定时任务**定义**（`automations.json`）由 `automation-account-sync.js` 独立维护（开关 `automation-sync.json`，UI 上的「同步定时任务」按钮）；任务**运行记录会话**（`sessions.is_background_automation=1`）走会话接管。两者互不影响。
+- **删除状态无需同步**：`deleted_at` 写在全库唯一那条记录上，是全局字段而非视图过滤。A 删除后任何账号查这条都是已删除，切号接管又只处理 `deleted_at IS NULL`，因此不会「复活」或「回弹」到别的账号。
+- **回收站不同步的代价**（已知取舍）：哪条垃圾进谁的回收站，取决于删除那一刻它的归属账号；想清理某条，得切回当时删除它的账号。恢复（清空 `deleted_at`）后它会重新进入接管范围，下次任何账号登录都会被接管走 —— 这是设计预期，不是回弹。
+- **`automations` 内的 `owner_user_id` 不跟随**（上游字段，与本地会话归属无关）。
 - **服务端上下文**：本地归属/记录齐全后，云端是否接受跨账号继续全部上下文由 WorkBuddy 决定，按第 6 节端到端验收实测。
 - **`working` 态**：会话仍在运行就切号，先让它落盘/结束。
 
@@ -332,6 +336,7 @@ POST /api/rehome/run {uid:A} -> affected=46, backup=…\workbuddy-20261110-12324
 **A. `dedupeSessions(db, dataRoot, opts)`（`rehome-sessions.js`）**
 
 - 按 `(title, cwd)` 分组，组内每条都建立 `projects/**/<id>.jsonl` 索引
+- **去重范围**：`deleted_at IS NULL AND COALESCE(is_background_automation,0)=0` —— 覆盖活跃会话与已归档，**跳过后台任务运行记录**（那是真实执行历史，不是自动复制时代产生的副本）
 - **保守模式（默认）**：只有组内存在大小完全一致的「复制对」才认定为副本链，保留 `updated_at` 最新一条，其余写 `deleted_at` 软删；大小全不同的组跳过，避免误删独立演化的内容
 - **aggressive 模式**（`{aggressive:true}`）：同组内每条都有消息文件即保留最新、软删其余，用于一次性清理已分叉的历史副本
 - 软删而非硬删，配合 `VACUUM INTO` 备份可完整回滚
@@ -366,7 +371,44 @@ aggressive：7 组 / 软删 14 条，备份 workbuddy-dedupe-20261110-130838-901
 
 侧栏刷新后每个会话只显示一份。此后任意路径切号：watcher 2 秒内接管归属 → 自动保守去重 → 落点对齐，且自动复制保持关闭，不再产生新副本。
 
-### 11.4 回滚
+### 11.4 归档纳入接管 + 归档副本清理（20:46）
+
+口径调整：接管范围从「未删除 + 非后台任务 + 未归档」放宽到 **除回收站外全部**，去重范围同步覆盖归档（仍排除后台任务运行记录）。
+
+本机一次性执行结果：
+
+```
+接管口径 = deleted_at IS NULL
+去重口径 = deleted_at IS NULL AND COALESCE(is_background_automation,0)=0
+
+affected = 37 行（721d1e45: 17 / a2099672: 20 → 106cbbda）
+dedupe   = 15 组 / 软删 29 条
+备份     = workbuddy-20261110-204649-485.db
+```
+
+去重前做了两级校验，确认不丢内容：
+
+1. 15 组组内 JSONL **字节数全部一致**（说明是复制副本；MD5 不同是因为每行内嵌的 sessionId/账号字段被替换过）
+2. 逐组比对消息 UUID 集合：保留那条 **完整包含** 其余副本的全部消息 UUID，15 组全部通过，丢失风险 0
+
+执行前后逐条比对（以备份库为基准）：
+
+```
+执行前已删除记录 101 条 → user_id / deleted_at 改动 0 条
+未删除记录归属改动 37 条
+去重新产生软删 29 条
+```
+
+执行后各分类可见性（当前账号 `106cbbda`）：
+
+| 分类 | 当前可见 | 全库 | 说明 |
+| --- | --- | --- | --- |
+| 活跃普通 | 26 | 26 | 全部可见 |
+| 已归档 | 19 | 19 | 全部可见（去重后由 48 → 19） |
+| 后台任务 | 13 | 16 | 余 3 条在回收站，按约定不接管 |
+| 回收站 | 47 | 130 | 余 83 条属其它账号，保持删除时归属 |
+
+### 11.5 回滚
 
 两份去重备份在 `%APPDATA%\WorkDaddy\rehome-backups\`。软删的记录可用 `UPDATE sessions SET deleted_at = NULL WHERE id IN (...)` 恢复（`ids` 在 `/api/rehome/dedupe` 响应里），或直接用备份库覆盖 `workbuddy.db`（先完全退出 WorkBuddy）。
 

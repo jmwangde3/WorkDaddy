@@ -8,7 +8,8 @@
  *    按 user_id 隔离时每个账号只看到自己那份，归属统一后三份会同时出现在侧栏。
  *
  * 复用 session-db.js 的 createSessionDb（node:sqlite → sqlite3 CLI 兜底）。
- * 排除口径与 workbuddy-session-sync 一致：已删除 / 后台自动化任务 / 已归档。
+ * 接管口径：除回收站外全部接管（含已归档、后台自动化任务运行记录）。
+ * 去重口径：只动人工会话（含归档），跳过后台任务运行记录，避免误删真实执行历史。
  * 每次写入前用 VACUUM INTO 生成一致性备份，写入走单事务。
  */
 const fs = require('fs');
@@ -18,7 +19,25 @@ const { createSessionDb } = require('./session-db.js');
 const CONFIG_FILE = 'rehome-sessions.json';
 const BACKUP_DIR = 'rehome-backups';
 
-const WHERE = "deleted_at IS NULL AND COALESCE(is_background_automation, 0) = 0 AND COALESCE(status, '') <> 'archived'";
+/**
+ * 接管口径：只排除回收站（deleted_at 非空）。
+ *
+ * - 已归档（status='archived'）一并接管：归档是「翻历史」的入口，必须跨账号可见，
+ *   否则 A 归档的会话在 B 的归档列表里消失。
+ * - 后台自动化任务会话（is_background_automation=1）一并接管：那是定时任务每次执行的
+ *   运行记录，跨账号共享后历史才完整。任务「定义」本身由 automation-account-sync.js
+ *   单独维护（automation-sync.json 开关），两层互不影响。
+ * - 回收站不接管（用户明确暂不需要），保持原归属。
+ */
+const WHERE = "deleted_at IS NULL";
+
+/**
+ * 去重口径：在接管口径上再排除后台自动化任务会话。
+ *
+ * 后台任务是真实执行记录（每个账号/每天各一份，内容不同），不是「自动同步会话」时代
+ * 复制出来的重复副本，不能按同名同大小当副本删掉。去重只作用于人工会话（含归档）。
+ */
+const WHERE_DEDUPE = "deleted_at IS NULL AND COALESCE(is_background_automation, 0) = 0";
 
 function envFlag(name, fallback) {
   const raw = process.env[name];
@@ -60,7 +79,7 @@ async function dedupeSessions(db, dataRoot, opts = {}) {
   const aggressive = !!opts.aggressive;
   const idx = buildJsonlIndex(path.join(String(dataRoot || ''), 'projects'));
   const rows = await db.all(
-    `SELECT id, cwd, title, created_at, updated_at FROM sessions WHERE ${WHERE} ` +
+    `SELECT id, cwd, title, created_at, updated_at FROM sessions WHERE ${WHERE_DEDUPE} ` +
     'ORDER BY cwd, title, updated_at DESC, created_at ASC'
   );
   const groups = new Map();
@@ -236,7 +255,7 @@ function createRehomeRunner(options = {}) {
     };
   }
 
-  return { run, runDedupe, status, readConfig, setEnabled, WHERE, CONFIG_FILE, BACKUP_DIR };
+  return { run, runDedupe, status, readConfig, setEnabled, WHERE, WHERE_DEDUPE, CONFIG_FILE, BACKUP_DIR };
 }
 
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -267,4 +286,4 @@ function alignStartupRoutes(dataRoot, sourceUid) {
   return { ok: errors.length === 0, written, errors };
 }
 
-module.exports = { createRehomeRunner, alignStartupRoutes, dedupeSessions, buildJsonlIndex, WHERE, CONFIG_FILE, BACKUP_DIR };
+module.exports = { createRehomeRunner, alignStartupRoutes, dedupeSessions, buildJsonlIndex, WHERE, WHERE_DEDUPE, CONFIG_FILE, BACKUP_DIR };
