@@ -156,7 +156,8 @@ python 干跑：会话总数 179，接管范围 A=28 / C=26 / B=20，当前 A �
 - **备份**：每次写入前 `VACUUM INTO` 生成一致性快照到 `<DATA_DIR>/rehome-backups/`（Node 版）或 `%USERPROFILE%\.workbuddy\rehome-backups\`（Python 版）。恢复时用备份库覆盖 `workbuddy.db`（先完全退出 WorkBuddy）。
 - **失败隔离**：接管失败只记 `[rehome]` 日志，不阻断切号。
 - **硬链接断开（已自动兜底）**：`startup-route.json` 由客户端活跃时持续写入；若官方用「临时文件 + 原子替换」，硬链接会断。每次切号后 `alignStartupRoutes()` 都会用 `fs.writeFileSync` 原地写把三个账号的落点重新对齐（原地写保持 inode，硬链接不断），因此断开也会被自动修复；`setup-rehome.ps1` 只作为首次建立/手工重建手段。判定：`fsutil hardlink list` 只剩 1 条时，切一次号即恢复一致。
-- **接管范围**：除回收站外全部接管 —— 活跃会话、已归档（`status='archived'`）、后台自动化任务运行记录（`is_background_automation=1`）的 `user_id` 都改为当前账号；`deleted_at` 非空的回收站条目保持原归属，不接管。
+- **接管范围**：除回收站外全部接管 —— 活跃会话、已归档（`status='archived'`）、后台自动化任务运行记录（`is_background_automation=1`）、云端会话（`transport='cloud'`）的 `user_id` 都改为当前账号。
+- **「未删除」有两种编码（关键）**：`local` 会话是 `deleted_at IS NULL`，`cloud` 会话是 `deleted_at = -1`。客户端原文判定为 `(transport='local' AND deleted_at IS NULL) OR (transport='cloud' AND deleted_at = -1)`。只写 `deleted_at IS NULL` 会把全部云端会话漏在接管范围外（本机实测漏 5 条）。现统一用 `NOT_DELETED = "(deleted_at IS NULL OR deleted_at = -1)"`；真删除（时间戳）依然被排除。
 - **两层不同的「自动任务」**：定时任务**定义**（`automations.json`）由 `automation-account-sync.js` 独立维护（开关 `automation-sync.json`，UI 上的「同步定时任务」按钮）；任务**运行记录会话**（`sessions.is_background_automation=1`）走会话接管。两者互不影响。
 - **删除状态无需同步**：`deleted_at` 写在全库唯一那条记录上，是全局字段而非视图过滤。A 删除后任何账号查这条都是已删除，切号接管又只处理 `deleted_at IS NULL`，因此不会「复活」或「回弹」到别的账号。
 - **回收站不同步的代价**（已知取舍）：哪条垃圾进谁的回收站，取决于删除那一刻它的归属账号；想清理某条，得切回当时删除它的账号。恢复（清空 `deleted_at`）后它会重新进入接管范围，下次任何账号登录都会被接管走 —— 这是设计预期，不是回弹。
@@ -378,12 +379,13 @@ aggressive：7 组 / 软删 14 条，备份 workbuddy-dedupe-20261110-130838-901
 本机一次性执行结果：
 
 ```
-接管口径 = deleted_at IS NULL
-去重口径 = deleted_at IS NULL AND COALESCE(is_background_automation,0)=0
+接管口径 = (deleted_at IS NULL OR deleted_at = -1)          -- local 用 NULL，cloud 用 -1
+去重口径 = 同接管口径 AND COALESCE(is_background_automation,0)=0
 
 affected = 37 行（721d1e45: 17 / a2099672: 20 → 106cbbda）
 dedupe   = 15 组 / 软删 29 条
-备份     = workbuddy-20261110-204649-485.db
+云端会话 = 5 行（见 11.5）
+备份     = workbuddy-20261110-204649-485.db / workbuddy-20261110-205105-389.db
 ```
 
 去重前做了两级校验，确认不丢内容：
@@ -399,16 +401,32 @@ dedupe   = 15 组 / 软删 29 条
 去重新产生软删 29 条
 ```
 
-执行后各分类可见性（当前账号 `106cbbda`）：
+执行后各分类可见性（当前账号 `106cbbda`，最终态）：
 
 | 分类 | 当前可见 | 全库 | 说明 |
 | --- | --- | --- | --- |
-| 活跃普通 | 26 | 26 | 全部可见 |
-| 已归档 | 19 | 19 | 全部可见（去重后由 48 → 19） |
-| 后台任务 | 13 | 16 | 余 3 条在回收站，按约定不接管 |
-| 回收站 | 47 | 130 | 余 83 条属其它账号，保持删除时归属 |
+| 未删除合计 | 58 | 58 | 全部接管，无遗漏 |
+| 活跃普通 | 31 | 31 | 含 5 条云端会话 |
+| 已归档 | 19 | 19 | 去重后由 48 → 19 |
+| 后台任务 | 11 | 16 | 未删除 11 条全接管；余 5 条在回收站 |
+| 回收站 | 47 | 125 | 余 78 条属其它账号，保持删除时归属 |
 
-### 11.5 回滚
+### 11.5 顺带修掉：云端会话整类漏接管
+
+调整口径时翻客户端 bundle（`app.asar`）的 `FROM sessions` 片段，发现「未删除」有两个编码：
+
+```sql
+-- local 会话
+AND (transport = 'local'  AND deleted_at IS NULL)
+-- cloud 会话
+AND (transport = 'cloud'  AND deleted_at = -1)
+```
+
+原 `WHERE = "deleted_at IS NULL"` 把 `transport='cloud' AND deleted_at=-1` 的会话全部排除在接管之外 —— 本机 5 条云端会话（`a2099672` 4 条、`721d1e45` 1 条）从来没被接管过，当前账号一直看不到。改用 `NOT_DELETED = "(deleted_at IS NULL OR deleted_at = -1)"` 后一次性接管 5 条，备份 `workbuddy-20261110-205105-389.db`。
+
+顺带确认客户端的删除动作：`UPDATE sessions SET deleted_at = ?, updated_at = ?, unread = 0 WHERE id = ?` —— 只按 `id` 写时间戳，不做归属校验；而列表查询 `... WHERE user_id = ? ...` 带账号过滤。所以「A 删了，B 还能看到」在当前实现下不成立：B 的列表根本取不到那行。
+
+### 11.6 回滚
 
 两份去重备份在 `%APPDATA%\WorkDaddy\rehome-backups\`。软删的记录可用 `UPDATE sessions SET deleted_at = NULL WHERE id IN (...)` 恢复（`ids` 在 `/api/rehome/dedupe` 响应里），或直接用备份库覆盖 `workbuddy.db`（先完全退出 WorkBuddy）。
 

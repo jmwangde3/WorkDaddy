@@ -42,10 +42,13 @@ DEFAULT_BACKUP_DIR = Path(os.environ.get(
 
 # 接管口径：除回收站（deleted_at 非空）外全部接管——含已归档会话、
 # 后台自动化任务运行记录。归档是翻历史的入口，必须跨账号可见。
-WHERE = "deleted_at IS NULL"
+# 「未删除」有两种编码：local 用 NULL，cloud 用 -1（客户端主动判定原文：
+# (transport='local' AND deleted_at IS NULL) OR (transport='cloud' AND deleted_at = -1)）
+NOT_DELETED = "(deleted_at IS NULL OR deleted_at = -1)"
+WHERE = NOT_DELETED
 
 # 去重口径：只动人工会话（含归档），跳过后台任务运行记录（真实执行历史，不是副本）。
-WHERE_DEDUPE = "deleted_at IS NULL AND COALESCE(is_background_automation, 0) = 0"
+WHERE_DEDUPE = NOT_DELETED + " AND COALESCE(is_background_automation, 0) = 0"
 
 
 def current_uid(auth_path: Path) -> str:

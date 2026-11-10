@@ -37,6 +37,8 @@ async function main() {
     ['s4', B, 'H:/ws/a', 'archived-B', 'archived', null, 0, 1000, 2003],
     ['s5', B, 'H:/ws/a', 'deleted-B', 'completed', 1, 0, 1000, 2004],
     ['s6', B, 'H:/ws/a', 'automation-B', 'completed', null, 1, 1000, 2005],
+    // cloud 会话用 deleted_at = -1 表示「未删除」（客户端原文：transport='cloud' AND deleted_at = -1）
+    ['s7', B, 'H:/ws/a', 'cloud-B', 'completed', -1, 0, 1000, 2006],
   ];
   for (const row of fixtures) await db.run(INSERT, row);
 
@@ -53,7 +55,7 @@ async function main() {
   const dry = await runner.run(A, { dryRun: true });
   assert.equal(dry.ok, true, 'dry run ok');
   assert.equal(dry.dryRun, true, 'dry run flagged');
-  assert.equal(dry.affected, 4, 's2 + s3 + s4(archived) + s6(automation) are rehomed, s5(deleted) is not');
+  assert.equal(dry.affected, 5, 's2/s3/s4(archived)/s6(automation)/s7(cloud,-1) are rehomed, s5(deleted) is not');
   assert.equal(dry.backup, null, 'dry run makes no backup');
   const afterDry = await db.all('SELECT id, user_id FROM sessions ORDER BY id');
   assert.deepEqual(afterDry, before, 'dry run left data untouched');
@@ -61,7 +63,7 @@ async function main() {
   // real run
   const applied = await runner.run(A);
   assert.equal(applied.ok, true, 'apply ok: ' + (applied.error || ''));
-  assert.equal(applied.affected, 4, 'four rows changed');
+  assert.equal(applied.affected, 5, 'five rows changed');
   assert.ok(applied.backup && fs.existsSync(applied.backup), 'backup file created');
 
   const rows = await db.all('SELECT id, user_id FROM sessions ORDER BY id');
@@ -72,6 +74,7 @@ async function main() {
   assert.equal(byId.s4, A, 'archived row is rehomed (归档也接管)');
   assert.equal(byId.s5, B, 'deleted row untouched (回收站不接管)');
   assert.equal(byId.s6, A, 'background automation row is rehomed (运行记录也接管)');
+  assert.equal(byId.s7, A, 'cloud row with deleted_at=-1 is rehomed (云端会话也接管)');
 
   // idempotent second run
   const second = await runner.run(A);

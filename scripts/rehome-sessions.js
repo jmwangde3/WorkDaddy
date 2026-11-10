@@ -20,7 +20,13 @@ const CONFIG_FILE = 'rehome-sessions.json';
 const BACKUP_DIR = 'rehome-backups';
 
 /**
- * 接管口径：只排除回收站（deleted_at 非空）。
+ * 接管口径：只排除回收站。
+ *
+ * 「未删除」有两种编码（客户端 app.asar 里的原文）：
+ *   - local 会话：deleted_at IS NULL
+ *   - cloud 会话：deleted_at = -1
+ * 客户端活跃判定就是 `(transport='local' AND deleted_at IS NULL) OR (transport='cloud' AND deleted_at = -1)`。
+ * 只写 `deleted_at IS NULL` 会把全部云端会话漏在接管范围外（本机实测漏了 5 条）。
  *
  * - 已归档（status='archived'）一并接管：归档是「翻历史」的入口，必须跨账号可见，
  *   否则 A 归档的会话在 B 的归档列表里消失。
@@ -29,7 +35,8 @@ const BACKUP_DIR = 'rehome-backups';
  *   单独维护（automation-sync.json 开关），两层互不影响。
  * - 回收站不接管（用户明确暂不需要），保持原归属。
  */
-const WHERE = "deleted_at IS NULL";
+const NOT_DELETED = "(deleted_at IS NULL OR deleted_at = -1)";
+const WHERE = NOT_DELETED;
 
 /**
  * 去重口径：在接管口径上再排除后台自动化任务会话。
@@ -37,7 +44,7 @@ const WHERE = "deleted_at IS NULL";
  * 后台任务是真实执行记录（每个账号/每天各一份，内容不同），不是「自动同步会话」时代
  * 复制出来的重复副本，不能按同名同大小当副本删掉。去重只作用于人工会话（含归档）。
  */
-const WHERE_DEDUPE = "deleted_at IS NULL AND COALESCE(is_background_automation, 0) = 0";
+const WHERE_DEDUPE = NOT_DELETED + " AND COALESCE(is_background_automation, 0) = 0";
 
 function envFlag(name, fallback) {
   const raw = process.env[name];
@@ -117,7 +124,7 @@ async function dedupeSessions(db, dataRoot, opts = {}) {
   for (let i = 0; i < drop.length; i += 200) {
     const chunk = drop.slice(i, i + 200);
     statements.push({
-      sql: `UPDATE sessions SET deleted_at = ? WHERE id IN (${chunk.map(() => '?').join(',')}) AND deleted_at IS NULL`,
+      sql: `UPDATE sessions SET deleted_at = ? WHERE id IN (${chunk.map(() => '?').join(',')}) AND ${NOT_DELETED}`,
       params: [now, ...chunk],
     });
   }
@@ -236,7 +243,7 @@ function createRehomeRunner(options = {}) {
       for (let i = 0; i < dupe.ids.length; i += 200) {
         const chunk = dupe.ids.slice(i, i + 200);
         statements.push({
-          sql: `UPDATE sessions SET deleted_at = ? WHERE id IN (${chunk.map(() => '?').join(',')}) AND deleted_at IS NULL`,
+          sql: `UPDATE sessions SET deleted_at = ? WHERE id IN (${chunk.map(() => '?').join(',')}) AND ${NOT_DELETED}`,
           params: [now, ...chunk],
         });
       }
@@ -255,7 +262,7 @@ function createRehomeRunner(options = {}) {
     };
   }
 
-  return { run, runDedupe, status, readConfig, setEnabled, WHERE, WHERE_DEDUPE, CONFIG_FILE, BACKUP_DIR };
+  return { run, runDedupe, status, readConfig, setEnabled, WHERE, WHERE_DEDUPE, NOT_DELETED, CONFIG_FILE, BACKUP_DIR };
 }
 
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -286,4 +293,4 @@ function alignStartupRoutes(dataRoot, sourceUid) {
   return { ok: errors.length === 0, written, errors };
 }
 
-module.exports = { createRehomeRunner, alignStartupRoutes, dedupeSessions, buildJsonlIndex, WHERE, WHERE_DEDUPE, CONFIG_FILE, BACKUP_DIR };
+module.exports = { createRehomeRunner, alignStartupRoutes, dedupeSessions, buildJsonlIndex, WHERE, WHERE_DEDUPE, NOT_DELETED, CONFIG_FILE, BACKUP_DIR };
