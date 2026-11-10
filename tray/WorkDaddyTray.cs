@@ -80,6 +80,9 @@ namespace WorkDaddyTray
         private static volatile bool s_busy;
         private static int s_autoTick;
         private static bool s_autoStartDone;
+        private static bool s_waitingCdp;
+        private static int s_cdpWaitTicks;
+        private static volatile bool s_cdpRequestFailed;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool AttachConsole(int dwProcessId);
@@ -304,18 +307,34 @@ namespace WorkDaddyTray
             return StartWd();
         }
 
+        // daemon 的 /api/client/relaunch 要「逐个结束 WorkBuddy 进程 → 带
+        // --remote-debugging-port 重启 → CDP 连接 → 注入面板」之后才返回 202，
+        // 实测 19:31:21 → 19:32:22 约 60 秒。旧版同步等待且 Timeout=10s，
+        // 请求其实已被 daemon 接收并成功完成，托盘却因超时报「操作失败」。
+        // 这里只确认「请求已发出」，真实结果交给 2s 定时轮询的 CDP 端口检测，
+        // 既不冻结 UI 也不误报。
         private static bool RestoreCdp()
         {
+            if (!TestPort(DaemonPort)) return false;
             try
             {
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(DaemonUri + "/api/client/relaunch");
                 req.Method = "POST";
-                req.Timeout = 10000;
                 req.ContentLength = 0;
-                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                req.Timeout = 90000;
+                s_cdpRequestFailed = false;
+                req.BeginGetResponse(delegate(IAsyncResult ar)
                 {
-                    return resp.StatusCode == HttpStatusCode.Accepted || resp.StatusCode == HttpStatusCode.OK;
-                }
+                    try
+                    {
+                        using (HttpWebResponse resp = (HttpWebResponse)req.EndGetResponse(ar))
+                        {
+                            if ((int)resp.StatusCode >= 400) s_cdpRequestFailed = true;
+                        }
+                    }
+                    catch { s_cdpRequestFailed = true; }
+                }, null);
+                return true;
             }
             catch { return false; }
         }
@@ -374,7 +393,17 @@ namespace WorkDaddyTray
             s_start.Click += delegate { RunBusy(StartWd, StartOkText()); };
             s_stop.Click += delegate { RunBusy(StopWd, "WorkDaddy 已关闭"); };
             s_restart.Click += delegate { RunBusy(RestartWd, "WorkDaddy 已重启"); };
-            s_cdp.Click += delegate { RunBusy(RestoreCdp, "已请求恢复 CDP，WorkBuddy 窗口将重开"); };
+            s_cdp.Click += delegate
+            {
+                s_waitingCdp = true;
+                s_cdpWaitTicks = 0;
+                RunBusy(delegate
+                {
+                    bool ok = RestoreCdp();
+                    if (!ok) s_waitingCdp = false;
+                    return ok;
+                }, "已请求恢复 CDP；WorkBuddy 将重开，约 1 分钟，完成后会再提示");
+            };
             s_open.Click += delegate { OpenPage(); };
             s_auto.Click += delegate
             {
@@ -433,7 +462,7 @@ namespace WorkDaddyTray
             s_start.Enabled = !run;
             s_stop.Enabled = run;
             s_restart.Enabled = run;
-            s_cdp.Enabled = run && !cdp;
+            s_cdp.Enabled = run && !cdp && !s_waitingCdp;
             s_open.Enabled = run;
             s_auto.Checked = GetAutoStart();
         }
@@ -466,6 +495,31 @@ namespace WorkDaddyTray
             s_timer.Tick += delegate
             {
                 UpdateState();
+                // 恢复 CDP 期间 daemon 要跑约 60 秒；轮询端口，真正恢复后再提示一次，
+                // 避免「点了没反应 / 误报失败」。90 秒仍未恢复则给出超时提示。
+                if (s_cdpRequestFailed)
+                {
+                    s_cdpRequestFailed = false;
+                    s_waitingCdp = false;
+                    s_cdpWaitTicks = 0;
+                    ShowBalloon("恢复 CDP 请求失败，请打开管理页查看状态", ToolTipIcon.Warning);
+                }
+                if (s_waitingCdp)
+                {
+                    s_cdpWaitTicks++;
+                    if (TestPort(CdpPort))
+                    {
+                        s_waitingCdp = false;
+                        s_cdpWaitTicks = 0;
+                        ShowBalloon("CDP 已恢复，面板已注入", ToolTipIcon.Info);
+                    }
+                    else if (s_cdpWaitTicks > 45)
+                    {
+                        s_waitingCdp = false;
+                        s_cdpWaitTicks = 0;
+                        ShowBalloon("恢复 CDP 超时，请打开管理页查看状态", ToolTipIcon.Warning);
+                    }
+                }
                 if (autoStart && !s_autoStartDone)
                 {
                     s_autoTick++;

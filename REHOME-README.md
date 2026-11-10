@@ -427,7 +427,7 @@ WorkDaddy 上游是纯后台双进程，没有托盘图标。本节补一个独�
 | 文件 | 作用 |
 |---|---|
 | `WorkDaddyTray.cs` | C# 5 源码（考虑 Framework 4.0 自带编译器，不用字符串插值 / `?.` / `out var`） |
-| `WorkDaddyTray.exe` | 编译产物，19,968 B，`/target:winexe` 无控制台窗口 |
+| `WorkDaddyTray.exe` | 编译产物，20,992 B，`/target:winexe` 无控制台窗口 |
 | `build.cmd` | 重新构建（`/codepage:65001`，源码需 UTF-8 BOM） |
 | `Start-WorkDaddyTray.cmd` | 双击启动托盘 |
 
@@ -457,3 +457,27 @@ CDP/面板注入拆给独立的「恢复 CDP」菜单项（POST `/api/client/rel
 **注意**：「启动 WorkDaddy」只起后台服务 —— 会话归属接管、账号监听、去重等全部功能此时已可用；右下角机器人按钮/面板需要 CDP，点「恢复 CDP」会重启一次 WorkBuddy 窗口。「退出托盘」只关托盘，不影响后台服务。
 
 **验证（18:42）**：`--selftest` 全绿；`--start` 返回 True，4 秒后 47832/47932 均监听、watchdog+daemon 进程齐、卡住的 cmd 残留 0；托盘经 explorer 脱离会话启动后跨调用常驻。由工具会话直接派生的进程会在会话结束时被清理，这不代表程序问题 —— 用户双击 `Start-WorkDaddyTray.cmd` 启动的托盘本身就是常驻的。
+
+### 12.1 恢复 CDP「失败」是误报（19:32 修复）
+
+YG 反馈点「恢复 CDP」失败，实测**其实完全成功了**。daemon.log 时间线：
+
+```
+19:31:21  quitWorkBuddy() 逐个 taskkill 十几个 WorkBuddy 进程（普通退出未结束→强制）
+19:32:15  [cdp] 为 WorkBuddy 选择端口 9222
+19:32:16  [cdp] 已连接 WorkBuddy
+19:32:17  [cdp] 注入右下角组件 (connect) / inject.js 已执行
+19:32:18  [cdp] 注入结果确认(connect): root=true widget=true   ← 面板已注入
+19:32:22  [cdp] 用户通过一键恢复重启了客户端（路由此时才返回 202）
+```
+
+`/api/client/relaunch` 是「先结束全部 WorkBuddy 进程 → 带调试端口重启 → CDP 连接 → 注入面板」之后**才**返回 202，全程约 60 秒。旧版 `RestoreCdp()` 用同步 `GetResponse()` 且 `Timeout=10000`，10 秒超时被 `catch` 成 `false`，托盘弹「操作失败」，而 daemon 那边继续跑完并注入成功 —— 纯误报。
+
+**修法**：
+
+- `RestoreCdp()` 改 `BeginGetResponse` 异步 fire-and-forget：只确认「daemon 端口可达 + 请求已发出」即返回 true，`Timeout` 放宽到 90s 但不等响应，UI 不冻结、不误报。
+- 新增 `s_waitingCdp` / `s_cdpWaitTicks`：恢复期间禁用「恢复 CDP」菜单项防重复点；2s 定时轮询 9222，端口一通弹「CDP 已恢复，面板已注入」，90 秒未通弹超时提示。
+- 新增 `s_cdpRequestFailed`：异步回调里若 daemon 返回 5xx 或连接异常，由 UI 线程立刻弹失败提示，不用干等。
+- 提示文案改为「已请求恢复 CDP；WorkBuddy 将重开，约 1 分钟，完成后会再提示」。
+
+**19:32 实测状态**：9222 监听、`/json/version` 返回 Chrome/138、CDP 目标页为 WorkBuddy renderer、`inject.js 已执行`、`root=true widget=true` —— 面板本来就在。重编译（20,992 B）并重启托盘后，47832 / 47932 / 9222 与 daemon/watchdog 进程全程未变，服务零中断。
