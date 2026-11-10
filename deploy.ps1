@@ -71,7 +71,7 @@ Say "    补丁来源: $src" 'Green'
 Head '2/6 校验补丁清单'
 
 $newFiles = @(
-    'rehome-sessions.js', 'rehome-watcher.js', 'rehome_sessions.py',
+    'rehome-sessions.js', 'rehome-watcher.js', 'rehome-audit.js', 'rehome_sessions.py',
     'bind-rehome-ui.py', 'fix-cdp.cmd', 'setup-rehome.ps1', 'stop-workdaddy.ps1'
 )
 $patchedFiles = @(

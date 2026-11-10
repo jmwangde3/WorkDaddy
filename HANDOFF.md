@@ -140,7 +140,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-rehome.ps1
 | `scripts/win-launcher.js` | 上游文件，修 `taskkill` 非零导致 relaunch 中途放弃（改为延迟复验后放行） | 中 |
 | `scripts/workbuddy-exe.json` | **本机专用**：客户端实际路径 `H:\\Program Files\\WorkBuddy\\WorkBuddy.exe`。换机器必须改 | 低 |
 | `scripts/fix-cdp.cmd` / `setup-rehome.ps1` / `stop-workdaddy.ps1` | 一次性运维脚本：修 CDP / 建 startup-route 硬链接 / 停服务。不参与常规运行 | 低 |
-| `deploy.cmd` / `deploy.ps1` | **一键部署**：定位安装目录 → 校验 12 文件 → 按时间戳备份 → 复制 → 绑 UI → 重启 daemon → 轮询 47832。上游升级后跑一次即恢复 | 低 — 幂等；改了要实测一遍再提交 |
+| `deploy.cmd` / `deploy.ps1` | **一键部署**：定位安装目录 → 校验 13 文件 → 按时间戳备份 → 复制 → 绑 UI → 重启 daemon → 轮询 47832。上游升级后跑一次即恢复 | 低 — 幂等；改了要实测一遍再提交 |
 | `README.md` | **入门文档**（408 行），给不熟悉项目的人看：痛点 → 三步安装 → 托盘菜单 → FAQ | — |
 | `README_UPSTREAM.md` | 上游原版 README 存档，完整功能清单 | — |
 | `REHOME-README.md` | **主文档**，37 KB / 12 章，所有坑与实测都在里面 | — |
@@ -305,7 +305,7 @@ WorkDaddyTray.exe --autoon / --autooff
 
 上游发布版升级会**整目录覆盖** `%LOCALAPPDATA%\Programs\WorkDaddy\scripts`，本项目的改动会全部丢失（表现为切号不再接管、面板两个按钮变回原来的复选框）。
 
-**日常用法：双击仓库根目录的 `deploy.cmd`。** 它已经把下面的四步全部做完：定位安装目录 → 校验 12 个文件齐全 → 按时间戳备份 → 复制 → 绑面板 UI → 重启 daemon → 轮询 47832 最长 20 秒确认恢复。幂等，退出码 0 即成功。
+**日常用法：双击仓库根目录的 `deploy.cmd`。** 它已经把下面的四步全部做完：定位安装目录 → 校验 13 个文件齐全 → 按时间戳备份 → 复制 → 绑面板 UI → 重启 daemon → 轮询 47832 最长 20 秒确认恢复。幂等，退出码 0 即成功。
 
 只有两种情况才需要看下面的手工步骤：
 

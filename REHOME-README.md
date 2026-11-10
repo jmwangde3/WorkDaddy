@@ -478,6 +478,46 @@ POST auto-copy-all true     -> 200 {autoCopyAll:true, enabled:true}
 
 去重与收敛的备份都在 `%APPDATA%\WorkDaddy\rehome-backups\`（`workbuddy-*.db` / `workbuddy-dedupe-*.db`）。软删的记录可用 `UPDATE sessions SET deleted_at = NULL WHERE id IN (...)` 恢复（`ids` 在 `/api/rehome/dedupe` 响应里），或直接用备份库覆盖 `workbuddy.db`（先完全退出 WorkBuddy）。
 
+### 11.9 删除语义与「复活」边界（21:45）
+
+问题（YG）：A 删掉的会话，B 那边还在，切回 A 会不会被搬回来？A 删了之后 B 接着聊的进度，A 还能不能拿到？
+
+**结论：不会复活；进度会自动跟上。** 依据是架构，不是约定：
+
+1. **一条会话只有一行、一个文件。** 接管执行 `UPDATE sessions SET user_id = ? WHERE (deleted_at IS NULL OR deleted_at = -1)`，改归属不复制。B 看到的那条就是 A 删的那条本身，B 没有自己的第二份。
+2. **删除是终态。** 客户端删除写 `deleted_at = <时间戳>`（软删，消息文件留在 `projects\**\<id>.jsonl`，列表不再显示）。接管 WHERE 排除已删行，删掉的行永远不再被搬。`rehome-sessions.js` 全文只有去重分支写 `deleted_at = ?`，**从不写 `deleted_at = NULL`**；能把会话写回列表的只有客户端自身和 `/api/sessions/restore`（回收站恢复）。
+3. **进度天然连续。** 消息写在共享的 `<id>.jsonl`，不分账号。切回 A 时搬的是同一行、同一文件，直接读到 B 写的最新内容。
+
+**实测（2026-11-10 21:45，183 行）**
+
+```
+未删除 58（其中归档 19）｜回收站 125
+未删除全部在 106cbbda；回收站分布 47 / 50 / 28
+已删行在删除后仍有写入：0 条
+已删行对应 jsonl 仍存在：125 / 125（软删不删文件）
+```
+
+**唯一会「删了还在」的形态：字节相同的双活副本。** 巡检发现 3 组、11 条、其中 8 条重复，全部是 `is_background_automation = 1` 的自动化运行记录（`WHERE_DEDUPE` 按设计排除后台任务，所以上轮去重没动它们）：
+
+- `路由器和网络 · 每日分层库体检` — 6/7 活，159589 B / 308988 B ×3 / 194083 B ×2
+- `hy4求职` — 3/3 活，467106 B ×3
+- `ChatGPT 24h 最终分析 + 晚高峰大文件测速布署（合并）` — 2/4 活，470459 B ×2
+
+这些副本同属一个账号，不会造成跨账号复活；但只删其中一条，同名的另几条仍在列表里。要清就单独跑一轮针对后台任务的去重（保留 `updated_at` 最新一条），代价是自动化运行记录条数变少 —— **未执行**，等 YG 决定。
+
+**云端会话的边界**：5 条 `transport = 'cloud'`。本地软删不等于服务端已删；若服务端仍保留，客户端下次拉列表可能落回一条新行（新 id、`deleted_at = -1`）。那是客户端行为，不是接管搬回来的 —— 接管永不新建行、永不改 `deleted_at`，凡是「新 id 突然出现」都不是它干的。
+
+**巡检脚本**：`scripts/rehome-audit.js`，只读（`DatabaseSync` 以 `readOnly` 打开，不碰消息文件）：
+
+```
+node scripts\rehome-audit.js          # 人读
+node scripts\rehome-audit.js --json   # 机读，给别的 agent / 自动化
+node scripts\rehome-audit.js --files  # 附带统计回收站占用的消息文件
+```
+
+退出码 `0` = 无风险，`2` = 有风险，可直接接计划任务做巡检。已加入 `deploy.ps1` 的 `$newFiles` 清单（13 个文件）。
+
+
 ## 12. 系统托盘控制器（WorkDaddyTray.exe）
 
 WorkDaddy 上游是纯后台双进程，没有托盘图标。本节补一个独立托盘程序，把「启动 / 关闭 / 开机自启」收进右键菜单。
