@@ -176,6 +176,52 @@ const { recoverNativeSession } = require('./codebuddy-native-recovery.js');
 const { createCodeBuddySessionStore } = require('./codebuddy-session-store.js');
 const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile, selectPageTarget, selectIdeTargets } = require('./cdp-targets.js');
 const { createSessionDb, normalizeSessionIdBatch, parameterCount } = require('./session-db.js');
+const { createRehomeRunner, alignStartupRoutes } = require('./rehome-sessions.js');
+const { createAccountWatcher } = require('./rehome-watcher.js');
+
+// 切号后原地接管会话归属（不复制会话、不改会话 ID）。懒初始化：
+// PROFILE / DATA_DIR / log 在下方定义，函数体到调用时才求值。
+let rehomeRunner = null;
+function getRehomeRunner() {
+  if (!rehomeRunner) {
+    rehomeRunner = createRehomeRunner({
+      dataDir: DATA_DIR,                 // WorkDaddy 配置/备份目录
+      dataRoot: PROFILE.dataRoot,        // WorkBuddy 状态根（projects/ 消息文件、startup-route）
+      dbPath: PROFILE.sessionDb,
+      log: (msg) => { try { if (typeof log === 'function') log(msg); } catch (_) {} },
+    });
+  }
+  return rehomeRunner;
+}
+
+// 账号变化监听：覆盖客户端内登录 / 无感登录等不经过 /api/switch 的切号路径。
+// 在 HTTP server 成功监听后启动，此时 PROFILE / DATA_DIR / AUTH_FILE / log 均已就绪。
+let rehomeWatcher = null;
+function startRehomeWatcher() {
+  if (rehomeWatcher) return rehomeWatcher;
+  // 上游「自动同步所有会话」已废弃：UI 复选框现在直接绑定接管模式。
+  // 无条件清掉全量复制规则，杜绝历史残留再次生成副本。
+  try {
+    setAutoCopyAllSessions(DATA_DIR, false);
+  } catch (e) { log(`[rehome] 清理全量复制规则失败: ${e.message}`); }
+  rehomeWatcher = createAccountWatcher({
+    authPath: AUTH_FILE,
+    dataDir: DATA_DIR,
+    cdpPort: Number(process.env.WORKDADDY_CDP_PORT || (PROFILE.cdp && PROFILE.cdp.port) || 9222),
+    intervalMs: Number(process.env.WORKDADDY_REHOME_POLL_MS || 2000),
+    log: (msg) => { try { if (typeof log === 'function') log(msg); } catch (_) {} },
+    onSwitch: async (newUid, prevUid) => {
+      const result = await getRehomeRunner().run(newUid);
+      if (result && result.ok !== false) {
+        try { alignStartupRoutes(PROFILE.dataRoot, prevUid || newUid); }
+        catch (e) { log(`[rehome] startup-route 对齐失败: ${e.message}`); }
+      }
+      return result;
+    },
+  });
+  rehomeWatcher.start();
+  return rehomeWatcher;
+}
 const { createDirtyIndex } = require('./session-dirty.js');
 const {
   createEncryptedExport,
@@ -3972,7 +4018,9 @@ function automationSwitchAccount(account, options = {}) {
       }
       const rules = sourceUid ? getAutoCopyRules(DATA_DIR, sourceUid) : {};
       let job = null;
-      if (rules.allSessions || (rules.sessionIds || []).length || (rules.workspaces || []).length) {
+      // 接管模式开启时彻底停用上游复制任务（原功能已废弃）。
+      if (!getRehomeRunner().readConfig().enabled &&
+          (rules.allSessions || (rules.sessionIds || []).length || (rules.workspaces || []).length)) {
         job = startAutoCopyJob(sourceUid, uid, [], { sourceName: active.nickname, targetName: acct.nickname });
       }
       // Sync yields to reload priority: release it before awaiting the job.
@@ -10296,6 +10344,34 @@ function handleApi(req, res) {
     }).catch((error) => json(res, 400, { ok: false, error: error.message }));
   }
 
+  // 会话归属接管（rehome）：状态 / 开关 / 手动触发（支持干跑）
+  if (req.method === 'GET' && p === '/api/rehome/status') {
+    return json(res, 200, { ok: true, ...getRehomeRunner().status() });
+  }
+  if (req.method === 'POST' && p === '/api/rehome/config') {
+    return readBody(req).then((body) => {
+      if (!body || typeof body.enabled !== 'boolean') return json(res, 400, { ok: false, error: '缺少 enabled 布尔值' });
+      return json(res, 200, { ok: true, ...getRehomeRunner().setEnabled(body.enabled) });
+    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
+  }
+  if (req.method === 'POST' && p === '/api/rehome/run') {
+    return readBody(req).then(async (body) => {
+      const payload = body || {};
+      const uid = String(payload.uid || (currentAccount() || {}).uid || '').trim();
+      const result = await getRehomeRunner().run(uid, { dryRun: !!payload.dryRun });
+      return json(res, result.ok === false ? 500 : 200, result);
+    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
+  }
+  if (req.method === 'POST' && p === '/api/rehome/dedupe') {
+    return readBody(req).then(async (body) => {
+      const result = await getRehomeRunner().runDedupe({
+        dryRun: !!(body && body.dryRun),
+        aggressive: !!(body && body.aggressive),
+      });
+      return json(res, 200, { ok: true, ...result });
+    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
+  }
+
   if (req.method === 'GET' && p === '/api/automations') {
     const imported = importAgentInbox(DATA_DIR, { profileId: PROFILE.id });
     imported.forEach((item) => log(`[automation-agent] request=${item.requestId} ${item.ok ? 'imported=' + item.taskId : 'rejected=' + item.error}`));
@@ -11747,7 +11823,7 @@ function handleApi(req, res) {
     // 时间筛选和排序按最近活动/修改时间；旧记录缺字段时回退到创建时间。
     return sqliteQuery("SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, project_id FROM sessions WHERE " + clauses.join(' AND ') + " ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, created_at DESC;", params)
       .then(async (rows) => {
-        const autoCopyAll = getAutoCopyRules(DATA_DIR, uid).allSessions;
+        const autoCopyAll = getRehomeRunner().readConfig().enabled; // UI 复选框绑定接管模式
         const rulesByUid = {};
         rows.forEach((row) => {
           const owner = String(row.user_id || '').trim();
@@ -11784,6 +11860,7 @@ function handleApi(req, res) {
           uid,
           range,
           autoCopyAll,
+          rehomeEnabled: getRehomeRunner().readConfig().enabled,
           autoCopy: currentRules ? { sessionIds: Array.from(currentRules.sessions), workspaces: Array.from(currentRules.workspaces) } : null,
         });
       })
@@ -11993,13 +12070,16 @@ function handleApi(req, res) {
       }
     });
   }
-  // 全量自动复制覆盖：独立于逐会话/空间规则，关闭后原规则原样恢复。
+  // 「自动同步所有会话」UI 复选框现绑定接管模式（上游复制功能已废弃）。
+  // 保留该路径以兼容上游前端调用；状态即 rehome.enabled。
   if (req.method === 'POST' && p === '/api/sessions/auto-copy-all') {
     return readBody(req).then((body) => {
       try {
-        if (!body || typeof body.enabled !== 'boolean') return json(res, 400, { ok: false, error: '缺少全量自动复制开关状态' });
-        const result = setAutoCopyAllSessions(DATA_DIR, body.enabled);
-        return json(res, 200, { ok: true, autoCopyAll: result.allSessions });
+        if (!body || typeof body.enabled !== 'boolean') return json(res, 400, { ok: false, error: '缺少开关状态' });
+        const cfg = getRehomeRunner().setEnabled(body.enabled);
+        try { setAutoCopyAllSessions(DATA_DIR, false); } catch (_) {}
+        log(`[rehome] UI 开关 -> 接管模式 enabled=${cfg.enabled}`);
+        return json(res, 200, { ok: true, autoCopyAll: cfg.enabled, enabled: cfg.enabled });
       } catch (e) {
         return json(res, 400, { ok: false, error: e.message });
       }
@@ -12879,6 +12959,30 @@ function handleApi(req, res) {
         if (sessionAccountAmbiguous(sourceUid)) currentConversationId = '';
         if (sourceUid !== uid) await preserveAccountSwitchTheme(uid);
         const acct = await switchAccountForProfile(uid);
+        // 切号成功后、CDP 刷新之前完成归属接管：刷新时客户端从 DB 读到的会话已属于新账号。
+        // 失败只记日志，不阻断切号主流程。
+        let rehome = { ok: false, skipped: 'not-run', affected: 0 };
+        try {
+          rehome = await getRehomeRunner().run(uid);
+          log(`[rehome] uid=${uid} affected=${rehome.affected || 0}` +
+            (rehome.error ? ` error=${rehome.error}` : '') +
+            (rehome.backup ? ` backup=${rehome.backup}` : ''));
+        } catch (error) {
+          rehome = { ok: false, error: error.message, affected: 0 };
+          log(`[rehome] 接管失败（不影响切号）: ${error.message}`);
+        }
+        // 把源账号最后打开的会话同步成全部账号的启动落点。原地写保持硬链接，
+        // 客户端若曾用原子替换断开过链接，这一步也会自动修复。
+        let routeAlign = null;
+        try {
+          routeAlign = alignStartupRoutes(PROFILE.dataRoot, sourceUid);
+          log(`[rehome] startup-route aligned written=${routeAlign.written || 0}` +
+            (routeAlign.reason ? ` reason=${routeAlign.reason}` : ''));
+        } catch (error) {
+          routeAlign = { ok: false, error: error.message, written: 0 };
+          log(`[rehome] startup-route 对齐失败（不影响切号）: ${error.message}`);
+        }
+        if (rehome && typeof rehome === 'object') rehome.routeAlign = routeAlign;
         const hint = acct.nativeSwitched ? '原生登录态已切换，无需重启客户端' : '登录文件已切换，请刷新窗口使新账号生效';
         let automationSync = { enabled: false, copied: 0, skipped: 0, total: 0 };
         let officialAutomationSync = { enabled: false, copied: 0, skipped: 0, total: 0 };
@@ -12930,7 +13034,9 @@ function handleApi(req, res) {
         // open conversation into copying. Use the planner's exact selection rule.
         const autoCopyOpenSessionId = currentConversationRow && isAutoCopySessionSelected(sourceRules, currentConversationRow)
           ? currentConversationId : '';
-        const autoCopyJob = shouldStartAutoCopyJob(sourceRules, hasPendingAutoCopyTo(sourceUid))
+        // rehome 接管模式下跳过复制队列：原地改归属与生成副本互斥。
+        const rehomeActive = getRehomeRunner().readConfig().enabled;
+        const autoCopyJob = !rehomeActive && shouldStartAutoCopyJob(sourceRules, hasPendingAutoCopyTo(sourceUid))
           ? startAutoCopyJob(sourceUid, uid, [], {
             sourceName: sourceAccount.nickname || '',
             targetName: acct.nickname || '',
@@ -12942,6 +13048,7 @@ function handleApi(req, res) {
           uid: acct.uid,
           nickname: acct.nickname,
           reloaded,
+          rehome,
           autoCopy: autoCopyJob ? { jobId: autoCopyJob.id, total: autoCopyJob.total, openSessionId: autoCopyJob.openSessionId || '' } : { total: 0 },
           automationSync,
           officialAutomationSync,
@@ -13259,6 +13366,7 @@ function startServer() {
       ACTUAL_PORT = port;
       writeUiPortFile(port);
       log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
+      startRehomeWatcher();
     });
   };
   tryListen(0);

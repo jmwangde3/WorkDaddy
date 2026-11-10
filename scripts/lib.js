@@ -117,6 +117,14 @@ function wdCompatLog(msg) {
 // 校验的主程序路径；只在 Node/daemon 侧读取，注入到 renderer 的 compat 脚本不会触发。
 function wdCompatConfiguredExe() {
   if (!IS_WIN || typeof module === 'undefined' || !module.exports) return '';
+  // [rehome] 自定义安装盘符：同目录 workbuddy-exe.json 指定客户端路径。
+  // 官方默认只找 %LOCALAPPDATA%\Programs\WorkBuddy，装在其它盘时取钥失败，
+  // 会把 nickname / phone 显示成「(已加密)」，积分与成长接口也拿不到明文 token。
+  try {
+    const override = path.join(__dirname, 'workbuddy-exe.json');
+    const j = JSON.parse(fs.readFileSync(override, 'utf8'));
+    if (j && typeof j.path === 'string' && j.path.trim() && fs.existsSync(j.path.trim())) return j.path.trim();
+  } catch (_) {}
   try {
     const { getProfile } = require('./profiles.js');
     const profile = getProfile(process.env.WBSWITCH_PROFILE || 'workbuddy-cn', {
@@ -1853,6 +1861,12 @@ function listAccounts(dataDir) {
         item.type = typeof acct.type === 'string' ? acct.type : '';
         item.enterpriseName = typeof acct.enterpriseName === 'string' ? acct.enterpriseName.trim() : '';
       }
+      // [rehome] CDP accountSnapshot 明文兜底：信封取钥暂不可用时仍显示真实昵称。
+      try {
+        const disp = JSON.parse(fs.readFileSync(path.join(dataDir, 'account-display.json'), 'utf8'));
+        const d = disp[uid];
+        if (d && typeof d.nickname === 'string' && d.nickname) item.nickname = d.nickname;
+      } catch (_) {}
       if (j.auth) {
         item.tokenExpiresAt = j.auth.expiresAt || null;
         item.refreshExpiresAt = j.auth.refreshExpiresAt || null;

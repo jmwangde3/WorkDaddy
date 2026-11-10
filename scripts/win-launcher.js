@@ -1099,7 +1099,24 @@ async function killForExit(args, stage, verifyGone) {
       log(`[exit] ${stage} taskkill 非零但目标 PID 已消失，按竞态成功处理`);
       return result;
     }
-    throw result.error || new Error(`${stage} taskkill 失败 (code=${result.code})`);
+    // Electron child processes die together with their host, and CIM/WMI
+    // enumeration can lag a few hundred ms behind taskkill. A single PID
+    // returning ERRORLEVEL 1 ("process not found") used to throw here and
+    // abort the whole relaunch while WorkBuddy was still running without CDP.
+    // The authoritative check is waitForWorkBuddyExit() plus the force rounds
+    // in quitWorkBuddy(); those still fail closed if anything really survived.
+    // So a non-zero exit code from taskkill itself is logged and skipped, not
+    // fatal. Spawn-level errors (taskkill missing / access denied) still throw.
+    if (!result.error) {
+      await sleep(350);
+      if (verifyGone && await verifyGone()) {
+        log(`[exit] ${stage} taskkill 非零，延迟复验后目标 PID 已消失，按竞态成功处理`);
+        return result;
+      }
+      log(`[exit] ${stage} taskkill code=${result.code} 非零且 PID 仍可见，跳过该 PID 交由退出确认统一判定`);
+      return result;
+    }
+    throw result.error;
   }
   return result;
 }

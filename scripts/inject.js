@@ -7062,7 +7062,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       mask.innerHTML = '<div class="wbs-modal wbs-initial-sync-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-initial-sync-title">' +
         '<div class="wbs-modal-title" id="wbs-initial-sync-title">初始化设置</div>' +
         '<div class="wbs-initial-sync-copy">选择切换账号时是否自动同步会话。此设置之后也可以在「会话」页面修改。</div>' +
-        '<label class="wbs-account-settings-toggle wbs-initial-sync-toggle"><span>切换账号自动同步所有会话</span><span class="wbs-switch"><input type="checkbox" data-initial-auto-copy-all checked><span class="wbs-switch-slider"></span></span></label>' +
+        '<label class="wbs-account-settings-toggle wbs-initial-sync-toggle"><span>切换账号自动接管会话归属</span><span class="wbs-switch"><input type="checkbox" data-initial-auto-copy-all checked><span class="wbs-switch-slider"></span></span></label>' +
         '<div class="wbs-password-error wbs-initial-sync-error" role="alert"></div>' +
         '<div class="wbs-modal-actions"><button class="wbs-modal-btn wbs-modal-ok" type="button" data-initial-auto-copy-all-save>确定</button></div>' +
         '</div>';
@@ -7092,9 +7092,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         }).then(function (response) {
           if (!response || response.autoCopyAll !== enabled) throw new Error('daemon 未确认设置');
           try { localStorage.setItem(WBS_INITIAL_AUTO_COPY_ALL_KEY, '1'); } catch (_) {}
-          if (typeof sessionsState !== 'undefined' && sessionsState) sessionsState.autoCopyAll = enabled;
+          if (typeof sessionsState !== 'undefined' && sessionsState) sessionsState.rehomeEnabled = enabled;
           if (sessionsPane && sessionsPane.dataset.built) {
-            updateAutoCopyAllButton();
+            updateRehomeButton();
             updateSessCount();
           }
           busy = false;
@@ -9460,7 +9460,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     // ===== 会话 pane（构建：账号/时间筛选 + 按空间分组[默认2条/展开全部] + 刷新 + 批量操作[迁移/删除]）=====
-    var sessionsState = { uid: undefined, currentUid: '', range: 'all', minBytes: 0, totalBytes: null, list: [], selected: {}, wsExpanded: {}, accounts: [], batchMode: false, autoCopy: null, autoCopyAll: false, autoSyncAutomations: false, autoSyncAutomationsBusy: false, autoCopyJob: null, autoCopyPollTimer: null };
+    var sessionsState = { uid: undefined, currentUid: '', range: 'all', minBytes: 0, totalBytes: null, list: [], selected: {}, wsExpanded: {}, accounts: [], batchMode: false, autoCopy: null, rehomeEnabled: false, rehomeBusy: false, autoSyncAutomations: false, autoSyncAutomationsBusy: false, autoCopyJob: null, autoCopyPollTimer: null };
     function isTaskSessionRecordUI(s) {
       // 任务（未选择项目/一次性）会话：以官方 is_playground=1 为准。
       // 普通工作区也用 WorkBuddy\\YYYY-MM-DD-HH-MM-SS 命名，仅凭 cwd 无法区分。
@@ -9550,9 +9550,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '</div></div>' +
         '</div>' +
         '<div class="wbs-sess-toolbar">' +
-        '<button class="wbs-sess-auto-all" type="button" id="wbs-sess-auto-all" role="checkbox" aria-checked="false" aria-label="自动同步所有会话" title="切换账号时自动同步当前账号的所有会话，包括之后新增的会话">' +
+        '<button class="wbs-sess-auto-all" type="button" id="wbs-sess-auto-all" role="checkbox" aria-checked="false" aria-label="接管会话归属" title="切换账号时把本机会话原地改为当前账号：不复制、不改会话 ID，始终只有一份">' +
         '<span class="wbs-sess-auto-all-box" aria-hidden="true"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="12" rx="2"/><path class="wbs-sess-auto-all-check" d="m4.5 8 2.2 2.2L11.5 5.5"/></svg></span>' +
-        '<span class="wbs-sess-auto-all-label">自动同步所有会话</span>' +
+        '<span class="wbs-sess-auto-all-label">接管会话归属</span>' +
         '</button>' +
         '<button class="wbs-sess-auto-all" type="button" id="wbs-sess-auto-automations" role="checkbox" aria-checked="false" aria-label="同步定时任务" title="切换账号时保持所有已保存账号的定时任务一致，包括重命名和删除">' +
         '<span class="wbs-sess-auto-all-box" aria-hidden="true"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="12" rx="2"/><path class="wbs-sess-auto-all-check" d="m4.5 8 2.2 2.2L11.5 5.5"/></svg></span>' +
@@ -9709,7 +9709,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function canRefreshSessions() {
       return alive && state.open && !document.hidden && sessionsPane && sessionsPane.classList.contains('active') &&
         !sessionsState.batchMode && !Object.keys(sessionsState.selected || {}).some(function (id) { return sessionsState.selected[id]; }) &&
-        !sessionsState.autoCopyAllBusy && !sessionsState.autoSyncAutomationsBusy &&
+        !sessionsState.rehomeBusy && !sessionsState.autoSyncAutomationsBusy &&
         !(sessionsState.exportJob && sessionsState.exportJob.running) &&
         !(sessionsState.autoCopyJob && /^(queued|running)$/.test(sessionsState.autoCopyJob.status)) &&
         !Array.from(root.querySelectorAll('.wbs-modal-mask, .wbs-panel-modal-mask')).some(function (mask) {
@@ -9726,7 +9726,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!listEl) return;
       var silent = !!(options && options.silent);
       if (silent && (!canRefreshSessions() || sessionsState.loading)) return;
-      var snapshot = silent ? JSON.stringify([sessionsState.list, sessionsState.totalBytes, sessionsState.autoCopy, sessionsState.autoCopyAll]) : null;
+      var snapshot = silent ? JSON.stringify([sessionsState.list, sessionsState.totalBytes, sessionsState.autoCopy, sessionsState.rehomeEnabled]) : null;
       var serial = sessionsState.readSerial = (sessionsState.readSerial || 0) + 1;
       sessionsState.loading = true;
       if (!silent) listEl.innerHTML = '<div class="wbs-empty">加载中…</div>';
@@ -9736,17 +9736,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return api(url).then(function (d) {
         if (!alive || serial !== sessionsState.readSerial || (silent && !canRefreshSessions())) return;
         // A local rule toggle may finish before this older read returns.
-        if (silent && snapshot !== JSON.stringify([sessionsState.list, sessionsState.totalBytes, sessionsState.autoCopy, sessionsState.autoCopyAll])) return;
+        if (silent && snapshot !== JSON.stringify([sessionsState.list, sessionsState.totalBytes, sessionsState.autoCopy, sessionsState.rehomeEnabled])) return;
         var nextList = (d && d.sessions) || [];
         var nextAutoCopy = (d && d.autoCopy) || null;
-        if (silent && snapshot === JSON.stringify([nextList, d && d.totalBytes, nextAutoCopy, !!(d && d.autoCopyAll)])) return;
+        if (silent && snapshot === JSON.stringify([nextList, d && d.totalBytes, nextAutoCopy, !!(d && d.rehomeEnabled)])) return;
         // Capture at response time so scrolling during the request is retained.
         var listScroll = listEl.scrollTop, bodyScroll = body.scrollTop;
         // 任务会话（is_playground=1）保留在列表中，由渲染层归入「任务」分组展示与操作。
         sessionsState.list = nextList;
         sessionsState.totalBytes = d && d.totalBytes;
         sessionsState.autoCopy = nextAutoCopy;
-        sessionsState.autoCopyAll = !!(d && d.autoCopyAll);
+        sessionsState.rehomeEnabled = !!(d && d.rehomeEnabled);
         if (!silent) {
           sessionsState.selected = {};
           sessionsState.wsExpanded = {};
@@ -9790,7 +9790,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var listEl = sessionsPane.querySelector('#wbs-sess-list');
       var countEl = sessionsPane.querySelector('#wbs-sess-count');
       if (!listEl) return;
-      updateAutoCopyAllButton();
+      if (typeof updateRehomeButton === 'function') updateRehomeButton();
       if (typeof updateAutomationSyncButton === 'function') updateAutomationSyncButton();
       if (!filteredSessions().length) {
         listEl.innerHTML = '<div class="wbs-empty">当前筛选下没有会话</div>';
@@ -9805,7 +9805,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M20 7H8"/><path d="M8 21l-4-4 4-4"/><path d="M4 17h12"/></svg></button>';
       }
       function autoCopyButton(kind, key, uid, enabled, inherited) {
-        if (sessionsState.autoCopyAll || !canEditAutoCopy(uid)) return '';
+        if (sessionsState.rehomeEnabled || !canEditAutoCopy(uid)) return '';
         var title = inherited ? '随空间自动同步' : (enabled ? '取消自动同步' : '切换账号时自动同步');
         var disabled = inherited ? ' disabled' : '';
         return '<button class="wbs-sess-auto' + (enabled ? ' active' : '') + (inherited ? ' inherited' : '') + '" type="button" data-auto-kind="' + kind + '" data-auto-key="' + escAttr(key) + '" data-auto-uid="' + escAttr(uid) + '" aria-label="' + escAttr(title) + '" title="' + escAttr(title) + '" aria-pressed="' + (enabled ? 'true' : 'false') + '"' + disabled + '><span class="wbs-sess-auto-label">自动同步</span><span class="wbs-sess-auto-switch' + (enabled ? ' on' : '') + '" aria-hidden="true"><span></span></span></button>';
@@ -9890,7 +9890,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       bindSessEvents(listEl);
     }
     function activeAutoCopyCount() {
-      if (sessionsState.autoCopyAll) return filteredSessions().length;
+      if (sessionsState.rehomeEnabled) return filteredSessions().length;
       return filteredSessions().filter(function (s) {
         return !!s.autoCopySession || !!s.autoCopyWorkspace;
       }).length;
@@ -9900,15 +9900,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       countEl.innerHTML = '<span class="wbs-sess-summary-tag">共 <strong>' + sessionCopyCountText(filteredSessions().length) + '</strong> 个会话</span>' +
         '<span class="wbs-sess-summary-tag wbs-sess-summary-auto">自动同步 <strong>' + sessionCopyCountText(activeAutoCopyCount()) + '</strong></span>' +
         '<span class="wbs-sess-summary-tag wbs-sess-summary-size" title="所选账号全部会话的大小，不受时间和大小筛选影响">总大小 <strong>' + sessionCopySizeText(sessionsState.totalBytes) + '</strong></span>';
-    }
-    function updateAutoCopyAllButton() {
-      if (!sessionsPane) return;
-      var button = sessionsPane.querySelector('#wbs-sess-auto-all');
-      if (!button) return;
-      var enabled = !!sessionsState.autoCopyAll;
-      button.disabled = !!sessionsState.batchMode || !!sessionsState.autoCopyAllBusy;
-      button.classList.toggle('active', enabled);
-      button.setAttribute('aria-checked', enabled ? 'true' : 'false');
     }
     function updateAutomationSyncButton() {
       if (!sessionsPane) return;
@@ -9942,27 +9933,36 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         toast('同步定时任务设置失败: ' + (e.message || e), true, root);
       });
     }
-    function toggleAutoCopyAll(enabled) {
+    function updateRehomeButton() {
+      if (!sessionsPane) return;
+      var button = sessionsPane.querySelector('#wbs-sess-auto-all');
+      if (!button) return;
+      var enabled = !!sessionsState.rehomeEnabled;
+      button.disabled = !!sessionsState.batchMode || !!sessionsState.rehomeBusy;
+      button.classList.toggle('active', enabled);
+      button.setAttribute('aria-checked', enabled ? 'true' : 'false');
+    }
+    function toggleRehome(enabled) {
       var button = sessionsPane && sessionsPane.querySelector('#wbs-sess-auto-all');
       if (!button || button.disabled) return;
-      var previous = !!sessionsState.autoCopyAll;
-      sessionsState.autoCopyAll = !!enabled;
-      sessionsState.autoCopyAllBusy = true;
-      renderSessions();
-      api('/api/sessions/auto-copy-all', {
+      var previous = !!sessionsState.rehomeEnabled;
+      sessionsState.rehomeEnabled = !!enabled;
+      sessionsState.rehomeBusy = true;
+      updateRehomeButton();
+      api('/api/rehome/config', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ enabled: !!enabled }),
       }).then(function (response) {
-        sessionsState.autoCopyAll = !!(response && response.autoCopyAll);
-        sessionsState.autoCopyAllBusy = false;
-        renderSessions();
-        toast(sessionsState.autoCopyAll ? '已开启自动同步所有会话' : '已关闭自动同步所有会话', false, root);
+        sessionsState.rehomeEnabled = !!(response && response.enabled);
+        sessionsState.rehomeBusy = false;
+        updateRehomeButton();
+        toast(sessionsState.rehomeEnabled ? '已开启切号接管会话归属' : '已关闭切号接管会话归属', false, root);
       }).catch(function (e) {
-        sessionsState.autoCopyAll = previous;
-        sessionsState.autoCopyAllBusy = false;
-        renderSessions();
-        toast('自动同步所有会话设置失败: ' + (e.message || e), true, root);
+        sessionsState.rehomeEnabled = previous;
+        sessionsState.rehomeBusy = false;
+        updateRehomeButton();
+        toast('接管会话归属设置失败: ' + (e.message || e), true, root);
       });
     }
     function shortWs(w) {
@@ -10143,7 +10143,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       sessionsPane.querySelectorAll('.wbs-sess-filters button,.wbs-sess-filters select,#wbs-sess-batch,#wbs-sess-import').forEach(function (control) {
         control.disabled = !!on;
       });
-      updateAutoCopyAllButton();
+      if (typeof updateRehomeButton === 'function') updateRehomeButton();
       if (bar) bar.style.display = on ? 'flex' : 'none';
     }
 
@@ -10205,16 +10205,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         renderSessions();
         updateSessCount();
       });
-      var autoCopyAllBtn = sessionsPane.querySelector('#wbs-sess-auto-all');
-      if (autoCopyAllBtn) {
-        autoCopyAllBtn.addEventListener('click', function () {
-          toggleAutoCopyAll(autoCopyAllBtn.getAttribute('aria-checked') !== 'true');
-        });
-      }
       var autoAutomationBtn = sessionsPane.querySelector('#wbs-sess-auto-automations');
       if (autoAutomationBtn) {
         autoAutomationBtn.addEventListener('click', function () {
           toggleAutomationSync(autoAutomationBtn.getAttribute('aria-checked') !== 'true');
+        });
+      }
+      var rehomeBtn = sessionsPane.querySelector('#wbs-sess-auto-all');
+      if (rehomeBtn) {
+        rehomeBtn.addEventListener('click', function () {
+          toggleRehome(rehomeBtn.getAttribute('aria-checked') !== 'true');
         });
       }
       // 时间 Segment 组件
