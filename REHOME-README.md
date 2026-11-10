@@ -426,11 +426,7 @@ AND (transport = 'cloud'  AND deleted_at = -1)
 
 顺带确认客户端的删除动作：`UPDATE sessions SET deleted_at = ?, updated_at = ?, unread = 0 WHERE id = ?` —— 只按 `id` 写时间戳，不做归属校验；而列表查询 `... WHERE user_id = ? ...` 带账号过滤。所以「A 删了，B 还能看到」在当前实现下不成立：B 的列表根本取不到那行。
 
-### 11.6 回滚
-
-两份去重备份在 `%APPDATA%\WorkDaddy\rehome-backups\`。软删的记录可用 `UPDATE sessions SET deleted_at = NULL WHERE id IN (...)` 恢复（`ids` 在 `/api/rehome/dedupe` 响应里），或直接用备份库覆盖 `workbuddy.db`（先完全退出 WorkBuddy）。
-
-### 11.5 测试
+### 11.6 测试
 
 ```
 node test/rehome-sessions.test.js    # 归属接管 / 排除口径 / 备份 / 幂等 / 落点对齐
@@ -440,7 +436,7 @@ node test/rehome-dedupe.test.js      # 保守去重 / 大小不一致跳过 / ag
 
 三组全 PASS。
 
-### 11.6 「自动同步所有会话」开关已绑定接管模式（13:57）
+### 11.7 「自动同步所有会话」开关已绑定接管模式（13:57）
 
 **背景**：该复选框原本是 WorkDaddy 上游功能 —— 切号时把当前账号会话**复制**成新 ID 副本写入目标账号（`setAutoCopyAllSessions` → `startAutoCopyJob` → 复制 JSONL / 产物 / 插一行 `sessions`），源账号保留。§11.1 的「三份」正是它历史上开启留下的产物。它与接管归属是同一目标、两种相反手段（复制 = 新 ID / 多份 / 会分叉；接管 = 一条 UPDATE / ID 不变 / 始终一份）。
 
@@ -477,6 +473,10 @@ POST auto-copy-all true     -> 200 {autoCopyAll:true, enabled:true}
 界面现在只有一个「接管会话归属」复选框，勾选状态即接管模式开关；原复制功能没有任何 UI 或后端触发路径。面板刷新后显示新文案。
 
 ---
+
+### 11.8 回滚
+
+去重与收敛的备份都在 `%APPDATA%\WorkDaddy\rehome-backups\`（`workbuddy-*.db` / `workbuddy-dedupe-*.db`）。软删的记录可用 `UPDATE sessions SET deleted_at = NULL WHERE id IN (...)` 恢复（`ids` 在 `/api/rehome/dedupe` 响应里），或直接用备份库覆盖 `workbuddy.db`（先完全退出 WorkBuddy）。
 
 ## 12. 系统托盘控制器（WorkDaddyTray.exe）
 
