@@ -427,7 +427,7 @@ WorkDaddy 上游是纯后台双进程，没有托盘图标。本节补一个独�
 | 文件 | 作用 |
 |---|---|
 | `WorkDaddyTray.cs` | C# 5 源码（考虑 Framework 4.0 自带编译器，不用字符串插值 / `?.` / `out var`） |
-| `WorkDaddyTray.exe` | 编译产物，19,456 B，`/target:winexe` 无控制台窗口 |
+| `WorkDaddyTray.exe` | 编译产物，19,968 B，`/target:winexe` 无控制台窗口 |
 | `build.cmd` | 重新构建（`/codepage:65001`，源码需 UTF-8 BOM） |
 | `Start-WorkDaddyTray.cmd` | 双击启动托盘 |
 
@@ -450,4 +450,10 @@ WorkDaddyTray.exe --autoon | --autooff
 
 **实测（17:55）**：`build.cmd` 编译通过 → `--selftest` 全绿（含自启开关往返 was→on→mid→off→end→restored）、`--status` 正确、`--autoon` 写入正确路径、`--autooff` 清除；起 watchdog 后 `--stop` 返回 True 且 47832 释放、残留进程 0；GUI 启动后进程稳定常驻 4s 以上。
 
-**注意**：菜单「启动 WorkDaddy」走 `launcher.cmd`，若 WorkBuddy 正在运行且无 CDP，会按 §8.5 修复后的流程重启窗口以启用面板注入。「退出托盘」只关托盘，不影响后台服务。
+**启动路径（18:37 修复）**：早期版本用 `cmd.exe /c launcher.cmd` 启动。由无控制台的 `winexe` 托盘调用时，cmd 拿着无效 stdout 句柄空转 —— 实测 18:37 那次 cmd PID 33220 从 18:37:32 起吃了 **124 秒 CPU**、只有 conhost 子进程、没有 node、`launcher.log` 一个字没写，并且弹出命令行窗口后卡住（`launcher.cmd` 结尾的 `pause`）。现改为 `StartWd()` 直接启动 `node.exe watchdog.js`（`UseShellExecute=true` + `WindowStyle.Hidden`）：不经 cmd、不弹窗、不 pause、不重启 WorkBuddy 窗口；watchdog 自动拉起 daemon。`FindNode()` 按 `%USERPROFILE%\.workbuddy\binaries\node\versions` 倒序找最新 node，回退到安装目录内置 runtime 或 PATH。
+
+CDP/面板注入拆给独立的「恢复 CDP」菜单项（POST `/api/client/relaunch`）。启动成功后若 CDP 未连接，气球提示「WorkDaddy 服务已启动；面板未注入，点『恢复 CDP』」，避免服务已起但面板没注入时被误判为「没反应」。
+
+**注意**：「启动 WorkDaddy」只起后台服务 —— 会话归属接管、账号监听、去重等全部功能此时已可用；右下角机器人按钮/面板需要 CDP，点「恢复 CDP」会重启一次 WorkBuddy 窗口。「退出托盘」只关托盘，不影响后台服务。
+
+**验证（18:42）**：`--selftest` 全绿；`--start` 返回 True，4 秒后 47832/47932 均监听、watchdog+daemon 进程齐、卡住的 cmd 残留 0；托盘经 explorer 脱离会话启动后跨调用常驻。由工具会话直接派生的进程会在会话结束时被清理，这不代表程序问题 —— 用户双击 `Start-WorkDaddyTray.cmd` 启动的托盘本身就是常驻的。

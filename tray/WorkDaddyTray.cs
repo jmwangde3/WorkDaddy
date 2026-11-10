@@ -8,6 +8,8 @@
 //   * 托盘图标（绿=运行中 / 灰=已停止 / 橙=切换中），运行时绘制，无外部 .ico
 //   * 右键菜单：状态 / 启动 / 关闭 / 重启 / 恢复 CDP / 开机自启动 / 打开管理页 / 退出托盘
 //   * 单实例 Mutex，避免重复托盘
+//   * 启动走 node watchdog.js（不经 cmd / launcher.cmd），不弹窗、不 pause、
+//     不重启 WorkBuddy 窗口；CDP/面板注入交给「恢复 CDP」菜单项
 //   * 停止逻辑：按命令行精确匹配 WorkDaddy\scripts\(watchdog|daemon).js，
 //     先 watchdog 后 daemon，循环 4 轮压住 watchdog 的自动重启；不误伤其它 node.exe
 //   * 开机自启：HKCU\Software\Microsoft\Windows\CurrentVersion\Run 的 'WorkDaddyTray'
@@ -60,6 +62,7 @@ namespace WorkDaddyTray
 
         private static string s_scripts;
         private static string s_launcher;
+        private static string s_watchdog;
         private static NotifyIcon s_notify;
         private static ContextMenuStrip s_menu;
         private static System.Windows.Forms.Timer s_timer;
@@ -89,6 +92,7 @@ namespace WorkDaddyTray
         {
             s_scripts = ResolveScripts();
             s_launcher = Path.Combine(s_scripts, "launcher.cmd");
+            s_watchdog = Path.Combine(s_scripts, "watchdog.js");
 
             if (args.Length > 0 && args[0].StartsWith("--", StringComparison.Ordinal))
             {
@@ -222,18 +226,49 @@ namespace WorkDaddyTray
         }
 
         // ------------------------------------------------------------ 动作
+        // 直接起 watchdog.js，绕过 cmd.exe /c launcher.cmd。
+        // launcher.cmd 是「双击」入口：内部会 pause、会弹控制台、会走
+        // win-launcher.js 的「重启 WorkBuddy 带 CDP」长流程。由无控制台的
+        // winexe 托盘用 cmd /c 调它时，cmd 拿着无效 stdout 句柄空转
+        // （实测 CPU 124s、无 node 子进程、launcher.log 零新增），还会弹出
+        // 命令行窗口。这里只启动后台服务，CDP/面板注入交给「恢复 CDP」。
+        private static string FindNode()
+        {
+            string root = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                @".workbuddy\binaries\node\versions");
+            try
+            {
+                if (Directory.Exists(root))
+                {
+                    foreach (string dir in Directory.GetDirectories(root)
+                        .OrderByDescending(x => x, StringComparer.Ordinal))
+                    {
+                        string exe = Path.Combine(dir, "node.exe");
+                        if (File.Exists(exe)) return exe;
+                    }
+                }
+            }
+            catch { }
+            string bundled = Path.Combine(s_scripts, "runtime", "node", "node.exe");
+            if (File.Exists(bundled)) return bundled;
+            return "node";
+        }
+
         private static bool StartWd()
         {
-            if (!File.Exists(s_launcher)) return false;
+            if (!File.Exists(s_watchdog)) return false;
+            if (TestPort(DaemonPort)) return true;
             try
             {
                 ProcessStartInfo psi = new ProcessStartInfo();
-                psi.FileName = "cmd.exe";
-                psi.Arguments = "/c \"" + s_launcher + "\"";
-                psi.WorkingDirectory = Path.GetDirectoryName(s_launcher);
+                psi.FileName = FindNode();
+                psi.Arguments = "\"" + s_watchdog + "\"";
+                psi.WorkingDirectory = s_scripts;
+                // UseShellExecute=true 让 shell 分配自己的句柄，不继承托盘
+                // (winexe) 的无效标准句柄；Hidden 隐藏 node 的控制台窗口。
+                psi.UseShellExecute = true;
                 psi.WindowStyle = ProcessWindowStyle.Hidden;
-                psi.UseShellExecute = false;
-                psi.EnvironmentVariables["WBSWITCH_NO_PAUSE"] = "1";
                 Process.Start(psi);
                 return true;
             }
@@ -323,7 +358,7 @@ namespace WorkDaddyTray
             s_status.Enabled = false;
             s_menu.Items.Add(new ToolStripSeparator());
 
-            s_start = AddItem("启动 WorkDaddy", "启动后台服务；若 WorkBuddy 正在运行，可能重启窗口以启用面板");
+            s_start = AddItem("启动 WorkDaddy", "只启动后台服务，不弹窗、不重启 WorkBuddy 窗口；面板注入请用『恢复 CDP』");
             s_stop = AddItem("关闭 WorkDaddy", "停止 watchdog + daemon，保留全部账号与会话数据");
             s_restart = AddItem("重启 WorkDaddy", "先停止再启动");
             s_cdp = AddItem("恢复 CDP（会重开 WorkBuddy 窗口）", "POST /api/client/relaunch，带调试端口重开 WorkBuddy");
@@ -336,7 +371,7 @@ namespace WorkDaddyTray
             s_open = AddItem("打开管理页", "打开 http://127.0.0.1:47832/");
             ToolStripMenuItem exitItem = AddItem("退出托盘", "只关闭托盘程序，不影响 WorkDaddy 后台服务");
 
-            s_start.Click += delegate { RunBusy(StartWd, "WorkDaddy 已启动"); };
+            s_start.Click += delegate { RunBusy(StartWd, StartOkText()); };
             s_stop.Click += delegate { RunBusy(StopWd, "WorkDaddy 已关闭"); };
             s_restart.Click += delegate { RunBusy(RestartWd, "WorkDaddy 已重启"); };
             s_cdp.Click += delegate { RunBusy(RestoreCdp, "已请求恢复 CDP，WorkBuddy 窗口将重开"); };
@@ -363,7 +398,7 @@ namespace WorkDaddyTray
             s_notify.DoubleClick += delegate
             {
                 if (TestPort(DaemonPort)) OpenPage();
-                else RunBusy(StartWd, "WorkDaddy 已启动");
+                else RunBusy(StartWd, StartOkText());
             };
             s_notify.BalloonTipClicked += delegate { OpenPage(); };
         }
@@ -403,6 +438,13 @@ namespace WorkDaddyTray
             s_auto.Checked = GetAutoStart();
         }
 
+        private static string StartOkText()
+        {
+            return TestPort(CdpPort)
+                ? "WorkDaddy 已启动，面板已注入"
+                : "WorkDaddy 服务已启动；面板未注入，点『恢复 CDP』";
+        }
+
         private static void RunBusy(Func<bool> work, string okText)
         {
             s_busy = true;
@@ -430,7 +472,7 @@ namespace WorkDaddyTray
                     if (s_autoTick >= 3)
                     {
                         s_autoStartDone = true;
-                        if (!TestPort(DaemonPort)) RunBusy(StartWd, "开机自启：WorkDaddy 已启动");
+                        if (!TestPort(DaemonPort)) RunBusy(StartWd, StartOkText());
                     }
                 }
             };
@@ -475,6 +517,7 @@ namespace WorkDaddyTray
                     sb.AppendLine("exe        : " + Application.ExecutablePath);
                     sb.AppendLine("wd scripts : " + s_scripts);
                     sb.AppendLine("launcher   : exists=" + File.Exists(s_launcher));
+                    sb.AppendLine("watchdog   : exists=" + File.Exists(s_watchdog));
                     sb.AppendLine("daemon 47832 : " + TestPort(DaemonPort));
                     sb.AppendLine("cdp 9222     : " + TestPort(CdpPort));
                     sb.AppendLine("wd processes : " + GetWdProcesses().Count);
