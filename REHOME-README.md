@@ -415,3 +415,39 @@ POST auto-copy-all true     -> 200 {autoCopyAll:true, enabled:true}
 ```
 
 界面现在只有一个「接管会话归属」复选框，勾选状态即接管模式开关；原复制功能没有任何 UI 或后端触发路径。面板刷新后显示新文案。
+
+---
+
+## 12. 系统托盘控制器（WorkDaddyTray.exe）
+
+WorkDaddy 上游是纯后台双进程，没有托盘图标。本节补一个独立托盘程序，把「启动 / 关闭 / 开机自启」收进右键菜单。
+
+**位置**：仓库 `tray/`。纯 .NET Framework 4.x WinForms，用 Windows 自带的 `csc.exe` 编译，不需要 Visual Studio、SDK 或 NuGet。
+
+| 文件 | 作用 |
+|---|---|
+| `WorkDaddyTray.cs` | C# 5 源码（考虑 Framework 4.0 自带编译器，不用字符串插值 / `?.` / `out var`） |
+| `WorkDaddyTray.exe` | 编译产物，19,456 B，`/target:winexe` 无控制台窗口 |
+| `build.cmd` | 重新构建（`/codepage:65001`，源码需 UTF-8 BOM） |
+| `Start-WorkDaddyTray.cmd` | 双击启动托盘 |
+
+**菜单**：状态行 / 启动 WorkDaddy / 关闭 WorkDaddy / 重启 WorkDaddy / 恢复 CDP（会重开 WorkBuddy 窗口）/ 开机自启动（勾选）/ 打开管理页 / 退出托盘。图标运行时绘制：绿=运行中、灰=已停止、橙=切换中；双击图标打开管理页（未运行时改为启动）；2 秒定时刷新状态。单实例 Mutex `Local\WorkDaddyTraySingleton`。
+
+**停止逻辑**：与 `scripts\stop-workdaddy.ps1` 一致 —— WMI 查 `Win32_Process`，正则 `WorkDaddy\scripts\(watchdog|daemon)\.js` 精确匹配，先 watchdog 后 daemon，循环 4 轮压住自动重启，绝不误伤其它 `node.exe`（Codex / MCP server 等）。
+
+**开机自启**：写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `WorkDaddyTray` 值，指向 exe 自身 + `/autostart`。名字避开上游 `install-win.ps1` 清理的 `WorkDaddy` / `WorkDaddy AI`。`/autostart` 模式下托盘起来约 6 秒后若服务未运行则自动拉起**一次**，用户手动关闭后不会自作主张重启。
+
+**命令行动作**（与菜单复用同一组函数，结果同时写 `%TEMP%\WorkDaddyTray-cli.txt`）：
+
+```
+WorkDaddyTray.exe --status
+WorkDaddyTray.exe --selftest
+WorkDaddyTray.exe --start | --stop | --restart
+WorkDaddyTray.exe --autoon | --autooff
+```
+
+**路径发现**：`WORKDADDY_SCRIPTS` 环境变量 → `%LOCALAPPDATA%\Programs\WorkDaddy\scripts` → 同目录 `\scripts` → exe 上级 `..\scripts`（适配只 clone 仓库、未安装发布版的机器）。
+
+**实测（17:55）**：`build.cmd` 编译通过 → `--selftest` 全绿（含自启开关往返 was→on→mid→off→end→restored）、`--status` 正确、`--autoon` 写入正确路径、`--autooff` 清除；起 watchdog 后 `--stop` 返回 True 且 47832 释放、残留进程 0；GUI 启动后进程稳定常驻 4s 以上。
+
+**注意**：菜单「启动 WorkDaddy」走 `launcher.cmd`，若 WorkBuddy 正在运行且无 CDP，会按 §8.5 修复后的流程重启窗口以启用面板注入。「退出托盘」只关托盘，不影响后台服务。
