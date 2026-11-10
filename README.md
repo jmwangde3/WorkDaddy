@@ -273,6 +273,13 @@ node scripts\rehome-audit.js
 
 只读，不改任何东西。看到「字节相同的双活副本 0 组」就安全。
 
+后台自动化任务的副本要单独清（它们每次运行都是新会话，不能按标题整组只留一条）：
+
+```
+node scripts\rehome-sessions.js --dedupe-background --dry-run   # 先看要删哪几条
+node scripts\rehome-sessions.js --dedupe-background             # 真删，自动备份
+```
+
 ### A 删了，B 又接着聊，A 还能拿到后面的进度吗
 
 **能，不用做任何操作。**

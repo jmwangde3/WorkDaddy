@@ -200,11 +200,15 @@ const WHERE_DEDUPE = NOT_DELETED + " AND COALESCE(is_background_automation, 0) =
 
 现为 `BeginGetResponse` 异步 fire-and-forget + 2 秒轮询 9222，通了提示「已恢复」，90 秒超时才报超时。
 
-### 5.5 去重不能碰定时任务运行记录
+### 5.5 去重不能碰定时任务运行记录（但副本可以单独清）
 
-`sessions.is_background_automation = 1` 是**真实执行记录**（每个账号每天各跑一份，内容不同），不是「自动同步会话」时代复制出来的副本。按同名同大小当副本删掉会丢真实执行历史。
+`sessions.is_background_automation = 1` 是**真实执行记录**：自动化任务每次运行都新建一条同名会话（title 是任务名、cwd 是工作区），按 `(title, cwd)` 整组只留一条会删掉不同日期的运行。
 
-所以 `WHERE_DEDUPE` 比 `WHERE` 多一个 `COALESCE(is_background_automation, 0) = 0`。
+所以默认口径仍然排除它们：`WHERE_DEDUPE` 比 `WHERE` 多一个 `COALESCE(is_background_automation, 0) = 0`。
+
+**但后台任务里确实会混进副本** —— 旧「自动复制」把运行记录也一并复制了。这类只能按内容指纹分桶清：同 `(title, cwd)` + 同大小 + **归一化 sha256 相同**，桶内留 `updated_at` 最新一条，**逐桶判、不按组判**（同组不同大小 = 不同次运行，各自都要留）。
+
+入口：`runBackgroundDedupe()` / `node scripts\rehome-sessions.js --dedupe-background [--dry-run]`。2026-11-10 22:00 实跑：4 桶、11 条活副本 → 5 条，删 6（备份 `workbuddy-bg-dedupe-20261110-220003-366.db`）。
 
 ### 5.6 去重判定不能只看 MD5
 
@@ -218,6 +222,8 @@ const WHERE_DEDUPE = NOT_DELETED + " AND COALESCE(is_background_automation, 0) =
 4. 保留 `updated_at` 最新的一条，其余写 `deleted_at` 软删
 
 第 3 步是关键校验，跳过它就是在赌。
+
+**11-10 补充：代码里已改成「归一化 sha256」实现第 2–3 步** —— 把本行 session id 替换成 `<SID>` 再哈希，等于比对除 id 之外的全部内容，比 UUID 集合覆盖更严格也更快。**原始 sha256 不行**：复制时 `sessionId` 被逐行改写，字节长度不变但内容不同，直接哈希会把真副本全部漏判（22:00 那轮第一版干跑就是 0 组，踩过）。
 
 ### 5.7 `sessions` 表没有 `owner_user_id`
 
@@ -498,7 +504,7 @@ fsutil hardlink list "$env:USERPROFILE\.workbuddy\<uid>\startup-route.json"
 硬约束（读完 HANDOFF 也要记住）：
 1. 改仓库不等于生效 —— 运行的是 %LOCALAPPDATA%\Programs\WorkDaddy\scripts，必须同步 + 重启 daemon
 2. 「未删除」是 (deleted_at IS NULL OR deleted_at = -1)，云端会话用 -1，别写成单一条件
-3. 去重跳过 is_background_automation=1（真实执行记录，不是副本）
+3. 去重默认跳过 is_background_automation=1；后台任务副本只走 --dedupe-background（按归一化指纹分桶，别按 title+cwd 整组删）
 4. 动生产库前先 dryRun，写入前会自动 VACUUM INTO 备份到 %APPDATA%\WorkDaddy\rehome-backups
 5. 改 inject.js 用 bind-rehome-ui.py，别手改 1.4 MB 文件
 6. 托盘是 C# 5 / .NET Framework 4.0，改 .cs 后必须跑 tray\build.cmd

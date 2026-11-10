@@ -503,7 +503,36 @@ POST auto-copy-all true     -> 200 {autoCopyAll:true, enabled:true}
 - `hy4求职` — 3/3 活，467106 B ×3
 - `ChatGPT 24h 最终分析 + 晚高峰大文件测速布署（合并）` — 2/4 活，470459 B ×2
 
-这些副本同属一个账号，不会造成跨账号复活；但只删其中一条，同名的另几条仍在列表里。要清就单独跑一轮针对后台任务的去重（保留 `updated_at` 最新一条），代价是自动化运行记录条数变少 —— **未执行**，等 YG 决定。
+这些副本同属一个账号，不会造成跨账号复活；但只删其中一条，同名的另几条仍在列表里。已在 22:00 单独跑一轮清理，见下。
+
+**22:00 执行：后台任务副本去重（新增 `runBackgroundDedupe`）**
+
+不能复用 `dedupeSessions`：自动化任务每次运行都会新建一条同名会话（title 是任务名、cwd 是工作区），按 `(title, cwd)` 整组只留一条会把不同日期的真实运行记录删掉。
+
+判定改成三层，任何一层不满足就跳过：
+
+1. 同 `(title, cwd)`；
+2. 消息文件大小完全一致；
+3. **归一化指纹一致** —— 旧「自动复制」生成副本时会重写每行的 `sessionId`（消息里的 message id 不变），所以两份内容完全相同的副本原始字节并不相等。先把本行 id 替换成 `<SID>` 再算 sha256，真实的复制关系才还原得出来。只比大小会误伤，只比原始 sha256 会全部漏判（第一版就是这么漏的：干跑 0 组）。
+
+桶内保留 `updated_at` 最新一条（并列取 `created_at` 最新）。执行结果：
+
+```
+4 个桶 / 11 条活副本 -> 5 条
+删 6：6f4b6839 675756da（hy4求职） 7d37618e（ChatGPT） 353c5576 5af4ebab（每日分层库体检 308988） fcf268c4（194083）
+留 4：e5b6f03b 86bdd7ff cb76c903 694e9acc ＋ 独有的 861d61d5
+备份：%APPDATA%\WorkDaddy\rehome-backups\workbuddy-bg-dedupe-20261110-220003-366.db
+复验：rehome-audit 报「字节相同的双活副本 0 组 / 无复活风险」；非后台会话被改动 0 条
+```
+
+命令（幂等，再跑一次报 0）：
+
+```
+node scripts\rehome-sessions.js --dedupe-background --dry-run
+node scripts\rehome-sessions.js --dedupe-background
+```
+
+`session_usage` 里对应的用量行没有删 —— 软删只影响列表可见性，token 统计保持原样。
 
 **云端会话的边界**：5 条 `transport = 'cloud'`。本地软删不等于服务端已删；若服务端仍保留，客户端下次拉列表可能落回一条新行（新 id、`deleted_at = -1`）。那是客户端行为，不是接管搬回来的 —— 接管永不新建行、永不改 `deleted_at`，凡是「新 id 突然出现」都不是它干的。
 

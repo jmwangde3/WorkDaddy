@@ -13,7 +13,9 @@
  * 每次写入前用 VACUUM INTO 生成一致性备份，写入走单事务。
  */
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { createSessionDb } = require('./session-db.js');
 
 const CONFIG_FILE = 'rehome-sessions.json';
@@ -132,6 +134,120 @@ async function dedupeSessions(db, dataRoot, opts = {}) {
   return { groups: groupsCleaned, dropped: drop.length, ids: drop, applied: true };
 }
 
+/**
+ * 副本指纹：把会话自己的 session id 归一成 `<SID>` 后再算 sha256。
+ *
+ * 旧「自动复制」生成副本时会重写每行的 sessionId 字段（消息里的 message id 保持不变），
+ * 所以两份内容完全相同的副本，原始字节并不相等 —— 直接比 sha256 会全部漏判。
+ * 归一掉本行 id 之后，真实的复制关系就还原成同一个哈希。
+ */
+function normalizedSha256(file, sessionId) {
+  try {
+    const raw = fs.readFileSync(file);
+    const needle = Buffer.from(String(sessionId || ''));
+    if (!needle.length) return crypto.createHash('sha256').update(raw).digest('hex');
+    const marker = Buffer.from('<SID>');
+    const parts = [];
+    let start = 0;
+    let at = raw.indexOf(needle, start);
+    while (at !== -1) {
+      parts.push(raw.subarray(start, at), marker);
+      start = at + needle.length;
+      at = raw.indexOf(needle, start);
+    }
+    parts.push(raw.subarray(start));
+    return crypto.createHash('sha256').update(Buffer.concat(parts)).digest('hex');
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 后台任务副本去重 —— 只处理 is_background_automation = 1，与人工会话分开跑。
+ *
+ * 为什么不能复用 dedupeSessions：
+ *   自动化任务每次运行都会新建一条同名会话（title 是任务名、cwd 是工作区），
+ *   按 (title, cwd) 整组只留一条会把不同日期的真实运行记录删掉。
+ *
+ * 判定改成三层，任何一层不满足就跳过：
+ *   1) 同 (title, cwd)；
+ *   2) 消息文件大小完全一致；
+ *   3) 消息文件 sha256 完全一致（逐字节相同才算副本，光看大小会误伤）。
+ * 桶内保留 updated_at 最新的一条（并列取 created_at 最新），其余软删。
+ */
+async function dedupeBackgroundSessions(db, dataRoot, opts = {}) {
+  const dryRun = !!opts.dryRun;
+  const idx = buildJsonlIndex(path.join(String(dataRoot || ''), 'projects'));
+  const rows = await db.all(
+    `SELECT id, cwd, title, created_at, updated_at FROM sessions ` +
+    `WHERE ${NOT_DELETED} AND COALESCE(is_background_automation, 0) = 1 ` +
+    'ORDER BY cwd, title, updated_at DESC, created_at DESC'
+  );
+  const buckets = new Map();
+  let skippedNoFile = 0;
+  for (const r of rows) {
+    const p = idx.get(String(r.id));
+    let size = -1;
+    try { size = p ? fs.statSync(p).size : -1; } catch (_) { size = -1; }
+    if (!p || size <= 0) { skippedNoFile += 1; continue; }
+    const key = String(r.title || '') + '\u0000' + String(r.cwd || '') + '\u0000' + size;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push({ row: r, file: p });
+  }
+  const drop = [];
+  const keep = [];
+  const groups = [];
+  let groupsCleaned = 0;
+  for (const list of buckets.values()) {
+    if (list.length < 2) continue;
+    const byHash = new Map();
+    for (const item of list) {
+      const h = normalizedSha256(item.file, item.row.id);
+      if (!h) continue;
+      if (!byHash.has(h)) byHash.set(h, []);
+      byHash.get(h).push(item);
+    }
+    for (const [hash, dupes] of byHash) {
+      if (dupes.length < 2) continue;
+      dupes.sort((a, b) =>
+        (Number(b.row.updated_at || 0) - Number(a.row.updated_at || 0)) ||
+        (Number(b.row.created_at || 0) - Number(a.row.created_at || 0)));
+      const keeper = dupes[0];
+      groups.push({
+        title: String(keeper.row.title || ''),
+        cwd: String(keeper.row.cwd || ''),
+        hash: hash.slice(0, 12),
+        removed: dupes.length - 1,
+      });
+      keep.push(String(keeper.row.id));
+      for (const item of dupes.slice(1)) drop.push(String(item.row.id));
+      groupsCleaned += 1;
+    }
+  }
+  const result = {
+    groups: groupsCleaned,
+    dropped: drop.length,
+    ids: drop,
+    keptIds: keep,
+    details: groups,
+    skippedNoFile,
+    applied: false,
+  };
+  if (dryRun || !drop.length) return { ...result, applied: !dryRun && drop.length === 0 };
+  const now = Date.now();
+  const statements = [];
+  for (let i = 0; i < drop.length; i += 200) {
+    const chunk = drop.slice(i, i + 200);
+    statements.push({
+      sql: `UPDATE sessions SET deleted_at = ? WHERE id IN (${chunk.map(() => '?').join(',')}) ` +
+        `AND COALESCE(is_background_automation, 0) = 1 AND ${NOT_DELETED}`,
+      params: [now, ...chunk],
+    });
+  }
+  await db.transaction(statements);
+  return { ...result, applied: true };
+}
+
 function createRehomeRunner(options = {}) {
   const dataDir = String(options.dataDir || '');          // WorkDaddy 配置/备份目录
   const dataRoot = String(options.dataRoot || '');        // WorkBuddy 状态根（含 projects/）
@@ -205,6 +321,22 @@ function createRehomeRunner(options = {}) {
     return { ...(await dedupeSessions(db, dataRoot, opts2)), backup: null, backend: db.backend };
   }
 
+  /** 后台任务副本去重（独立入口，人工会话去重不受影响）。 */
+  async function runBackgroundDedupe(opts = {}) {
+    if (!dbPath || !fs.existsSync(dbPath)) throw new Error(`会话数据库不存在: ${dbPath || '(未配置)'}`);
+    const db = createSessionDb({ dbPath });
+    const preview = await dedupeBackgroundSessions(db, dataRoot, { dryRun: true });
+    if (opts.dryRun || !preview.dropped) {
+      return { ...preview, backup: null, backend: db.backend };
+    }
+    fs.mkdirSync(backupRoot, { recursive: true });
+    const backupPath = path.join(backupRoot, `workbuddy-bg-dedupe-${stamp()}.db`);
+    await db.run(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
+    if (!fs.existsSync(backupPath)) throw new Error('备份未生成，已中止写入');
+    const result = await dedupeBackgroundSessions(db, dataRoot, {});
+    return { ...result, backup: backupPath, backend: db.backend };
+  }
+
   async function execute(targetUid, dryRun) {
     const cfg = readConfig();
     if (!cfg.enabled) return { ok: true, skipped: 'disabled', affected: 0, backup: null };
@@ -262,7 +394,7 @@ function createRehomeRunner(options = {}) {
     };
   }
 
-  return { run, runDedupe, status, readConfig, setEnabled, WHERE, WHERE_DEDUPE, NOT_DELETED, CONFIG_FILE, BACKUP_DIR };
+  return { run, runDedupe, runBackgroundDedupe, status, readConfig, setEnabled, WHERE, WHERE_DEDUPE, NOT_DELETED, CONFIG_FILE, BACKUP_DIR };
 }
 
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -293,4 +425,47 @@ function alignStartupRoutes(dataRoot, sourceUid) {
   return { ok: errors.length === 0, written, errors };
 }
 
-module.exports = { createRehomeRunner, alignStartupRoutes, dedupeSessions, buildJsonlIndex, WHERE, WHERE_DEDUPE, NOT_DELETED, CONFIG_FILE, BACKUP_DIR };
+/** CLI 只用于手工跑后台任务去重；被 daemon require 时不走这里。 */
+function defaultPaths() {
+  const home = os.homedir();
+  const candidates = [
+    path.join(home, '.workbuddy', 'workbuddy.db'),
+    path.join(home, '.workbuddy-ai', 'workbuddy.db'),
+  ];
+  const dbPath = process.env.WORKBUDDY_DB || candidates.find((p) => fs.existsSync(p)) || candidates[0];
+  const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+  return {
+    dbPath,
+    dataRoot: path.dirname(dbPath),
+    dataDir: process.env.WORKDADDY_DATA || path.join(appData, 'WorkDaddy'),
+  };
+}
+
+if (require.main === module) {
+  const argv = process.argv.slice(2);
+  const wantsBackground = argv.includes('--dedupe-background') || argv.includes('--dedupe-bg');
+  if (!wantsBackground) {
+    process.stdout.write('用法: node rehome-sessions.js --dedupe-background [--dry-run]\n');
+    process.exit(1);
+  }
+  const { dbPath, dataRoot, dataDir } = defaultPaths();
+  if (!fs.existsSync(dbPath)) {
+    process.stderr.write(`找不到会话库: ${dbPath}\n`);
+    process.exit(1);
+  }
+  const runner = createRehomeRunner({ dataDir, dataRoot, dbPath, log: (m) => process.stdout.write(m + '\n') });
+  runner.runBackgroundDedupe({ dryRun: argv.includes('--dry-run') })
+    .then((r) => {
+      process.stdout.write(JSON.stringify(r, null, 2) + '\n');
+      process.exit(0);
+    })
+    .catch((e) => {
+      process.stderr.write(String(e && e.message || e) + '\n');
+      process.exit(1);
+    });
+}
+
+module.exports = {
+  createRehomeRunner, alignStartupRoutes, dedupeSessions, dedupeBackgroundSessions,
+  buildJsonlIndex, defaultPaths, WHERE, WHERE_DEDUPE, NOT_DELETED, CONFIG_FILE, BACKUP_DIR,
+};
