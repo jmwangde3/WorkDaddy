@@ -140,7 +140,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-rehome.ps1
 | `scripts/win-launcher.js` | 上游文件，修 `taskkill` 非零导致 relaunch 中途放弃（改为延迟复验后放行） | 中 |
 | `scripts/workbuddy-exe.json` | **本机专用**：客户端实际路径 `H:\\Program Files\\WorkBuddy\\WorkBuddy.exe`。换机器必须改 | 低 |
 | `scripts/fix-cdp.cmd` / `setup-rehome.ps1` / `stop-workdaddy.ps1` | 一次性运维脚本：修 CDP / 建 startup-route 硬链接 / 停服务。不参与常规运行 | 低 |
-| `deploy.cmd` / `deploy.ps1` | **一键部署**：定位安装目录 → 校验 13 文件 → 按时间戳备份 → 复制 → 绑 UI → 重启 daemon → 轮询 47832。上游升级后跑一次即恢复 | 低 — 幂等；改了要实测一遍再提交 |
+| `deploy.cmd` / `deploy.ps1` | **一键部署**：定位安装目录 → 校验 14 文件 → 按时间戳备份 → 复制 → 绑 UI → 重启 daemon → 轮询 47832。上游升级后跑一次即恢复 | 低 — 幂等；改了要实测一遍再提交 |
 | `README.md` | **入门文档**（408 行），给不熟悉项目的人看：痛点 → 三步安装 → 托盘菜单 → FAQ | — |
 | `README_UPSTREAM.md` | 上游原版 README 存档，完整功能清单 | — |
 | `REHOME-README.md` | **主文档**，37 KB / 12 章，所有坑与实测都在里面 | — |
@@ -250,6 +250,21 @@ UPDATE sessions SET deleted_at = ?, updated_at = ?, unread = 0 WHERE id = ?
 
 **推论（重要）**：软删的会话在 UI 上直接消失，**没有恢复入口**。去重软删的 29 条也一样 —— 要恢复只能走 SQL 或覆盖备份库（见 §9）。
 
+### 5.11 「允许完全访问」是三层状态，不是单开关
+
+改权限相关的东西之前先记住这条：客户端把完全访问拆成三层，缺一层界面就显示成没开。
+
+1. **账号偏好** `storage/user-<uid>-personal/global/preferences.json` → `localTaskPermissionMode: "full-access"`；决定新会话默认值，冷启动也读它。
+2. **会话字段** `sessions.permission_mode` → `fullAccess`；`WorkbuddyAdapter.getSessionPermissionState()` 直接读，读不到默认 `bypassPermissions`（= 默认沙箱）。`plan` 是用户显式选择，别覆盖。
+3. **渲染层开关** 输入框底部 `.cr-permission-setting` → 面板 `.cr-permission-panel`，开启时 `.cr-permission-panel__row--on`；改动会立刻回写第 1 层。
+
+两个坑：
+
+- 开启确认弹窗是 `.wb-modal--confirm`（不是 `--conf`），里面的「允许完全访问」按钮**默认 disabled**，必须先勾 `input[type=checkbox]`（我已了解风险）。不勾就点，看起来像点了没反应。
+- 关闭开关是**静默**的，会直接把账号偏好改成 `default-sandbox`；所以「关一下再开」不是无副作用操作，偏好会被改写。
+
+自动保活：`scripts/permission-sync.js`（三层一起补，幂等），daemon 在 `/api/switch` 成功后 3.5s 调一次、账号监听触发时也调、启动只补前两层。手动：`POST /api/permission/ensure`（需 `x-workdaddy-token`）或 `node scripts/permission-sync.js --apply`。
+
 ### 5.10 章节号是契约
 
 `REHOME-README.md` 的 `§` 编号被各文件引用。**改内容可以，别重排编号、别复用已作废的小节号。**
@@ -311,7 +326,7 @@ WorkDaddyTray.exe --autoon / --autooff
 
 上游发布版升级会**整目录覆盖** `%LOCALAPPDATA%\Programs\WorkDaddy\scripts`，本项目的改动会全部丢失（表现为切号不再接管、面板两个按钮变回原来的复选框）。
 
-**日常用法：双击仓库根目录的 `deploy.cmd`。** 它已经把下面的四步全部做完：定位安装目录 → 校验 13 个文件齐全 → 按时间戳备份 → 复制 → 绑面板 UI → 重启 daemon → 轮询 47832 最长 20 秒确认恢复。幂等，退出码 0 即成功。
+**日常用法：双击仓库根目录的 `deploy.cmd`。** 它已经把下面的四步全部做完：定位安装目录 → 校验 14 个文件齐全 → 按时间戳备份 → 复制 → 绑面板 UI → 重启 daemon → 轮询 47832 最长 20 秒确认恢复。幂等，退出码 0 即成功。
 
 只有两种情况才需要看下面的手工步骤：
 

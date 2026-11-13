@@ -178,6 +178,7 @@ const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile, selectPageT
 const { createSessionDb, normalizeSessionIdBatch, parameterCount } = require('./session-db.js');
 const { createRehomeRunner, alignStartupRoutes } = require('./rehome-sessions.js');
 const { createAccountWatcher } = require('./rehome-watcher.js');
+const { applyFullAccess } = require('./permission-sync.js');
 
 // 切号后原地接管会话归属（不复制会话、不改会话 ID）。懒初始化：
 // PROFILE / DATA_DIR / log 在下方定义，函数体到调用时才求值。
@@ -192,6 +193,79 @@ function getRehomeRunner() {
     });
   }
   return rehomeRunner;
+}
+
+// ---- 「允许完全访问」保活 ----
+// 客户端把完全访问拆成三层：账号偏好（localTaskPermissionMode）、会话字段
+// （sessions.permission_mode）、渲染层开关。切号会换账号作用域并重载页面，
+// 只要有一层掉队，界面就退回默认沙箱，用户看到的就是「每次切号都要重新点一遍」。
+// 这里在切号后把三层一起补齐，幂等；失败只记日志，不阻断切号。
+const PERMISSION_OK_STATUS = new Set(['already-full-access', 'enabled', 'enabled-unverified', 'unknown-unverified']);
+function cdpReadyForPermission() {
+  return !!(cdp && cdp.connected && cdp.ws && cdp.ws.readyState === 1);
+}
+async function applyPermissionLayers(uid, options = {}) {
+  const targetUid = String(uid || '').trim();
+  if (!targetUid) return null;
+  const wantRenderer = options.renderer !== false;
+  const send = wantRenderer && cdpReadyForPermission() ? (method, params) => cdpSend(method, params) : null;
+  if (!send && options.requireRenderer) return null;
+  const report = await applyFullAccess({
+    dataRoot: PROFILE.dataRoot,
+    dbPath: PROFILE.sessionDb,
+    uid: targetUid,
+    send,
+    renderer: !!send,
+    log: (msg) => { try { log(msg); } catch (_) {} },
+  });
+  return report;
+}
+let permissionSyncTimer = null;
+function schedulePermissionSync(uid, options = {}) {
+  const targetUid = String(uid || '').trim();
+  if (!targetUid) return Promise.resolve(null);
+  const attempts = Number.isFinite(options.attempts) ? options.attempts : 6;
+  const gapMs = Number.isFinite(options.gapMs) ? options.gapMs : 2500;
+  const firstDelay = Number.isFinite(options.delayMs) ? options.delayMs : 2500;
+  if (permissionSyncTimer) { clearTimeout(permissionSyncTimer); permissionSyncTimer = null; }
+  const run = async () => {
+    permissionSyncTimer = null;
+    let last = null;
+    // 先补不依赖页面的两层：CDP 正在重连时也要保证偏好与会话字段落盘。
+    try {
+      await applyPermissionLayers(targetUid, { renderer: false });
+    } catch (error) {
+      log(`[permission] 偏好/会话字段补齐失败: ${error.message}`);
+    }
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const report = await applyPermissionLayers(targetUid, { requireRenderer: true });
+        last = report;
+        const status = report && report.renderer && report.renderer.status;
+        if (report && report.preference && report.preference.ok === false) {
+          log(`[permission] 账号偏好写入失败: ${report.preference.error || ''}`);
+        }
+        if (status && PERMISSION_OK_STATUS.has(status)) {
+          log(`[permission] 完全访问已落实 uid=${targetUid} status=${status}`);
+          return report;
+        }
+        if (report && report.renderer && report.renderer.status === 'foreign-modal-open') {
+          log('[permission] 页面有其它弹窗，稍后重试');
+        }
+      } catch (error) {
+        last = { ok: false, error: error.message };
+        log(`[permission] 同步异常: ${error.message}`);
+      }
+      if (i + 1 < attempts) await new Promise((r) => setTimeout(r, gapMs));
+    }
+    const status = last && last.renderer ? last.renderer.status : (last && last.error) || 'unknown';
+    log(`[permission] 未能确认完全访问 uid=${targetUid} status=${status}（下次切号再试）`);
+    return last;
+  };
+  if (!firstDelay) return run();
+  permissionSyncTimer = setTimeout(run, firstDelay);
+  if (permissionSyncTimer.unref) permissionSyncTimer.unref();
+  return Promise.resolve(null);
 }
 
 // 账号变化监听：覆盖客户端内登录 / 无感登录等不经过 /api/switch 的切号路径。
@@ -216,6 +290,8 @@ function startRehomeWatcher() {
         try { alignStartupRoutes(PROFILE.dataRoot, prevUid || newUid); }
         catch (e) { log(`[rehome] startup-route 对齐失败: ${e.message}`); }
       }
+      // 客户端内直接登录/无感登录也要把完全访问补回去（不经过 /api/switch）。
+      schedulePermissionSync(newUid, { delayMs: 1500 });
       return result;
     },
   });
@@ -580,8 +656,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.65：兼容空会话同步、自定义模型和重定向备份目录，工作目录恢复退避重试。
 // 1.2.66：刷新凭据按原信封加密保存，同账号刷新去重，过期账号保留手动切换。
 // 1.2.67：Windows 重启 GUI 客户端时不再请求隐藏主窗口，与冷启动保持一致。
-const DAEMON_VERSION = '1.2.78';
-const DAEMON_BUILD_ID = 'release-1.2.78-stop-historical-deletion-propagation';
+const DAEMON_VERSION = '1.2.79';
+const DAEMON_BUILD_ID = 'release-1.2.79-full-access-persist';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -12926,6 +13002,21 @@ function handleApi(req, res) {
     }
   }
 
+  // 手动补齐「允许完全访问」三层状态（偏好 / 会话字段 / 页面开关）。
+  if (req.method === 'POST' && p === '/api/permission/ensure') {
+    return readBody(req).then(async (body) => {
+      const acct = currentAccount() || {};
+      const uid = String((body && body.uid) || acct.uid || '').trim();
+      if (!uid) return json(res, 400, { ok: false, error: '缺少 uid' });
+      try {
+        const report = await applyPermissionLayers(uid);
+        return json(res, 200, { ok: !!(report && report.ok), uid, report });
+      } catch (e) {
+        return json(res, 500, { ok: false, error: e.message });
+      }
+    });
+  }
+
   if (req.method === 'POST' && p === '/api/switch') {
     return readBody(req).then(async (body) => {
       const uid = (body.uid || '').trim();
@@ -13027,6 +13118,9 @@ function handleApi(req, res) {
             log(`[switch] CDP 刷新失败: ${e.message}`);
           }
         }
+        // 完全访问保活：偏好/会话字段先补齐，页面重载稳定后再把开关拨回去。
+        // 不 await，避免切号响应被 20s 的页面等待拖住。
+        schedulePermissionSync(acct.uid, { delayMs: reloaded ? 3500 : 1200 });
         // 空间规则可能因切换前后的会话索引时序暂时无法生成初始计划，但规则本身仍需触发复制任务；
         // 任务规则通常能直接命中，所以旧逻辑只表现为“任务能复制、空间不复制”。
         const sourceRules = sourceUid ? getAutoCopyRules(DATA_DIR, sourceUid) : { allSessions: false, sessionIds: [], workspaces: [] };
@@ -13367,6 +13461,14 @@ function startServer() {
       writeUiPortFile(port);
       log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
       startRehomeWatcher();
+      // 启动时只补偏好与会话字段，不动页面（避免每次开机弹一下权限面板）。
+      const bootAcct = currentAccount() || {};
+      if (bootAcct.uid) {
+        setTimeout(() => {
+          applyPermissionLayers(bootAcct.uid, { renderer: false })
+            .catch((error) => log(`[permission] 启动补齐失败: ${error.message}`));
+        }, 4000);
+      }
     });
   };
   tryListen(0);

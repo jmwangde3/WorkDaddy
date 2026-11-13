@@ -82,7 +82,7 @@ WorkBuddy 的会话是**按账号隔离**的。你登在账号 A，侧栏就只�
 去 [babygoton/workdaddy/releases](https://github.com/babygoton/workdaddy/releases) 下载 `WorkDaddy-Setup-x.y.z.exe`，双击装完。
 
 > 为什么不能直接用本仓库？
-> 本仓库只存了**改动的 13 个文件**，没有上游那几百个文件。它是一个「补丁包」，不是完整程序。
+> 本仓库只存了**改动的 14 个文件**，没有上游那几百个文件。它是一个「补丁包」，不是完整程序。
 
 装完确认一下这个目录存在：
 
@@ -101,7 +101,7 @@ C:\Users\<你的用户名>\AppData\Local\Programs\WorkDaddy\scripts
 1. 找到你的 WorkDaddy 装在哪儿
 2. 检查 12 个补丁文件齐不齐
 3. 备份会被覆盖的文件（存到 `%APPDATA%\WorkDaddy\script-backups\deploy-<时间戳>\`）
-4. 复制 13 个文件过去
+4. 复制 14 个文件过去
 5. 重新绑定面板上的按钮（有 Python 才会跑，没有也不影响功能）
 6. 重启后台服务
 
@@ -255,6 +255,26 @@ UPDATE sessions SET user_id = '当前账号' WHERE ...;
 
 新版改成异步：点了立刻提示「已请求」，恢复好之后再提示「已恢复」。
 
+### 切完号，「允许完全访问」又变回默认权限了
+
+已经自动修好了（v1.2.79 起）。切号完成后，WorkDaddy 会把三层状态一起补回去：
+
+1. **账号偏好** —— `localTaskPermissionMode` 写回 `full-access`，新会话默认就是完全访问；
+2. **会话字段** —— 把 `sessions.permission_mode` 补齐成 `fullAccess`，老会话打开时不会退回默认；
+3. **窗口开关** —— 页面重载完成后，如果输入框那儿的开关是关的，自动帮你打开，并点过「确认允许完全访问」。
+
+日志里能看到 `[permission] 完全访问已落实 uid=… status=…`。想手动补一次：
+
+```bash
+# 看三个账号现在各自是什么状态
+node scripts\permission-sync.js
+
+# 立刻补齐（不开页面，只写偏好和会话字段）
+node scripts\permission-sync.js --apply
+```
+
+> 为什么以前会掉：完全访问是「账号偏好 + 会话字段」两层存的，切号会换账号作用域并重载页面，客户端有时会用旧值把开关写回默认；三层里缺哪一层，界面都会显示成没开。
+
 ### 侧栏出现两条一模一样的会话
 
 去重在下一次切号时自动跑。想立刻处理，打开管理页用接口触发，或者直接切一次账号。
@@ -338,7 +358,7 @@ grep 关键字：`[cdp]`、`[rehome]`、`error`。
 
 ## 和上游的区别
 
-**代码层面**：13 个文件。8 个新增，5 个是上游文件的改造版。
+**代码层面**：14 个文件。9 个新增，5 个是上游文件的改造版。
 
 | 类型 | 文件 | 作用 |
 | --- | --- | --- |
@@ -350,6 +370,7 @@ grep 关键字：`[cdp]`、`[rehome]`、`error`。
 | 新增 | `stop-workdaddy.ps1` | 强制停止（压住 watchdog） |
 | 新增 | `fix-cdp.cmd` | 手工修复 CDP 的入口 |
 | 新增 | `rehome-audit.js` | 只读体检：查复活风险、双活副本、删除后写入 |
+| 新增 | `permission-sync.js` | 切号后把「允许完全访问」三层状态补齐（偏好 / 会话字段 / 窗口开关） |
 | 改造 | `daemon.js` | 接入 rehome 逻辑 + `/api/rehome/*` 路由 |
 | 改造 | `inject.js` | 面板文案与复选框绑定 |
 | 改造 | `lib.js` | 非 C 盘路径解析 + CDP 明文兜底 |
@@ -379,7 +400,7 @@ WorkDaddy/
 ├── HANDOFF.md                    交接文档：硬知识、SOP、已知缺口
 ├── REHOME-README.md              实现文档：踩坑记录、实测数据
 │
-├── scripts/                      13 个补丁文件都在这
+├── scripts/                      14 个补丁文件都在这
 │   ├── rehome-sessions.js        ← 接管核心
 │   ├── rehome-watcher.js
 │   ├── daemon.js                 上游改版

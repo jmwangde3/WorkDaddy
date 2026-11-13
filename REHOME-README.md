@@ -547,6 +547,43 @@ node scripts\rehome-audit.js --files  # 附带统计回收站占用的消息文�
 退出码 `0` = 无风险，`2` = 有风险，可直接接计划任务做巡检。已加入 `deploy.ps1` 的 `$newFiles` 清单（13 个文件）。
 
 
+### 11.10 「允许完全访问」切号后失效（23:2x，已修）
+
+**现象**：每次切号后，输入框底部的权限开关回到「默认权限」，必须重新点一次「允许完全访问」并过确认弹窗。
+
+**不是单开关，是三层状态**（客户端 app.asar 里可逐层验证）：
+
+| 层 | 位置 | 作用 | 读写点 |
+| --- | --- | --- | --- |
+| 账号偏好 | `storage/user-<uid>-personal/global/preferences.json` 的 `localTaskPermissionMode` | 新会话默认值 / 冷启动按钮态 | `ConfigService.preference()`，按 `storage.user` 作用域读 |
+| 会话字段 | `sessions.permission_mode`（`fullAccess` / `bypassPermissions` / `plan`） | 打开或恢复已有会话时的按钮态 | `WorkbuddyAdapter.getSessionPermissionState()`，读不到默认 `bypassPermissions` |
+| 窗口开关 | 渲染层 `useLocalTaskPermissionPreference()` | 当前窗口实时状态 | 按 `${enterpriseId}:${userId}` 作用域 hydrate，监听 `config.preference.localTaskPermissionMode.changed` |
+
+切号会换账号作用域并 `reload` 页面，三层里任意一层掉队，界面就显示成没开。实测两层都会掉：
+
+- 拨动开关会**直接改写账号偏好**：关掉后 `preferences.json` 立刻变成 `"localTaskPermissionMode": "default-sandbox"`（23:26:29 日志抓到 `账号偏好 default-sandbox → full-access`），所以旧值会跨会话留存。
+- 库里有 5 条活会话 `permission_mode` 为 NULL / `bypassPermissions`（旧自动复制留下的副本），打开它们必然显示默认权限。
+
+**修复（`scripts/permission-sync.js` + daemon 接线）**：
+
+1. `ensurePreference()`：只补 `localTaskPermissionMode` 一个键，原子写（`.tmp` + rename），其余键原样保留。
+2. `ensureSessionModes()`：`UPDATE sessions SET permission_mode='fullAccess' WHERE (deleted_at IS NULL OR deleted_at=-1) AND user_id=? AND COALESCE(is_background_automation,0)=0 AND COALESCE(permission_mode,'') NOT IN ('fullAccess','plan')`，带 4 次写锁重试；`plan` 是用户显式选择，不覆盖。
+3. `buildRendererScript()`：完全复刻人工操作 —— 点 `.cr-permission-setting` 开面板 → 未开则点 `input[role=switch]` → 等 `.wb-modal--confirm` → **先勾选「我已了解风险」复选框**（不勾时确认按钮是 `disabled`，这是第一版自动点失败的原因）→ 点「允许完全访问」→ 复验开关态 → 收面板。
+
+**接线**：`/api/switch` 成功后 `schedulePermissionSync(uid, { delayMs: reloaded ? 3500 : 1200 })`，6 次 × 2.5s 重试直到 `already-full-access` / `enabled`；账号监听 `onSwitch` 同样调用（覆盖客户端内直接登录）；daemon 启动只补前两层（`renderer:false`，避免每次开机闪一下面板）。手动入口 `POST /api/permission/ensure`。
+
+**实测（23:26，真实页面）**：
+
+```
+关闭开关                 → preferences.json: default-sandbox
+POST /api/permission/ensure → pref=fixed db=0 ui=enabled
+复验                      → 面板文案「当前权限为允许完全访问」，勾选态 true，无残留弹窗
+```
+
+再跑一次返回 `already-full-access`，幂等。5 条 NULL/`bypassPermissions` 会话已补齐为 `fullAccess`（`--apply` 输出 `会话权限 5 条`）。
+
+**副作用**：切号后约 3.5 秒，权限面板会被程序开一下再收起（约 1.5 秒），这是为了读开关态并拨回；不想让它动页面就只跑 CLI `node scripts/permission-sync.js --apply`。
+
 ## 12. 系统托盘控制器（WorkDaddyTray.exe）
 
 WorkDaddy 上游是纯后台双进程，没有托盘图标。本节补一个独立托盘程序，把「启动 / 关闭 / 开机自启」收进右键菜单。
