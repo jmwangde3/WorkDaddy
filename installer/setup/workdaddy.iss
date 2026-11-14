@@ -62,8 +62,11 @@ Filename: "powershell.exe"; \
   Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Expand-Archive -LiteralPath '{tmp}\workdaddy-setup\payload.zip' -DestinationPath '{tmp}\workdaddy-setup\payload' -Force"""; \
   StatusMsg: "正在解包..."; Flags: waituntilterminated runhidden
 ; Step 2：走测试过的安装器（快捷方式、数据初始化、安装记录都由它负责）
+; -Json 写到数据目录：Inno 的 [Run] 不传递子进程退出码，安装失败在 Setup 层面
+; 看不出来。这份报告是唯一的失败线索，verify-setup.ps1 会读它。
+; 不用 {tmp}：那是 Inno 自己的临时子目录，Setup 退出时会被删掉。
 Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\workdaddy-setup\payload\installer\install-workdaddy.ps1"" -SourceDir ""{tmp}\workdaddy-setup\payload"" -AppDir ""{localappdata}\Programs\WorkDaddy"" -DataDir ""{userappdata}\WorkDaddy"""; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\workdaddy-setup\payload\installer\install-workdaddy.ps1"" -SourceDir ""{tmp}\workdaddy-setup\payload"" -AppDir ""{localappdata}\Programs\WorkDaddy"" -DataDir ""{userappdata}\WorkDaddy"" -Json ""{userappdata}\WorkDaddy\install-report.json"""; \
   StatusMsg: "正在安装 WorkDaddy..."; Flags: waituntilterminated
 
 [UninstallRun]

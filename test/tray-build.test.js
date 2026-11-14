@@ -276,7 +276,17 @@ function main() {
     assert.match(r.text, /=== WorkDaddyTray\.exe self-test ===/);
     assert.match(r.text, /launcher\s*: exists=(True|False)/);
     assert.match(r.text, /watchdog\s*: exists=(True|False)/);
-    assert.match(r.text, /restored=True/, '--selftest 必须把自启动项还原：' + r.text);
+    // 最后一行打印的是「测试结束时的自启动状态」，不是布尔判断结果：
+    // 开发机上本来开着（was=True → restored=True），CI 上本来没开（was=False → restored=False）。
+    // 真正的不变量是「结束时 == 开始时」，不是「一定为 True」。
+    const m = r.text.match(/autostart RT : was=(\w+) on=(\w+) mid=(\w+) off=(\w+) end=(\w+) restored=(\w+)/);
+    assert.ok(m, '--selftest 缺 autostart RT 结果行：' + r.text);
+    assert.equal(m[2], 'True', 'on 应写入成功');
+    assert.equal(m[3], 'True', 'mid 应读到刚写入的值');
+    // off 是 DeleteValue 的返回值，即便删成功也可能报 False（键本来就不存在时），
+    // 所以不把它当承诺；真正要看的「关掉之后读回是关的」。
+    assert.equal(m[5], 'False', 'end 应读到已删除');
+    assert.equal(m[6], m[1], '自启动项必须还原到测试前的值');
     assert.match(r.text, /SELF-TEST OK/);
   });
 
