@@ -3,7 +3,6 @@
   "note": "上游元数据。所有字段都标注来源与验证方式；未验证的字段不得用于强制拦截部署。schema 4 起区分「补丁基线代际」与「上游最新代际」，并修正一处错误的祖先关系结论。",
   "verifiedAt": "2026-11-14T11:40:00Z",
   "source": "本地 git 对象库（git fetch upstream 后的 fb9f8db / 9b9bad5 两个提交），逐文件 blob 计算",
-
   "upstream": {
     "repository": "https://github.com/babygoton/WorkDaddy",
     "branch": "main",
@@ -15,12 +14,20 @@
     "commitMessage": "merge: integrate 1.2.22 into main",
     "verified": true,
     "recentCommits": [
-      { "sha": "9b9bad5f4d8cbba36486bca455db6910a1c7b948", "message": "merge: integrate 1.2.22 into main" },
-      { "sha": "03aeabcce4cafe42c2550dc5e8ba6050ea62ded2", "message": "fix: preserve official session pins across account switches" },
-      { "sha": "e8bcec1b9d70342d0778190e9132a39fdfcde83f", "message": "merge: consolidate yesterday's fixes into 1.2.22" }
+      {
+        "sha": "9b9bad5f4d8cbba36486bca455db6910a1c7b948",
+        "message": "merge: integrate 1.2.22 into main"
+      },
+      {
+        "sha": "03aeabcce4cafe42c2550dc5e8ba6050ea62ded2",
+        "message": "fix: preserve official session pins across account switches"
+      },
+      {
+        "sha": "e8bcec1b9d70342d0778190e9132a39fdfcde83f",
+        "message": "merge: consolidate yesterday's fixes into 1.2.22"
+      }
     ]
   },
-
   "fork": {
     "version": "1.3.0",
     "baseCommit": "fb9f8dbc75db7acb501c72d276acf066a18350b1",
@@ -39,54 +46,120 @@
       "fixedIn": "2026-11-14 全量 Fork 迁移（feat/full-fork-migration）"
     }
   },
-
   "deploy": {
-    "patchFiles": ["daemon.js", "inject.js", "lib.js", "win-launcher.js"],
-    "forkOnlyFiles": [
-      "rehome-sessions.js", "rehome-watcher.js", "rehome-audit.js",
-      "session-dedupe.js", "session-scope.js", "permission-sync.js", "upstream.json"
+    "patchFiles": [
+      "daemon.js",
+      "inject.js",
+      "lib.js",
+      "win-launcher.js"
     ],
-
+    "forkOnlyFiles": [
+      "rehome-sessions.js",
+      "rehome-watcher.js",
+      "rehome-audit.js",
+      "session-dedupe.js",
+      "session-scope.js",
+      "permission-sync.js",
+      "upstream.json"
+    ],
     "upstreamFileHashes": {
-      "daemon.js": { "sha256": "07eb156c47a2ba4edd222c4bc2b958504d145589947f2bf7652d000215373eea", "size": 719017, "generation": "1.2.20" },
-      "inject.js": { "sha256": "e39403bcc396dfabae7ff32e784e7a38f149008dcc2655e6216a9935be62c88a", "size": 1359391, "generation": "1.2.20" },
-      "lib.js": { "sha256": "5d3f1920c76fd981c5db7b2de8446875f9e7d5d2d487a8b9fe77bddbc505eb07", "size": 94114, "generation": "1.2.20" },
-      "win-launcher.js": { "sha256": "202c0da5093de5c62cf87b92289ca8e7e6569b3e6209eb7370f6ac1290110b56", "size": 85164, "generation": "1.2.20" },
-      "verify-win.cmd": { "sha256": "dedd8e63e2120d23e6dae1bb6dfa972b5fe9eb4bd9951b20dc514677202fda05", "size": 5086, "generation": "1.2.20" }
+      "daemon.js": {
+        "sha256": "07eb156c47a2ba4edd222c4bc2b958504d145589947f2bf7652d000215373eea",
+        "size": 719017,
+        "generation": "1.2.20"
+      },
+      "inject.js": {
+        "sha256": "e39403bcc396dfabae7ff32e784e7a38f149008dcc2655e6216a9935be62c88a",
+        "size": 1359391,
+        "generation": "1.2.20"
+      },
+      "lib.js": {
+        "sha256": "5d3f1920c76fd981c5db7b2de8446875f9e7d5d2d487a8b9fe77bddbc505eb07",
+        "size": 94114,
+        "generation": "1.2.20"
+      },
+      "win-launcher.js": {
+        "sha256": "202c0da5093de5c62cf87b92289ca8e7e6569b3e6209eb7370f6ac1290110b56",
+        "size": 85164,
+        "generation": "1.2.20"
+      },
+      "verify-win.cmd": {
+        "sha256": "dedd8e63e2120d23e6dae1bb6dfa972b5fe9eb4bd9951b20dc514677202fda05",
+        "size": 5086,
+        "generation": "1.2.20"
+      }
     },
     "upstreamFileHashesSource": "git cat-file blob <commit>:scripts/<file> 的字节，本地计算 SHA-256；size 取 git cat-file -s，二者互相印证。提交为 fb9f8db（1.2.20，本 fork 的补丁基线）。",
     "upstreamFileHashesVerifiedAt": "2026-11-14T11:40:00Z",
-
     "upstreamFileHashesByVersion": {
       "1.2.20": {
-        "daemon.js": { "sha256": "07eb156c47a2ba4edd222c4bc2b958504d145589947f2bf7652d000215373eea", "size": 719017 },
-        "inject.js": { "sha256": "e39403bcc396dfabae7ff32e784e7a38f149008dcc2655e6216a9935be62c88a", "size": 1359391 },
-        "lib.js": { "sha256": "5d3f1920c76fd981c5db7b2de8446875f9e7d5d2d487a8b9fe77bddbc505eb07", "size": 94114 },
-        "win-launcher.js": { "sha256": "202c0da5093de5c62cf87b92289ca8e7e6569b3e6209eb7370f6ac1290110b56", "size": 85164 },
-        "verify-win.cmd": { "sha256": "dedd8e63e2120d23e6dae1bb6dfa972b5fe9eb4bd9951b20dc514677202fda05", "size": 5086 }
+        "daemon.js": {
+          "sha256": "07eb156c47a2ba4edd222c4bc2b958504d145589947f2bf7652d000215373eea",
+          "size": 719017
+        },
+        "inject.js": {
+          "sha256": "e39403bcc396dfabae7ff32e784e7a38f149008dcc2655e6216a9935be62c88a",
+          "size": 1359391
+        },
+        "lib.js": {
+          "sha256": "5d3f1920c76fd981c5db7b2de8446875f9e7d5d2d487a8b9fe77bddbc505eb07",
+          "size": 94114
+        },
+        "win-launcher.js": {
+          "sha256": "202c0da5093de5c62cf87b92289ca8e7e6569b3e6209eb7370f6ac1290110b56",
+          "size": 85164
+        },
+        "verify-win.cmd": {
+          "sha256": "dedd8e63e2120d23e6dae1bb6dfa972b5fe9eb4bd9951b20dc514677202fda05",
+          "size": 5086
+        }
       },
       "1.2.22": {
-        "daemon.js": { "sha256": "c503febe78ca7d414e8210f06ddb440b4ee0f18a912bc34e3f944d4619d387d0", "size": 749088 },
-        "inject.js": { "sha256": "270a929083237f145d11e77ebedf69b48e03ee55d14e5d19ce28230cd38c1753", "size": 1386282 },
-        "lib.js": { "sha256": "7f57f0d097c5d25f6170d68fb3cb5234a2a213744ed1988c09444d3e0bbc7a48", "size": 96050 },
-        "win-launcher.js": { "sha256": "4c796b64985e7d12d2c71ca9edd8135b69075e3e6c7130866365f12e206e2b69", "size": 85801 },
-        "verify-win.cmd": { "sha256": "dedd8e63e2120d23e6dae1bb6dfa972b5fe9eb4bd9951b20dc514677202fda05", "size": 5086 }
+        "daemon.js": {
+          "sha256": "c503febe78ca7d414e8210f06ddb440b4ee0f18a912bc34e3f944d4619d387d0",
+          "size": 749088
+        },
+        "inject.js": {
+          "sha256": "270a929083237f145d11e77ebedf69b48e03ee55d14e5d19ce28230cd38c1753",
+          "size": 1386282
+        },
+        "lib.js": {
+          "sha256": "7f57f0d097c5d25f6170d68fb3cb5234a2a213744ed1988c09444d3e0bbc7a48",
+          "size": 96050
+        },
+        "win-launcher.js": {
+          "sha256": "4c796b64985e7d12d2c71ca9edd8135b69075e3e6c7130866365f12e206e2b69",
+          "size": 85801
+        },
+        "verify-win.cmd": {
+          "sha256": "dedd8e63e2120d23e6dae1bb6dfa972b5fe9eb4bd9951b20dc514677202fda05",
+          "size": 5086
+        }
       }
     },
     "upstreamFileHashesByVersionNote": "部署闸门把任一已知上游代际都判为 pristine-upstream：装 1.2.20 或 1.2.22 原版都说明「没打过我们的补丁」，覆盖都会丢上游修复，都该中止。只按最新代际判会漏掉旧安装。",
-
     "localFileHashes": {
-      "daemon.js": { "sha256": "f63870bcd44ea78ebeee70fc4e5865aed2ee4a1002e99576413552e33fb296e9", "size": 767555 },
-      "inject.js": { "sha256": "da494c60ae3b1888e4bf5d7f6da924561dc9af2a72ba943b18041a671a77de00", "size": 1386452 },
-      "lib.js": { "sha256": "b17fc6f916b2f03c6d4d92b74400168c0eb5962497089dc35b13ec12db9928d2", "size": 96966 },
-      "win-launcher.js": { "sha256": "f668f07b0b98b75f21f0014b92f0a749b9079a7307c0af2649ddd48f025d5e10", "size": 86752 }
+      "daemon.js": {
+        "sha256": "e80482f99bd059cbd7dbc8ff8ffaa86147bf63fd4d4410e09e99a8df5d504cc3",
+        "size": 765191
+      },
+      "inject.js": {
+        "sha256": "da494c60ae3b1888e4bf5d7f6da924561dc9af2a72ba943b18041a671a77de00",
+        "size": 1386452
+      },
+      "lib.js": {
+        "sha256": "b17fc6f916b2f03c6d4d92b74400168c0eb5962497089dc35b13ec12db9928d2",
+        "size": 96966
+      },
+      "win-launcher.js": {
+        "sha256": "f668f07b0b98b75f21f0014b92f0a749b9079a7307c0af2649ddd48f025d5e10",
+        "size": 86752
+      }
     },
     "localFileHashesNote": "本仓库 scripts/ 下补丁文件在记录时刻的 SHA-256（合并上游 1.2.22 之后重算）。deploy.ps1 判定用运行时实际计算的哈希；这一组只用于发现元数据过期（patch-drift 提示）。改动补丁文件后必须重算，deploy-safety 测试会校验两者一致。",
-
     "generationFinding": "本 fork 的补丁基线是 1.2.20（fb9f8db），不是 1.2.22。四个补丁文件在 1.2.20 与 1.2.22 之间全部发生了变化，因此：把本 fork 的文件覆盖到 1.2.22 安装目录会丢上游修复；反过来把 1.2.22 原版当成「已打补丁」也是错的。两个代际的哈希都已记录，任一命中即中止。",
     "fileGenerationGate": "hard-sha256-multi-generation",
     "fileGenerationGateReason": "闸门依据是目标文件与「本补丁版 / 任一已知上游代际」的 SHA-256 是否相等，属于可测量的事实；未知代际一律中止，-Force 才可越过。旧版只比字节数，同大小不同内容会被误判成已打补丁。",
-
     "conflicts": {
       "session-pin-sync.js": {
         "upstreamSize": 5723,
@@ -95,7 +168,6 @@
       }
     }
   },
-
   "versionGate": {
     "enforce": false,
     "mode": "advisory",
@@ -103,11 +175,12 @@
     "optInFlag": "-StrictVersionGate",
     "forceOptInFlag": "-ForceVersion"
   },
-
   "runtime": {
     "minNodeVersion": "22.13.0",
     "minNodeVersionSource": "node:sqlite 在 22.13 起无需 --experimental-sqlite；CI 有独立 job 复核",
-    "testedWorkBuddyVersions": ["5.9.3"],
+    "testedWorkBuddyVersions": [
+      "5.9.3"
+    ],
     "supportedWorkBuddyRange": null,
     "supportedWorkBuddyRangeNote": "没有跨版本实测数据，不声明支持区间。仅记录实测过的版本。"
   }

@@ -191,6 +191,19 @@ const {
   applyFullAccess, readGuardState, startPreferenceGuard, stopRendererGuard,
   stopPermissionGuards, getPermissionStatus, readGuardConfig, setGuardSwitch,
 } = require('./permission-sync.js');
+// 分叉新增接口（接管 / 去重）的分发器。路由实现放在 src/features/sessions/**/routes.js，
+// daemon 只注入依赖；详见 src/features/README.md。
+const { createForkRoutes, NOT_HANDLED: FORK_NOT_HANDLED } = require('../src/features/integration/fork-routes.js');
+
+// 分发器懒初始化：readBody / json / currentAccount 是函数声明（有提升），
+// getRehomeRunner 也已定义，首次请求时依赖一定就绪。
+let forkRouteHandler = null;
+function handleForkRoutes(req, res, p) {
+  if (!forkRouteHandler) {
+    forkRouteHandler = createForkRoutes({ getRunner: getRehomeRunner, readBody, json, currentAccount });
+  }
+  return forkRouteHandler(req, res, p);
+}
 
 // 切号后原地接管会话归属（不复制会话、不改会话 ID）。懒初始化：
 // PROFILE / DATA_DIR / log 在下方定义，函数体到调用时才求值。
@@ -10875,66 +10888,13 @@ function handleApi(req, res) {
     }).catch((error) => json(res, 400, { ok: false, error: error.message }));
   }
 
-  // 会话归属接管（rehome）：状态 / 开关 / 手动触发（支持干跑）
-  if (req.method === 'GET' && p === '/api/rehome/status') {
-    return Promise.resolve(getRehomeRunner().inspectTransports())
-      .catch(() => null)
-      .then((transports) => json(res, 200, { ok: true, ...getRehomeRunner().status(), transports }));
-  }
-  if (req.method === 'POST' && p === '/api/rehome/config') {
-    return readBody(req).then((body) => {
-      if (!body || typeof body.enabled !== 'boolean') return json(res, 400, { ok: false, error: '缺少 enabled 布尔值' });
-      return json(res, 200, { ok: true, ...getRehomeRunner().setEnabled(body.enabled) });
-    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
-  }
-  // 去重开关：默认关闭，必须显式打开；mode 只能是 exact / containment。
-  if (req.method === 'POST' && p === '/api/rehome/dedupe/config') {
-    return readBody(req).then((body) => {
-      if (!body || typeof body.dedupe !== 'boolean') return json(res, 400, { ok: false, error: '缺少 dedupe 布尔值' });
-      const mode = body.mode === 'containment' ? 'containment' : 'exact';
-      return json(res, 200, { ok: true, ...getRehomeRunner().setDedupe(body.dedupe, mode) });
-    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
-  }
-  if (req.method === 'POST' && p === '/api/rehome/run') {
-    return readBody(req).then(async (body) => {
-      const payload = body || {};
-      const uid = String(payload.uid || (currentAccount() || {}).uid || '').trim();
-      const result = await getRehomeRunner().run(uid, { dryRun: !!payload.dryRun });
-      return json(res, result.ok === false ? 500 : 200, result);
-    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
-  }
-  if (req.method === 'POST' && p === '/api/rehome/dedupe') {
-    return readBody(req).then(async (body) => {
-      const payload = body || {};
-      const result = await getRehomeRunner().runDedupe({
-        dryRun: !!payload.dryRun,
-        mode: payload.mode === 'containment' || payload.aggressive === true ? 'containment' : 'exact',
-        force: payload.force === true,
-      });
-      return json(res, result.ok === false ? 409 : 200, { ok: result.ok !== false, ...result });
-    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
-  }
-  if (req.method === 'POST' && p === '/api/rehome/dedupe/rollback') {
-    return readBody(req).then(async (body) => {
-      const journal = String((body && body.journal) || '').trim();
-      if (!journal) return json(res, 400, { ok: false, error: '缺少操作日志路径' });
-      const result = await getRehomeRunner().runRollback(journal, { dryRun: !!(body && body.dryRun) });
-      return json(res, 200, { ok: true, ...result });
-    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
-  }
-  if (req.method === 'POST' && p === '/api/rehome/dedupe/background') {
-    return readBody(req).then(async (body) => {
-      const payload = body || {};
-      // 后台任务隔离：默认只读；写入必须同时给 allowBackground 与 apply。
-      const result = await getRehomeRunner().runBackgroundDedupe({
-        dryRun: payload.dryRun !== false,
-        allowBackground: payload.allowBackground === true,
-        apply: payload.apply === true,
-        mode: payload.mode === 'containment' || payload.aggressive === true ? 'containment' : 'exact',
-        force: payload.force === true,
-      });
-      return json(res, result.ok === false ? 409 : 200, { ok: result.ok !== false, ...result });
-    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
+  // 会话归属接管 / 去重：7 条接口已搬到 src/features/sessions/**/routes.js。
+  // 这里只留一行分发，把分叉对 daemon.js 的改动压到最小，减少同步上游时的冲突面。
+  // 用 typeof 守卫：部分测试会把 handleApi 的源码切片后放进 vm 执行，那个上下文里
+  // 没有本函数（也没有 FORK_NOT_HANDLED），守卫让这些用例继续只测它关心的接口。
+  if (typeof handleForkRoutes === 'function') {
+    const routed = handleForkRoutes(req, res, p);
+    if (routed !== FORK_NOT_HANDLED) return routed;
   }
 
   if (req.method === 'GET' && p === '/api/automations') {
