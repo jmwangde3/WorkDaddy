@@ -318,3 +318,16 @@ test/session-pin-sync.test.js       PASS（7 场景）
 - `scripts/daemon.js` → `DAEMON_VERSION = '1.3.0'` / `DAEMON_BUILD_ID = 'release-1.3.0-safe-defaults'`
 
 升级说明必须在 Release Notes 首行写明：**去重不再自动执行；权限守卫默认全部关闭，需要手动开启。**
+
+---
+
+## 11. 第二轮修复（发布前复核通过后）
+
+首轮 CI 全绿之后，又按复核意见做了四项收紧（P0-1 去重保序、P0-2 legacy
+`deleted_at=-1` 默认阻断、P1-1 部署代际改 SHA-256、P1-2 历史失败错误指纹），
+外加把 `-Force` 与 `-StrictVersionGate` 解耦（新增 `-ForceVersion`）。
+
+完整记录在 `REVIEW-1.3.0.md` §9，本文件不重复，避免两处数字不一致。
+
+第二轮结论：**1612 用例 / 1548 通过 / 57 历史失败 / 7 跳过 / 新增失败 0**，
+基线 schema 由 3 升到 4（条目数 57 → 57，没有为通过而删条目）。

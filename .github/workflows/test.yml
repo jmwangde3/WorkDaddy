@@ -25,9 +25,9 @@ jobs:
       matrix:
         node: ['22.14.0']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
 
@@ -63,7 +63,7 @@ jobs:
           - ps: '7'
             exe: pwsh.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # 语法、BOM、CRLF 三项检查写在脚本里，用命令行参数指定用哪个解释器跑。
       # 注意：GitHub Actions 的 shell: 字段不接受 ${{ matrix.* }} 表达式
@@ -81,9 +81,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.13.0'
 

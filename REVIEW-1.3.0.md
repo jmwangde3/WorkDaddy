@@ -2,7 +2,7 @@
 
 - 仓库：`H:\AI工作区\wb账号同步\WorkDaddy`
 - 复核分支：`fix/workdaddy-data-permission-hardening`（从 `main` @ `041e3dc` 拉出，`main` 未动）
-- 本轮提交：1 个（本地，未推送）
+- 本轮提交：第一轮 1 个 + CI 适配 3 个（已推送，CI 全绿）；第二轮 P0/P1 修复 1 个（本地，待推）
 - 复核日期：2026-11-14
 - 环境：Windows 11 26100 / Node v22.14.0 / PS 5.1.26100.9711 / PS 7.7.0
 
@@ -12,10 +12,11 @@
 
 - 发现并修复的实质问题：**9 个**（其中 4 个会导致误删或误判、2 个会让新增失败被误判为历史失败、1 个是本机文件被降级的风险、1 个是停止不彻底、1 个是语义自相矛盾）
 - 复核后新增测试：去重 +4 类、范围 +2 组、权限 +2 组、部署 +3 组
-- 全量结果：**1611 用例 / 1547 通过 / 57 历史失败 / 7 跳过 / 新增失败 0**（退出码 0）
+- 全量结果（第二轮后）：**1612 用例 / 1548 通过 / 57 历史失败 / 7 跳过 / 新增失败 0**（退出码 0）
 - 未触碰：真实 WorkBuddy 数据库、真实安装目录、`main` 分支历史
 
-**具备推送独立分支并触发 GitHub CI 的条件**（详见 §6）。
+**已推送并跑通 GitHub CI**（首轮三轮适配见 §7）。第二轮四项修复见 §9。
+
 
 ---
 
@@ -176,20 +177,23 @@ daemon 的 `POST /api/rehome/dedupe/background` 同步改为默认 `dryRun`。�
 ## 4. 测试结果
 
 ```
-逐文件全量：184 个文件
-用例 1611 / 通过 1547 / 失败 57 / 跳过 7
+逐文件全量：185 个文件（第二轮新增 run-ci-signature.test.js）
+用例 1612 / 通过 1548 / 失败 57 / 跳过 7
 已知失败(基线) 57   新增失败 0   基线已修复 0
-基线用例 1611   本次 1611   差 +0
+基线用例 1612   本次 1612   差 +0
+基线 schema 4（文件 + 用例名 + 规范化错误签名，三重匹配）
 退出码 0
 ```
 
 | 套件 | 结果 |
 |---|---|
-| `rehome-dedupe.test.js` | PASS — 21 类场景 |
-| `session-scope.test.js` | PASS — 6 组 |
+| `rehome-dedupe.test.js` | PASS — 24 类场景（含同 ID 乱序 / 无 ID 乱序 / 混合乱序） |
+| `session-scope.test.js` | PASS — 6 组（含真实临时 SQLite 验证 `-1` 不被接管） |
 | `permission-guard.test.js` | PASS |
 | `rehome-watcher-retry.test.js` | PASS — 8 场景 |
-| `deploy-safety.test.js` | PASS — 8 组 |
+| `deploy-safety.test.js` | PASS — 13 组（含同大小不同内容、pristine、unknown、`-Force` / `-ForceVersion` 分离） |
+| `run-ci-signature.test.js` | PASS — 13 组（含 2 条「同名不同错误必须算新增」负例） |
+| `rehome-sessions.test.js` | PASS — 含「老库 -1 默认阻断写入」+「显式承认后 `-1` 仍不接管」 |
 | `session-pin-sync.test.js` | PASS — 7 场景 |
 
 静态检查：
@@ -205,29 +209,28 @@ daemon 的 `POST /api/rehome/dedupe/background` 同步改为默认 `dryRun`。�
 | # | 风险 | 触发条件 | 影响 | 缓解 |
 |---|---|---|---|---|
 | R1 | 补丁基线不是上游 1.2.22 | 直接部署到 1.2.22 安装目录 | 丢失上游修复（含 pin 同步） | 文件代际硬闸；`-Force` 才越过 |
-| R2 | 上游 HEAD 会继续前进 | 上游再发版 | 字节数变化 → 代际闸门判 `unknown-generation` 只警告 | 重跑 API 更新 `upstreamFileSizes` |
+| R2 | 上游 HEAD 会继续前进 | 上游再发版 | 哈希不同 → 判 `unknown-generation`，默认中止（`-Force` 才越过） | 重跑 API 更新 `upstreamFileHashes` |
 | R3 | 旧守卫监听器结构未知 | 1.2.80 装过且页面没重载 | 极少数监听器可能残留 | `needsReload` + `--reload` |
 | R4 | cloud 会话端到端未验证 | 开启 `cloudVerified` | 可能改错云会话归属 | 默认关；代码不自动置真 |
 | R5 | 相对路径附件引用 | 客户端未来改成相对路径 | 去重能力下降（退化为只认字节） | 安全方向，不误删 |
-| R6 | 57 条历史失败仍在 | — | 真回归可能被淹没在噪声里 | 双匹配 + 四道闸；新增失败一定报 |
+| R6 | 57 条历史失败仍在 | — | 真回归可能被淹没在噪声里 | 三重匹配（文件+名字+错误签名）+ 四道闸；新增失败与「同名换原因」一定报 |
 | R7 | `zz` 探测验证依赖人工 | — | — | 已实测一次并删除探针 |
-| R8 | CI 尚未在 GitHub 真跑 | 首次推送 | workflow 语法/权限可能有小问题 | 只读 `contents: read`，三个 job 独立 |
+| R8 | CI 环境与本地差异 | 后续提交 | 行尾/编码/时区类失败 | 已在 GitHub 真跑通三轮适配（§7），`.gitattributes` 钉死 LF |
 
 ---
 
 ## 6. 是否具备推送条件
 
-**具备。** 判断依据：
+**具备，且已执行。** 判断依据：
 
-1. 全量测试退出码 0，新增失败 0，基线 schema 3 已固化；
+1. 全量测试退出码 0，新增失败 0，基线 schema 4 已固化；
 2. 分支 `fix/workdaddy-data-permission-hardening` 独立，`main` 仍停在 `041e3dc`，历史未被改写；
-3. 已提交（1 个 commit），工作区干净；
+3. 已提交，工作区干净；
 4. `deploy.ps1` 在 PS 5.1 与 7.7.0 双版本解析通过，`-DryRun` 实跑通过；
 5. CI workflow 只申请 `contents: read`，不含任何发布/写 Release 步骤。
 
-**推送前唯一需要你点头的**：是否允许 `git push -u origin fix/workdaddy-data-permission-hardening`。推送后 CI 会自动跑 `node-tests`（Windows + Node 22.14）、`powershell-check`（5.1/7 矩阵）、`node-version-floor`（22.13）。
-
-不推送、不合并、不发 Release —— 等你的指令。
+推送已获授权并完成（首次推送 commit `0bebf5f` 之前那一串），CI 结果见 §7。
+第二轮仍只推这个独立分支，不合并、不发 Release。
 
 ## 7. 推送与首轮 CI（2026-11-14）
 
@@ -244,35 +247,171 @@ daemon 的 `POST /api/rehome/dedupe/background` 同步改为默认 `dryRun`。�
 **新增失败 0**；`powershell-check` 5.1 与 7 双绿；`node-version-floor` 绿。
 基线未改动。
 
-## 8. 后续发布前事项（未在本轮处理）
+## 8. 发布前事项的处理状态（第二轮已全部处理）
 
-1. **无 ID 消息的包含关系安全性**
-   当前包含层对无 `id` 记录用「内容哈希多重集 ⊆」判定。同一条无 id 记录
-   重复出现多次时，多重集计数能区分，但**顺序信息丢失**：A 有 [m1,m2]、
-   B 有 [m2,m1]，集合层面互为子集，若同 id 部分也一致就会被判 equal。
-   发布前应改为「按行序列做子序列校验」或直接对无 id 记录要求逐字节相同。
+上一版这一节是 5 条待办。第二轮按 P0-1 / P0-2 / P1-1 / P1-2 逐条落地，
+每条都配了回归用例，没有一条只是「改注释 / 改文档」。
 
-2. **Legacy `deleted_at = -1` 的处理**
-   `legacy-no-transport`（表里没有 `transport` 列）目前沿用旧行为，只把
-   `-1` 行数作为 `legacy-minus-one-rows` 报出来，不纳入接管范围也不判失败。
-   发布前需在真实旧库副本上确认：旧版到底用 `NULL` 还是 `-1` 表示未删除，
-   再决定是否把 legacy 分支也收紧为单一编码。
+1. **无 ID 消息的包含关系安全性** → **已修**。顺序不再丢：每行记录都进
+   `order` 序列（无 id 用内容哈希占位），`equal` 要求序列相等，包含关系要求
+   子序列。A=[m1,m2] / B=[m2,m1] 一律各自保留。见 §9.1。
 
-3. **上游文件 SHA-256 代际验证**
-   现在的文件代际闸门比的是**字节数**（目标 == 上游实测大小 → 判为原版）。
-   字节数会撞：不同版本恰好同大小就无法区分。应改为比对上游文件的
-   SHA-256，把 `upstream.json.deploy.upstreamFileSizes` 扩成
-   `upstreamFileHashes`，同时保留大小作为快速预筛。
+2. **Legacy `deleted_at = -1`** → **已修**。老库 `-1` 行移出写入范围，且
+   「存在 `-1` 行 + 未显式承认」默认**阻断写入**（返回 `blocked:true`，不是
+   只打一行警告）。即使写 `allowLegacyAmbiguous: true`，`-1` 行仍不接管。见 §9.2。
 
-4. **历史失败增加错误指纹**
-   `known-failures.json` 目前按 `{file, name}` 匹配。若某条历史失败换了
-   失败原因（比如断言语义变了但用例名没变），会被继续当成同一条已知失败。
-   应把 TAP 的 `error` / `code` 归一化后存成指纹，匹配时要求用例名 + 指纹
-   同时命中，否则算新增失败。
+3. **上游文件 SHA-256 代际验证** → **已修**。`upstream.json` 升 schema 3，
+   存上游原版与本地补丁双方的 `{sha256,size}`；`deploy.ps1` 三种判定全部按
+   哈希，`pristine-upstream` 与 `unknown-generation` 默认中止（`exit 2`），
+   只有 `-Force` 越过。见 §9.3。
 
-5. **PowerShell 5.1 实际 DryRun 与回滚测试**
-   目前 `deploy-safety.test.js` 用 `spawnSync('powershell.exe')` 跑，覆盖了
-   版本闸门与故障注入回滚，但**没有**在 5.1 上跑一次完整 `-DryRun` 到
-   「生成部署报告」的端到端路径；也没验证 5.1 下 `Copy-Item` 失败时的
-   回滚顺序。发布前补一条「PS 5.1 + 真实临时目录 + 中途失败」的用例。
+4. **历史失败增加错误指纹** → **已修**。`known-failures.json` 升 schema 4，
+   匹配改为「文件 + 用例名 + 规范化错误签名」；同名但错误内容变化按新增失败
+   处理，并打印基线签名与本次签名。见 §9.4。
+
+5. **PowerShell 5.1 实际 DryRun 与回滚测试** → **已覆盖**。
+   `deploy-safety.test.js` 全部用例都用 `powershell.exe`（5.1）实际执行
+   `deploy.ps1`，包含 `-DryRun`、临时目录真实部署、故障注入回滚三条路径。
+   见 §9.5。
+
+---
+
+## 9. 第二轮修复（P0-1 / P0-2 / P1-1 / P1-2，2026-11-14）
+
+### 9.1 P0-1 精确副本必须比「完整规范化记录序列」
+
+问题：`compareFingerprints` 只比消息多重集，顺序不同也判 equal；无 ID 记录
+只进多重集，顺序信息彻底丢失。
+
+改法：
+
+- `inspectSessionFile` 每行 push 一个 `order` 元素（有 `id` 用 id，无 id 用
+  内容哈希占位），得到完整序列；`messages`（id→哈希）与 `unkeyed`（多重集）保留。
+- 新增 `orderEqual(a,b)`；`equal` 判定改为
+  `messagesEqual && multisetEqual && orderEqual`。
+- 新增 `isSubsequence(a,b)`；允许包含时除集合包含外，还要求
+  `b.order` 是 `a.order` 的子序列。
+- `judgeGroup` 第 1 步并查集只 union `relation === 'equal'` 的组；第 2 步对
+  不满足子序列的候选记入 `containmentSkipped`，不合并。
+
+效果：顺序不同的一律各自保留，宁可少删。
+
+测试：`test/rehome-dedupe.test.js` 新增 `writeSessionOrdered` 与三类乱序用例
+（同 ID 乱序 / 无 ID 乱序 / 混合乱序），断言 `ok === true` 但 `groups === 0`、
+`dropped === 0`。
+
+### 9.2 P0-2 legacy `deleted_at = -1` 移出写入范围 + 默认阻断
+
+问题：老库（无 `transport` 列）沿用旧口径，`-1` 行只被统计不阻断，仍在
+可能的写入范围内。
+
+改法：
+
+- `session-scope.js`：local-only 改为
+  `deleted_at IS NULL AND (transport IS NULL OR transport = 'local')`；
+  新增 `assessDeletedSemantics(db)`，按 transport 分组统计 `deleted_at`，
+  出现 local=-1 / cloud=NULL / 未知 transport 即 `verified=false` 并列出 `issues`。
+- `rehome-sessions.js`：真实写入前判断「老库 + 存在 `-1` 行 + 未显式承认」→
+  返回 `{ ok:false, skipped:'legacy-deleted-at-ambiguous', blocked:true,
+  affected:0, hint }`；dry-run 不写库，但如实标 `blocked:true` 与 `ambiguity.rows`。
+- `rehome-watcher.js`：`ok === false` 或 `blocked` 时不推进 `lastConfirmedUid`，
+  状态进 `failed`。
+
+即使配置 `allowLegacyAmbiguous: true`，`-1` 行仍然不进写入范围（只写
+`deleted_at IS NULL`）。
+
+测试：`test/session-scope.test.js` 用真实临时 SQLite 造老库，断言
+`blocked.ok === false`、`affected === 0`、`scope === 'legacy-no-transport(strict)'`；
+`test/rehome-sessions.test.js` 覆盖「默认阻断 → 一行没动 → 显式承认后只写 4 行 →
+第二次幂等 0 行」。
+
+### 9.3 P1-1 部署代际闸门改 SHA-256
+
+问题：旧实现比字节数，同大小不同内容会被判 `already-patched` 直接覆盖。
+
+改法：
+
+- `scripts/upstream.json` 升 schema 3，新增 `deploy.upstreamFileHashes` 与
+  `deploy.localFileHashes`，每项 `{sha256,size}`；上游按 `9b9bad5`（1.2.22）实取，
+  本地按当前补丁文件实算。
+- `deploy.ps1` 3b：目标哈希 == 补丁哈希 → `already-patched`；
+  == 上游哈希 → `pristine-upstream`；其余（含缺上游哈希）→ `unknown-generation`。
+  `pristine-upstream` 与 `unknown-generation` 默认 `exit 2`，只有 `-Force` 越过。
+- 顺带解耦：`-StrictVersionGate` 原来会被 `-Force` 一起越过。而「目标版本被
+  改过」必然意味着 daemon.js 哈希不等于补丁哈希，也就必然要 `-Force` 才能过
+  代际闸门 —— 于是版本闸门永远不可能触发，等于被代际闸门顺手拆掉。现在版本
+  闸门只认新开关 `-ForceVersion`，两个闸门各用各的开关。
+
+测试：`test/deploy-safety.test.js` 13 组，全程 `powershell.exe` 实跑，含：
+
+- 同大小不同内容（把 `daemon.js` 里一个 `A` 改成 `B`，字节数不变）→
+  `exit 2` + `代际不明`；
+- pristine 上游 → `exit 2` + `原版上游`；
+- `-Force` 越过代际、`-ForceVersion` 越过版本闸门；
+- 真实部署（`workbuddy-exe.json` 保留、新文件落盘、报告生成）；
+- 故障注入回滚 → `exit 4`，`daemon.js` 恢复原内容、新建文件被清理。
+
+### 9.4 P1-2 历史失败指纹（schema 4）
+
+问题：`known-failures.json` 只按 `{file,name}` 匹配，同名换原因会被当成
+历史失败放过去。
+
+改法：
+
+- 新增 `test/tap-fingerprint.js`：从 TAP 提取每个失败用例的 `error`
+  （块标量 / 单行标量 / `stack` 兜底），规范化后作为签名。
+- 规范化范围：绝对路径 → `<PATH>`、UUID → `<UUID>`、ISO 时间 → `<TIME>`、
+  日期 → `<DATE>`、长十六进制 → `<HEX>`、端口 → `<PORT>`、6 位以上数字 →
+  `<NUM>`、mkdtemp 风格目录名 → `<TMPNAME>`。**不**规范化错误类型、错误码、
+  actual/expected 的值 —— 那正是错误原因本身。
+- 匹配从「文件 + 名字」升为「文件 + 名字 + 签名」三重；同名不同签名 →
+  `reason: 'signature-changed'`，按新增失败处理，并打印基线签名与本次签名。
+- schema < 4 的旧条目仍可匹配（只按名字），但会打印条数告警，不静默放宽。
+- 顺带修了个真 bug：`parseTap` 里最后一个 `not ok` 会吞掉尾部
+  `# tests` / `# fail` 统计块，导致 `mismatch` 检查形同虚设。
+
+测试：`test/run-ci-signature.test.js` 13 组，含两条负例（同文件同名字不同签名
+→ `kind === null`；文件不同 → `name-unknown`），以及「两台机器不同路径 / UUID /
+时间 / 端口 / pid 得到同一签名」。
+
+结果：基线从 schema 3（57 条无签名）升到 schema 4（57 条带签名）。升级前后
+各跑一次全量，新增失败都是 0；条目数没有减少（57 → 57）。
+
+### 9.5 PowerShell 5.1 实测范围（回应上一版 §8-5）
+
+`test/deploy-safety.test.js` 里所有部署用例都是
+`spawnSync('powershell.exe', ...)`，即 Windows PowerShell 5.1 实际执行
+`deploy.ps1`，不是静态解析：
+
+- `-DryRun` 走到「代际检查」并输出报告；
+- 真实部署（临时 `-TargetDir`）验证 `workbuddy-exe.json` 不被覆盖、新文件落盘、
+  部署报告生成；
+- 故障注入（`WORKDADDY_DEPLOY_TESTING=1` + `WORKDADDY_DEPLOY_FAIL_AFTER=3`）
+  验证回滚顺序：`exit 4`、`daemon.js` 恢复原内容、新建文件被清理。
+
+唯一没覆盖的是「真实安装目录」——按约束不碰。
+
+### 9.6 附带修正
+
+- `test/rehome-sessions.test.js` 原来断言 `deleted_at=-1` 的 s7 会被接管（5 行）。
+  按 P0-2 新语义改为 4 行 + 默认阻断，并补「显式承认后 s7 仍不动」。
+- `deploy.ps1` 的 pristine 提示文案补上「原版上游文件」字样，与文档里的
+  `pristine-upstream` 对齐，否则日志看不出拦的是哪一类。
+- GitHub Actions 的 `actions/checkout` / `setup-node` 由 `v4` 升到 `v5`，
+  消掉 Node 20 runtime 弃用警告；`upload-artifact` 暂留 `v4`（只在失败时用，
+  升级风险大于收益）。
+- 本文件顶部的提交数、§0 与 §4 的用例数、§5 的 R2/R6/R8 都改成当前事实。
+
+### 9.7 第二轮验证
+
+```
+逐文件全量：185 个文件
+用例 1612 / 通过 1548 / 失败 57 / 跳过 7
+基线 schema 4   已知失败 57   新增失败 0   基线已修复 0
+退出码 0
+```
+
+基线没有为了「通过」而删掉任何条目：升级前后都是 57 条。新增的 2 条用例
+（`run-ci-signature.test.js`）让总数从 1611 变 1612，属于新增文件，不是旧用例消失。
+
 
