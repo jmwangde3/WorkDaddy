@@ -1,2 +1,7 @@
-*.cmd -text whitespace=cr-at-eol
+# .cmd / .bat 由 cmd.exe 执行：裸 LF 会让 goto / for / 多行 if 出错。
+# 这里显式声明 eol=crlf，保证任何平台 checkout 出来都是 CRLF（CI 的 CRLF 检查依赖它）。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# shell 脚本必须 LF，否则容器/CI 里会因 shebang 后的 \r 报 "bad interpreter"。
 *.sh text eol=lf

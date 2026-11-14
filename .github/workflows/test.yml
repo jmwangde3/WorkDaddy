@@ -30,15 +30,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-          cache: ''
 
       - name: 环境信息
-        shell: pwsh
+        shell: bash
         run: |
           node -v
           npm -v
-          $PSVersionTable.PSVersion.ToString()
-          Write-Host "PowerShell 7: $($PSVersionTable.PSVersion.Major)"
+          echo "runner: $RUNNER_OS $RUNNER_ARCH"
 
       - name: 完整测试（只对新增失败报错）
         shell: bash
@@ -61,54 +59,22 @@ jobs:
       matrix:
         include:
           - ps: '5.1'
-            shell: powershell
+            exe: powershell.exe
           - ps: '7'
-            shell: pwsh
+            exe: pwsh.exe
     steps:
       - uses: actions/checkout@v4
 
-      - name: 解析全部 .ps1（${{ matrix.ps }}）
-        shell: ${{ matrix.shell }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $bad = 0
-          $files = Get-ChildItem -Path . -Filter *.ps1 -Recurse -File
-          foreach ($f in $files) {
-            $errs = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
-            if ($errs -and $errs.Count -gt 0) {
-              $bad++
-              Write-Host ("::error file={0}::{1}" -f $f.FullName, $errs[0].Message)
-            }
-          }
-          Write-Host ("已解析 {0} 个脚本，错误 {1} 个" -f $files.Count, $bad)
-          if ($bad -gt 0) { exit 1 }
+      # 语法、BOM、CRLF 三项检查写在脚本里，用命令行参数指定用哪个解释器跑。
+      # 注意：GitHub Actions 的 shell: 字段不接受 ${{ matrix.* }} 表达式
+      # （会报 Unrecognized named-value: 'matrix'），所以这里用 bash 起进程。
+      - name: 语法 / BOM / CRLF 检查（PowerShell ${{ matrix.ps }}）
+        shell: bash
+        run: ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass -File .github/scripts/check-powershell.ps1
 
-      - name: UTF-8 BOM / CRLF 检查
-        shell: ${{ matrix.shell }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $issues = 0
-          foreach ($f in Get-ChildItem -Path . -Filter *.ps1 -Recurse -File) {
-            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
-            $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-            # 纯 ASCII 脚本不强制 BOM；含中文/非 ASCII 的必须带 BOM，否则 PS 5.1 按 ANSI 解读会乱码。
-            $hasNonAscii = $false
-            foreach ($b in $bytes) { if ($b -gt 127) { $hasNonAscii = $true; break } }
-            if ($hasNonAscii -and -not $hasBom) {
-              Write-Host ("::error file={0}::缺少 UTF-8 BOM（PowerShell 5.1 下中文会乱码）" -f $f.FullName)
-              $issues++
-            }
-          }
-          foreach ($f in Get-ChildItem -Path scripts -Filter *.cmd -File) {
-            $text = [System.IO.File]::ReadAllText($f.FullName)
-            if ($text -notmatch "`r`n") {
-              Write-Host ("::error file={0}::cmd 必须使用 CRLF" -f $f.FullName)
-              $issues++
-            }
-          }
-          if ($issues -gt 0) { exit 1 }
-          Write-Host '编码检查通过'
+      - name: 解释器版本回显
+        shell: bash
+        run: ${{ matrix.exe }} -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
   node-version-floor:
     name: node:sqlite 最低版本检查
@@ -120,7 +86,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.13.0'
-          cache: ''
 
       - name: 验证 node:sqlite 无需实验开关
         shell: bash
