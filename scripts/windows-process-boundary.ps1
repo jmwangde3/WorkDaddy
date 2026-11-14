@@ -147,7 +147,18 @@ function ConvertTo-WorkDaddyProcessRecordIfPresent {
   try { return ConvertTo-WorkDaddyProcessRecord -Process $Process }
   catch {
     if (Test-CimProcessDisappearedError $_) { return $null }
-    throw
+    # 字段读不全：5.11.x 起客户端带 prewarm 进程池，进程会在查询瞬间退出，
+    # CommandLine / ExecutablePath 随之变空。这是「这一条不可用」，不是「查询失败」。
+    # 以前在这里 throw，一个瞬时进程就能让整个列表查询作废 —— 表现为安装目录里
+    # 明明有客户端在跑，launcher 却报 CIM 退出码 1 直接崩掉，连修复入口都没了。
+    # 跳过它不降低安全性：跳过的进程不会被结束，后续要动手时仍会走单 PID 的
+    # Get-StrictProcessRecord 精确验证。
+    # 往 stderr 留一行，让调用方能区分「真的没有进程」和「有进程但一条都读不到」。
+    $skippedPid = '?'
+    try { if ($null -ne $Process) { $skippedPid = [string]$Process.ProcessId } } catch { }
+    $skippedReason = ([string]$_.Exception.Message) -replace '\r', ' ' -replace '\n', ' '
+    [Console]::Error.WriteLine('WBD-PROCESS-SKIPPED ' + $skippedPid + ' ' + $skippedReason)
+    return $null
   }
 }
 

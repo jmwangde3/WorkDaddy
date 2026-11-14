@@ -101,6 +101,22 @@ function validateProcessRecord(row, options = {}) {
   };
 }
 
+// helper 在字段读不全时会跳过该进程，并往 stderr 留一行 WBD-PROCESS-SKIPPED。
+// 调用方需要知道「跳过」而不是「没有」：一个进程都没解析出来但确实有进程被跳过时，
+// 说明当前权限/时机下读不到任何身份字段，此时假装"没有客户端在跑"会导致误启动。
+const SKIPPED_PROCESS_MARKER = 'WBD-PROCESS-SKIPPED';
+function parseSkippedProcesses(stderr) {
+  const skipped = [];
+  for (const line of String(stderr || '').split(/\r?\n/)) {
+    const at = line.indexOf(SKIPPED_PROCESS_MARKER);
+    if (at < 0) continue;
+    const rest = line.slice(at + SKIPPED_PROCESS_MARKER.length).trim();
+    const pid = (rest.match(/^\d+/) || [''])[0];
+    skipped.push({ pid: pid ? Number(pid) : null, reason: rest.slice(pid.length).trim() });
+  }
+  return skipped;
+}
+
 function parseCimProcessResult(result, options = {}) {
   if (!result || result.error) {
     throw (result && result.error) || new Error('CIM process query did not return a result');
@@ -110,16 +126,31 @@ function parseCimProcessResult(result, options = {}) {
     if (options.allowTransientNotFound && /(0x80041002|ObjectNotFound|not found)/i.test(detail)) return [];
     throw new Error(`CIM process query exited with status ${result.status}${detail ? ': ' + detail : ''}`);
   }
+  const skipped = parseSkippedProcesses(result.stderr);
   const output = String(result.stdout || '').trim();
-  if (!output) return [];
+  if (!output) {
+    if (skipped.length) {
+      const ids = skipped.map((item) => item.pid || '?').join(',');
+      throw new Error(`检测到 ${skipped.length} 个进程，但一个都无法确认身份（PID=${ids}）；` +
+        '通常是客户端刚重启或权限不同，稍后重试即可');
+    }
+    return [];
+  }
   let parsed;
   try {
     parsed = JSON.parse(output);
   } catch (error) {
     throw new Error(`CIM process query returned invalid JSON: ${error.message}`);
   }
-  const rows = Array.isArray(parsed) ? parsed : [parsed];
-  return rows.map((row) => validateProcessRecord(row, options));
+  const rows = (Array.isArray(parsed) ? parsed : [parsed])
+    .map((row) => validateProcessRecord(row, options))
+    .filter(Boolean);
+  if (!rows.length && skipped.length) {
+    const ids = skipped.map((item) => item.pid || '?').join(',');
+    throw new Error(`检测到 ${skipped.length} 个进程，但一个都无法确认身份（PID=${ids}）；` +
+      '通常是客户端刚重启或权限不同，稍后重试即可');
+  }
+  return rows;
 }
 
 function resolveWindowsExecutable(value, realpath = fs.realpathSync.native) {
@@ -153,7 +184,11 @@ function buildNativeProcessQuery(helperPath, processSource) {
     throw new Error('Native process query requires a trusted absolute helper and source');
   }
   const quotedHelper = helper.replace(/'/g, "''");
-  return `. '${quotedHelper}'; ${source} | ForEach-Object { ConvertTo-WorkDaddyProcessRecordIfPresent -Process $_ } | Where-Object { $null -ne $_ } | ConvertTo-Json -Compress -Depth 4`;
+  // [Console]::OutputEncoding 必须先钉成 UTF-8：Windows PowerShell 5.1 默认按控制台
+  // 代码页（中文机器是 936）写管道，Node 侧按 UTF-8 解码会把 helper 抛出的中文
+  // 错误消息变成乱码 —— 排查时看到的是一串问号，等于把诊断信息扔了。
+  const prelude = '[Console]::OutputEncoding = [Text.Encoding]::UTF8; ';
+  return `${prelude}. '${quotedHelper}'; ${source} | ForEach-Object { ConvertTo-WorkDaddyProcessRecordIfPresent -Process $_ } | Where-Object { $null -ne $_ } | ConvertTo-Json -Compress -Depth 4`;
 }
 
 function sameWindowsFilePath(a, b) {
