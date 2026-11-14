@@ -32,12 +32,19 @@ const { sanitizeSessionCopyError } = require('./session-copy-error');
 const net = require('net');
 const { inspectPersona, copyPersona, readPersonaSettings, listPersonaSources, configurePersona, dismissPersonaNotice, syncSharedPersonaForSwitch } = require('./persona.js');
 let sessionSync = require('./session-sync.js');
+const { createSessionPinSync, readPinsInRenderer, applyPinsInRenderer } = require('./session-pin-sync');
 const {createCodeBuddyFiles} = require('./codebuddy-files.js');
 const { createAccountCreditCache } = require('./account-credit-cache.js');
 const { spawn, spawnSync, execFile } = require('child_process');
 const { createWallpaperRotation, updateWallpaperInRenderer, pickWallpaperDirectory } = require('./wallpaper-rotation');
+const {
+  VIDEO_MAX_BYTES, VIDEO_HEAD_BYTES, VIDEO_LAYER_CSS,
+  sniffVideo, resolveVideoFile, videoRootBackground,
+  updateVideoInRenderer, disposeVideoInRenderer,
+} = require('./wallpaper-video');
 const { readClientLaunchSettings, setClientLaunchSettings, getClientLaunchArgs } = require('./client-launch-settings.js');
 const { getWorkBuddyLaunchEnv } = require('./workbuddy-launch-env.js');
+const { inspectClientTemp, requestClientTempCleanup, runPendingClientTempCleanup } = require('./client-temp.js');
 const PROBE_CLIENT_RUNNING = process.argv.includes('--probe-client-running');
 const {
   assertSameProcessIdentity,
@@ -118,6 +125,8 @@ const {
   removeAutoCopySession,
   removeAutoCopyAccount,
   collectLineageMembersForDelete,
+  recordSessionDeletion,
+  isAutoCopyTargetExcluded,
   getAutoCopyMapping,
   getAutoCopyMappings,
   migrateAutoCopyTargetRevisions: migrateAutoCopyTargetRevisionsFromMeta,
@@ -178,7 +187,23 @@ const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile, selectPageT
 const { createSessionDb, normalizeSessionIdBatch, parameterCount } = require('./session-db.js');
 const { createRehomeRunner, alignStartupRoutes } = require('./rehome-sessions.js');
 const { createAccountWatcher } = require('./rehome-watcher.js');
-const { applyFullAccess, installRendererGuard, readGuardState, startPreferenceGuard } = require('./permission-sync.js');
+const {
+  applyFullAccess, readGuardState, startPreferenceGuard, stopRendererGuard,
+  stopPermissionGuards, getPermissionStatus, readGuardConfig, setGuardSwitch,
+} = require('./permission-sync.js');
+// 分叉新增接口（接管 / 去重）的分发器。路由实现放在 src/features/sessions/**/routes.js，
+// daemon 只注入依赖；详见 src/features/README.md。
+const { createForkRoutes, NOT_HANDLED: FORK_NOT_HANDLED } = require('../src/features/integration/fork-routes.js');
+
+// 分发器懒初始化：readBody / json / currentAccount 是函数声明（有提升），
+// getRehomeRunner 也已定义，首次请求时依赖一定就绪。
+let forkRouteHandler = null;
+function handleForkRoutes(req, res, p) {
+  if (!forkRouteHandler) {
+    forkRouteHandler = createForkRoutes({ getRunner: getRehomeRunner, readBody, json, currentAccount });
+  }
+  return forkRouteHandler(req, res, p);
+}
 
 // 切号后原地接管会话归属（不复制会话、不改会话 ID）。懒初始化：
 // PROFILE / DATA_DIR / log 在下方定义，函数体到调用时才求值。
@@ -195,27 +220,21 @@ function getRehomeRunner() {
   return rehomeRunner;
 }
 
-// ---- 「允许完全访问」保活 ----
-// 客户端把完全访问拆成三层：账号偏好（localTaskPermissionMode）、会话字段
-// （sessions.permission_mode）、渲染层开关。切号会换账号作用域并重载页面，
-// 只要有一层掉队，界面就退回默认沙箱，用户看到的就是「每次切号都要重新点一遍」。
-// 这里在切号后把三层一起补齐，幂等；失败只记日志，不阻断切号。
-const PERMISSION_OK_STATUS = new Set(['already-full-access', 'enabled', 'enabled-unverified', 'unknown-unverified']);
+// ---- 「允许完全访问」配置修复（默认关闭）----
+// 客户端把完全访问拆成三层：账号偏好、会话字段、渲染层开关。
+// 本模块只负责前两层的**手动**修复：开关 B（configRepair）默认关闭，
+// 页面里的开关与执行期授权一律由用户本人操作，daemon 不代点。
+const PERMISSION_OK_STATUS = new Set(['fixed', 'ok']);
 function cdpReadyForPermission() {
   return !!(cdp && cdp.connected && cdp.ws && cdp.ws.readyState === 1);
 }
-async function applyPermissionLayers(uid, options = {}) {
+async function applyPermissionLayers(uid) {
   const targetUid = String(uid || '').trim();
   if (!targetUid) return null;
-  const wantRenderer = options.renderer !== false;
-  const send = wantRenderer && cdpReadyForPermission() ? (method, params) => cdpSend(method, params) : null;
-  if (!send && options.requireRenderer) return null;
   const report = await applyFullAccess({
     dataRoot: PROFILE.dataRoot,
     dbPath: PROFILE.sessionDb,
     uid: targetUid,
-    send,
-    renderer: !!send,
     log: (msg) => { try { log(msg); } catch (_) {} },
   });
   return report;
@@ -224,42 +243,32 @@ let permissionSyncTimer = null;
 function schedulePermissionSync(uid, options = {}) {
   const targetUid = String(uid || '').trim();
   if (!targetUid) return Promise.resolve(null);
-  const attempts = Number.isFinite(options.attempts) ? options.attempts : 6;
+  // 开关 B 关闭时什么都不做：切号不再自动改任何权限配置。
+  if (!readGuardConfig().configRepair && options.force !== true) {
+    return Promise.resolve({ skipped: 'config-repair-disabled' });
+  }
+  const attempts = Number.isFinite(options.attempts) ? options.attempts : 3;
   const gapMs = Number.isFinite(options.gapMs) ? options.gapMs : 2500;
   const firstDelay = Number.isFinite(options.delayMs) ? options.delayMs : 2500;
   if (permissionSyncTimer) { clearTimeout(permissionSyncTimer); permissionSyncTimer = null; }
   const run = async () => {
     permissionSyncTimer = null;
     let last = null;
-    // 先补不依赖页面的两层：CDP 正在重连时也要保证偏好与会话字段落盘。
-    try {
-      await applyPermissionLayers(targetUid, { renderer: false });
-    } catch (error) {
-      log(`[permission] 偏好/会话字段补齐失败: ${error.message}`);
-    }
     for (let i = 0; i < attempts; i++) {
+      if (!readGuardConfig().configRepair) return last;
       try {
-        const report = await applyPermissionLayers(targetUid, { requireRenderer: true });
-        last = report;
-        const status = report && report.renderer && report.renderer.status;
-        if (report && report.preference && report.preference.ok === false) {
-          log(`[permission] 账号偏好写入失败: ${report.preference.error || ''}`);
-        }
-        if (status && PERMISSION_OK_STATUS.has(status)) {
-          log(`[permission] 完全访问已落实 uid=${targetUid} status=${status}`);
-          return report;
-        }
-        if (report && report.renderer && report.renderer.status === 'foreign-modal-open') {
-          log('[permission] 页面有其它弹窗，稍后重试');
+        last = await applyPermissionLayers(targetUid);
+        if (last && last.ok) {
+          log(`[permission] 配置已补齐 uid=${targetUid}（开关 B）`);
+          return last;
         }
       } catch (error) {
         last = { ok: false, error: error.message };
-        log(`[permission] 同步异常: ${error.message}`);
+        log(`[permission] 配置补齐异常: ${error.message}`);
       }
       if (i + 1 < attempts) await new Promise((r) => setTimeout(r, gapMs));
     }
-    const status = last && last.renderer ? last.renderer.status : (last && last.error) || 'unknown';
-    log(`[permission] 未能确认完全访问 uid=${targetUid} status=${status}（下次切号再试）`);
+    log(`[permission] 配置补齐未成功 uid=${targetUid}（下次切号再试）`);
     return last;
   };
   if (!firstDelay) return run();
@@ -273,11 +282,15 @@ function schedulePermissionSync(uid, options = {}) {
 let rehomeWatcher = null;
 let preferenceGuard = null;
 
-// 第四层：偏好文件守卫。切号 / 页面卸载 / 关会话都可能把 localTaskPermissionMode
-// 写回 default-sandbox，而这一步是静默的（实测拨一下就立刻落盘）。这里每 3s 扫一遍，
-// 发现被改写就还原，只碰这一个键。
+// 开关 A：偏好文件守卫（默认关闭）。
+// 只有用户在配置里显式打开 preferenceGuard 才会启动；stopPermissionGuards() 会真正停掉。
 function startPermissionPreferenceGuard() {
   if (preferenceGuard) return preferenceGuard;
+  const cfg = readGuardConfig();
+  if (!cfg.preferenceGuard) {
+    log('[permission] 偏好守卫未启用（默认关闭，需要显式开启 preferenceGuard）');
+    return null;
+  }
   try {
     preferenceGuard = startPreferenceGuard({
       dataRoot: PROFILE.dataRoot,
@@ -290,19 +303,20 @@ function startPermissionPreferenceGuard() {
   return preferenceGuard;
 }
 
-// 第四层之二：页面里的常驻守卫（掉了自动拨回 + 接管执行期授权弹窗）。
-// 注册到 addScriptToEvaluateOnNewDocument，页面重载后自动重跑。
-async function installPermissionGuard(reason) {
-  if (!cdpReadyForPermission()) return null;
+// 页面守卫已按策略移除：不再注册 addScriptToEvaluateOnNewDocument，
+// 也不再自动拨「允许完全访问」或批准执行期请求。这里只清理页面里旧版的定时器
+// ——**不动**开关 A 的主进程定时器。
+async function clearLegacyPermissionGuard(reason) {
+  const send = cdpReadyForPermission() ? (method, params) => cdpSend(method, params) : null;
+  if (!send) return null;
   try {
-    const out = await installRendererGuard(
-      (method, params) => cdpSend(method, params),
-      (msg) => { try { log(msg); } catch (_) {} },
-    );
-    if (out && out.evaluated) log(`[permission] 页面守卫已就位 (${reason})`);
+    const out = await stopRendererGuard(send);
+    if (out.pageStopped || out.removed) {
+      log(`[permission] 已清理旧版页面守卫 (${reason}) scripts=${out.removed}`);
+    }
     return out;
   } catch (error) {
-    log(`[permission] 页面守卫注入失败 (${reason}): ${error.message}`);
+    log(`[permission] 清理旧版页面守卫失败 (${reason}): ${error.message}`);
     return null;
   }
 }
@@ -319,6 +333,7 @@ function startRehomeWatcher() {
     cdpPort: Number(process.env.WORKDADDY_CDP_PORT || (PROFILE.cdp && PROFILE.cdp.port) || 9222),
     intervalMs: Number(process.env.WORKDADDY_REHOME_POLL_MS || 2000),
     log: (msg) => { try { if (typeof log === 'function') log(msg); } catch (_) {} },
+    inspectAccounts: () => getRehomeRunner().distribution(),
     onSwitch: async (newUid, prevUid) => {
       const result = await getRehomeRunner().run(newUid);
       if (result && result.ok !== false) {
@@ -691,8 +706,14 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.65：兼容空会话同步、自定义模型和重定向备份目录，工作目录恢复退避重试。
 // 1.2.66：刷新凭据按原信封加密保存，同账号刷新去重，过期账号保留手动切换。
 // 1.2.67：Windows 重启 GUI 客户端时不再请求隐藏主窗口，与冷启动保持一致。
-const DAEMON_VERSION = '1.2.80';
-const DAEMON_BUILD_ID = 'release-1.2.80-full-access-guard';
+// 1.2.69：毛玻璃主题支持视频壁纸（MP4 / WebM），与图片壁纸共用蒙版与背景毛玻璃。
+// 1.2.70：视频壁纸层夹在 body 底色与 #root 之间，毛玻璃主题下正常显示画面。
+// #507: explicit cleanup of old Windows client temp files, only before a verified cold launch.
+// 1.2.81：在共享目标分支加入视频壁纸及失败重试、主题路径边界修复。
+// 1.3.0：本 fork 独立版本线。上游 DAEMON_VERSION 走 1.2.x 递增，本仓库自 1.2.80
+//        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
+const DAEMON_VERSION = '1.3.0';
+const DAEMON_BUILD_ID = 'release-1.3.0-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -1465,6 +1486,12 @@ function normTs(v) {
   return Math.round(ts);
 }
 
+function isAccountIdentityExpired(account, now = Date.now()) {
+  const raw = account && account.tokenExpiresAt;
+  const expiresAt = typeof raw === 'string' && Number.isNaN(Number(raw)) ? Date.parse(raw) : normTs(raw);
+  return expiresAt !== null && expiresAt <= now;
+}
+
 // 带超时的 JSON 请求（返回解析后的 JSON；解析失败回退 {code,message}）
 function httpJson(url, method, body, headers) {
   return new Promise((resolve, reject) => {
@@ -2093,6 +2120,7 @@ function syncCodeBuddyAuth() {
   return work;
 }
 async function switchAccountForProfile(uid) {
+  await captureSessionPins();
   if (!codeBuddyNative) {
     const sharing = PROFILE.kind === 'workbuddy' ? syncSharedPersonaForSwitch({ dataRoot: PROFILE.dataRoot,
       backupRoot: DATA_DIR, accounts: listAccounts(DATA_DIR), sourceUid: String((currentAccount() || {}).uid || ''), targetUid: String(uid) }) : null;
@@ -2497,8 +2525,8 @@ async function connectCdp() {
         restoreSavedTheme().catch((e) => log(`[theme] 恢复主题失败: ${e.message}`));
         // 连接可能发生在 loadEventFired 之后，也可能正好处于页面加载中。
         waitForPageReadyThenDispatch(cdpPageSessionId);
-        // 页面守卫：先注册到新文档（重载后自动重跑），再对当前文档装一次。
-        installPermissionGuard('connect').catch(() => {});
+        // 页面守卫已按策略移除：这里只清理旧版本可能残留的自动点击逻辑。
+        clearLegacyPermissionGuard('connect').catch(() => {});
       }, 1200);
       resolve(true);
     };
@@ -3559,6 +3587,9 @@ function relaunchWorkBuddy() {
       }
       // 日志用 ASCII 标记（非用户可见文案，无需进 i18n 词典）
       log(`[logout] 以 ${environmentMode ? '环境变量' : '命令行参数'} CDP=${port} 重启 WorkBuddy: ${command}${viaLauncher ? ' [via launcher]' : ''}`);
+      if (IS_WIN) await runPendingClientTempCleanup(DATA_DIR, PROFILE, {
+        isStopped: () => verifiedWindowsWorkBuddyProcesses(command).length === 0,
+      });
       const childEnv = getWorkBuddyLaunchEnv(PROFILE, DATA_DIR, process.platform, process.env);
       if (environmentMode) childEnv.WORKBUDDY_REMOTE_DEBUGGING_PORT = String(port);
       if (viaLauncher) {
@@ -4828,6 +4859,7 @@ async function injectWidget(reason, executionContextId) {
     // Reinjection and daemon replacement must reflect the current input lease,
     // including a reset after an interrupted run. Reply-waiting never locks UI.
     .then(async (r) => { await automationPanelSetInputActive(automationInputActive); return r; })
+    .then(async (r) => { if (!r?.exceptionDetails) await flushSessionPins(); return r; })
     // 注入脚本若在页面抛错，CDP 协议不报错（无 protocol error），会被误判为"已注入"；
     // 显式检查 exceptionDetails 让失败可见、留痕，便于定位 WorkBuddy 版本差异导致的挂载失败。
     .then((r) => {
@@ -5706,6 +5738,80 @@ function sessionCopyContentRevision(row) {
   ]);
 }
 
+function sessionTitlePair(row) {
+  return JSON.stringify([String(row && row.title || ''), String(row && row.custom_title || '')]);
+}
+
+function mappingTitlePair(mapping, side, uid) {
+  if (!mapping) return null;
+  const revisions = side === 'source'
+    ? [mapping.sourceRevisions && mapping.sourceRevisions[uid], mapping.sourceRevision, mapping.sourceStateRevision]
+    : [mapping.targetRevision, mapping.targetStateRevision];
+  for (const revision of revisions) {
+    try {
+      const parsed = JSON.parse(revision);
+      if (Array.isArray(parsed) && [5, 7].includes(parsed.length)) return JSON.stringify(parsed.slice(-2));
+    } catch (_) {}
+  }
+  return null;
+}
+
+// Title baselines are pairwise: a later A→B copy must not acknowledge B's
+// new title on behalf of C. Keep the last equal title for each physical pair,
+// and consult the reverse mapping so switching direction keeps that baseline.
+function titleBaselineEntry(mapping, source, target) {
+  const key = JSON.stringify([String(source.user_id), String(source.id)]);
+  const entry = mapping && mapping.titleBaselines && mapping.titleBaselines[key];
+  return entry && entry.targetId === String(target.id) && typeof entry.title === 'string' ? entry : null;
+}
+
+function sharedTitleBaseline(mapping, reverse, source, target) {
+  const entries = [titleBaselineEntry(mapping, source, target), titleBaselineEntry(reverse, target, source)].filter(Boolean);
+  if (entries.length) {
+    entries.sort((a, b) => b.at - a.at);
+    if (entries.length === 2 && entries[0].at === entries[1].at && entries[0].title !== entries[1].title) return null;
+    return entries[0].title;
+  }
+  // Legacy mappings are safe only if they prove this exact pair last had the
+  // same title. An old unequal-title skip is not a synchronization baseline.
+  for (const [candidate, from, to] of [[mapping, source, target], [reverse, target, source]]) {
+    if (!candidate || candidate.targetId !== String(to.id)) continue;
+    try {
+      const revision = JSON.parse(candidate.sourceRevisions && candidate.sourceRevisions[from.user_id] || candidate.sourceRevision);
+      const targetRevision = JSON.parse(candidate.targetRevision);
+      if (revision[0] !== String(from.id) || revision[1] !== String(from.user_id) ||
+          targetRevision[0] !== String(to.id) || targetRevision[1] !== String(to.user_id)) continue;
+      const left = mappingTitlePair(candidate, 'source', from.user_id);
+      if (left !== null && left === mappingTitlePair(candidate, 'target', to.user_id)) return left;
+    } catch (_) {}
+  }
+  return null;
+}
+
+function mappingWithTitleBaseline(mapping, reverse, source, target) {
+  const titleBaselines = Object.assign({}, mapping && mapping.titleBaselines);
+  if (target && sessionTitlePair(source) === sessionTitlePair(target)) {
+    const previous = titleBaselineEntry(mapping, source, target);
+    const backwards = titleBaselineEntry(reverse, target, source);
+    titleBaselines[JSON.stringify([String(source.user_id), String(source.id)])] = {
+      targetId: String(target.id), title: sessionTitlePair(source),
+      at: Math.max(Date.now(), Number(previous && previous.at || 0) + 1, Number(backwards && backwards.at || 0) + 1),
+    };
+  }
+  return { titleBaselines };
+}
+
+function mappingHasUnequalTitles(mapping) {
+  const source = mappingTitlePair(mapping, 'source', mapping && mapping.sourceUid);
+  const target = mappingTitlePair(mapping, 'target');
+  return source !== null && target !== null && source !== target;
+}
+
+function mappingSourceTitleChanged(mapping, uid, row) {
+  const baseline = mappingTitlePair(mapping, 'source', uid);
+  return baseline !== null && baseline !== sessionTitlePair(row);
+}
+
 // WorkBuddy stores the context-window denominator on the session row and the
 // usage ring data in session_usage. Both are optional across client versions;
 // a missing column/table must not break account switching for older clients.
@@ -5932,6 +6038,7 @@ function mappingWithSourceRevision(mapping, sourceUid, sourceRow) {
     sourceContentRevision: sessionCopyContentRevision(sourceRow),
     sourceStateRevision: sessionCopyStableStateRevision(sourceRow),
     sourceRevisions,
+    ...(mapping && mapping.titleBaselines ? { titleBaselines: mapping.titleBaselines } : {}),
   };
 }
 
@@ -6022,6 +6129,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
       }
     };
     const mapping = getAutoCopyMapping(DATA_DIR, lineageId, targetUid);
+    const reverseMapping = getAutoCopyMapping(DATA_DIR, lineageId, sourceUid);
     const ids = new Set(getAutoCopySessionMembers(DATA_DIR, lineageId, targetUid));
     if (mapping && mapping.targetId) ids.add(mapping.targetId);
     const candidates = [];
@@ -6029,6 +6137,8 @@ async function copySessionRecord(src, targetUid, options = {}) {
       const row = await readRow(id, targetUid);
       if (row) candidates.push(row);
     }
+    const targetExcluded = options.auto && isAutoCopyTargetExcluded(DATA_DIR, lineageId, targetUid);
+    if (targetExcluded && !candidates.length) return { status: 'skipped', sourceId: src.id, targetId: null };
     // A previous daemon could have created the target row and crashed before
     // persisting its lineage member/mapping. Repeated account switches must
     // recover that exact content instead of allocating another physical row.
@@ -6065,8 +6175,14 @@ async function copySessionRecord(src, targetUid, options = {}) {
     // revision persistence are revalidated once through the normal snapshot
     // comparison path.
     if (options.auto && existingMappingTarget && mapping.fingerprintVersion === 3 &&
+        sessionTitlePair(sourceRow) === sessionTitlePair(existingMappingTarget) &&
         mappingSourceRevisionMatches(mapping, sourceUid, sourceRow) &&
         mappingTargetRevisionMatches(mapping, existingMappingTarget)) {
+      if (!titleBaselineEntry(mapping, sourceRow, existingMappingTarget)) {
+        await withAutoCopyMetaWrite(() => setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
+          ...mapping, ...mappingWithTitleBaseline(mapping, reverseMapping, sourceRow, existingMappingTarget),
+        }));
+      }
       const sourceBytes = Number(mapping.sourceBytes);
       const totalBytes = Number(mapping.totalBytes);
       const warning = (Number.isFinite(sourceBytes) ? sourceBytes : 0) > 100 * 1024 * 1024
@@ -6110,29 +6226,65 @@ async function copySessionRecord(src, targetUid, options = {}) {
     // a new physical session in the same lineage, so later scans find it by
     // content and do not create another copy on every switch.
     const branched = selection.comparison.kind === 'conflict';
+    if (branched && targetExcluded) return { status: 'skipped', sourceId: src.id, targetId: null };
     const targetId = branched ? crypto.randomUUID() : selection.targetId;
     if (branched) {
       aliases.push(targetId);
       if (codeBuddyFiles) codeBuddyFiles.register({...sourceRow,id:targetId,user_id:targetUid});
     }
     const existing = candidates.find(row => row.id === targetId) || null;
-    // An equal selection needs no writes: the trimmed selection snapshot is
-    // enough to skip, and the next sync re-reads everything anyway. Avoid the
-    // extra full target snapshot on the hot all-skipped path.
+    // Equal message snapshots still need independent title synchronization.
+    // The trimmed selection is enough; no message file rewrite is needed.
     if (!branched && selection.comparison.kind === 'equal') {
+      let titleChanged = false;
+      if (existing && sessionTitlePair(sourceRow) !== sessionTitlePair(existing)) {
+        const baseline = sharedTitleBaseline(mapping, reverseMapping, sourceRow, existing);
+        const sourceChanged = baseline !== null && baseline !== sessionTitlePair(sourceRow);
+        const targetChanged = baseline !== null && baseline !== sessionTitlePair(existing);
+        // Activation timestamps do not prove which title was edited.
+        if (baseline === null || sourceChanged === targetChanged) {
+          return { status: 'conflict', sourceId: src.id, targetId, warning: '两端会话标题不同，已保留各自标题，请统一后重试' };
+        }
+        const from = sourceChanged ? sourceRow : existing;
+        const to = sourceChanged ? existing : sourceRow;
+        await assertSessionSyncIdle([sourceRow.id, existing.id]);
+        if (JSON.stringify(await readRow(sourceRow.id, sourceUid)) !== JSON.stringify(sourceRow) ||
+            JSON.stringify(await readRow(existing.id, targetUid)) !== JSON.stringify(existing)) {
+          throw new Error('会话记录正在变化，请稍后重试');
+        }
+        const updatedAt = Math.max(Number(to.updated_at || 0), Number(from.updated_at || 0));
+        const result = await sqliteRun(
+          "UPDATE sessions SET title = ?, custom_title = ?, updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL AND COALESCE(title, '') = ? AND COALESCE(custom_title, '') = ? AND COALESCE(updated_at, 0) = ? " +
+          "AND EXISTS (SELECT 1 FROM sessions AS source WHERE source.id = ? AND source.user_id = ? AND source.deleted_at IS NULL AND COALESCE(source.title, '') = ? AND COALESCE(source.custom_title, '') = ? AND COALESCE(source.updated_at, 0) = ?);",
+          [from.title || '', from.custom_title || '', updatedAt, to.id, to.user_id, to.title || '', to.custom_title || '', Number(to.updated_at || 0),
+            from.id, from.user_id, from.title || '', from.custom_title || '', Number(from.updated_at || 0)]
+        );
+        if (result && result.changes === 0) throw new Error('会话记录正在变化，请稍后重试');
+        // The sqlite3 CLI backend cannot report changes. Verify its result
+        // before acknowledging a title baseline after a conditional update.
+        if (!result || result.changes == null) {
+          const saved = await readRow(to.id, to.user_id);
+          const freshSource = await readRow(from.id, from.user_id);
+          if (!saved || sessionTitlePair(saved) !== sessionTitlePair(from) || Number(saved.updated_at || 0) !== updatedAt ||
+              JSON.stringify(freshSource) !== JSON.stringify(from)) throw new Error('会话记录正在变化，请稍后重试');
+        }
+        Object.assign(to, { title: from.title || '', custom_title: from.custom_title || '', updated_at: updatedAt });
+        titleChanged = true;
+      }
       await withAutoCopyMetaWrite(() => {
         if (!getAutoCopySessionMembers(DATA_DIR, lineageId, targetUid).includes(targetId)) addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, targetId);
         setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
           targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 3,
           ...mappingWithSourceRevision(mapping, sourceUid, sourceRow),
+          ...mappingWithTitleBaseline(mapping, reverseMapping, sourceRow, existing),
           targetRevision: sessionCopyRowRevision(existing || { ...sourceRow, id: targetId, user_id: targetUid }),
           targetStateRevision: sessionCopyStableStateRevision(existing || { ...sourceRow, id: targetId, user_id: targetUid }),
           sourceBytes: left.totalBytes, totalBytes: left.totalBytes,
         });
       });
       const warning = left.totalBytes > 100 * 1024 * 1024 ? '会话超过 100 MB，同步可能较慢' : '';
-      finishAutoDirty(targetId, runtimeRepairBytes > 0);
-      return { status: runtimeRepairBytes ? 'copied' : 'skipped', sourceId: src.id, targetId, branched: false, failedFiles: 0, warning, sourceBytes: left.totalBytes, totalBytes: left.totalBytes, copiedBytes: runtimeRepairBytes };
+      finishAutoDirty(targetId, titleChanged || runtimeRepairBytes > 0);
+      return { status: titleChanged || runtimeRepairBytes ? 'copied' : 'skipped', sourceId: src.id, targetId, branched: false, failedFiles: 0, warning, sourceBytes: left.totalBytes, totalBytes: left.totalBytes, copiedBytes: runtimeRepairBytes };
     }
     let right = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, targetId, aliases, syncCache);
     // Size is advisory only; both manual and automatic sync keep all files.
@@ -6213,6 +6365,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
       return setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
         targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 3,
         ...mappingWithSourceRevision(mapping, sourceUid, sourceRow),
+        ...mappingWithTitleBaseline(mapping, reverseMapping, sourceRow, mappingTarget),
         targetRevision: sessionCopyRowRevision(mappingTarget),
         targetStateRevision: sessionCopyStableStateRevision(mappingTarget),
         sourceBytes: left.totalBytes, totalBytes,
@@ -6282,6 +6435,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
     return true;
   };
   const refreshStableMappedPayload = async (row, mapping, targetRow, lineageId) => {
+    if (mappingSourceTitleChanged(mapping, source, row) || sessionTitlePair(row) !== sessionTitlePair(targetRow)) return false;
     if (!mapping || !mapping.targetId || !targetRow || !lineageId ||
         typeof sessionSync === 'undefined' || typeof sessionSync.readSnapshotAsync !== 'function' ||
         typeof sessionSync.compareSnapshots !== 'function') return false;
@@ -6368,6 +6522,9 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
       const lineageId = (rules.allLineages && rules.allLineages[String(row.id)]) ||
         (typeof getAutoCopySession === 'function' && getAutoCopySession(DATA_DIR, source, row.id)?.lineageId);
       const mapping = lineageId ? mappings.get(String(lineageId)) : null;
+      if (mappingSourceTitleChanged(mapping, source, row) || mappingHasUnequalTitles(mapping) ||
+          (targetById && mapping && targetById.has(String(mapping.targetId)) &&
+           sessionTitlePair(row) !== sessionTitlePair(targetById.get(String(mapping.targetId))))) { dirtyRows.push(row); continue; }
       // The target mapping is enough to restore the active view. Only enter
       // the worker when it is missing, its row disappeared, or the renderer
       // explicitly marked the source session dirty.
@@ -6399,6 +6556,9 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
     }
     const lineageId = rules.allLineages && rules.allLineages[String(row.id)];
     const mapping = lineageId ? mappings.get(String(lineageId)) : null;
+    if (mappingSourceTitleChanged(mapping, source, row) || mappingHasUnequalTitles(mapping) ||
+          (targetById && mapping && targetById.has(String(mapping.targetId)) &&
+           sessionTitlePair(row) !== sessionTitlePair(targetById.get(String(mapping.targetId))))) { dirtyRows.push(row); continue; }
     if (mapping && mapping.fingerprintVersion !== 3) { dirtyRows.push(row); continue; }
     if (dirtyIndex.shouldSync(source, row.id)) {
       if (clearStableDirtyMarker(row, mapping)) continue;
@@ -6448,7 +6608,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
     const mapping = row.lineageId ? mappings.get(String(row.lineageId)) : null;
     if (!mapping || mapping.fingerprintVersion !== 3 || !mapping.targetId) return true;
     const targetRow = targetById.get(String(mapping.targetId));
-    return !targetRow || !mappingSourceRevisionMatches(mapping, source, row) ||
+    return !targetRow || sessionTitlePair(row) !== sessionTitlePair(targetRow) || !mappingSourceRevisionMatches(mapping, source, row) ||
       (!mappingTargetRevisionMatches(mapping, targetRow) &&
        !mappingTargetLifecycleRevisionMatches(mapping, targetRow));
   });
@@ -6515,6 +6675,67 @@ function pruneAutoCopyJobs() {
     const oldest = completed.shift();
     autoCopyJobs.delete(oldest.id);
   }
+}
+
+// Official pin state is scoped to the signed-in account. Capture before auth
+// replacement, then deliver only proven mapped copies after the copy queue.
+// Never use source IDs in the target list or modify WorkBuddy's React state.
+let sessionPinSync = null;
+function getSessionPinSync() {
+  if (!sessionPinSync) sessionPinSync = createSessionPinSync({
+    file: path.join(DATA_DIR, 'session-pin-sync-' + PROFILE.id + '.json'),
+    read: (uid) => evaluateSessionPins(readPinsInRenderer, uid),
+    apply: (uid, ids) => evaluateSessionPins(applyPinsInRenderer, uid, ids),
+    resolve: async (sourceUid, targetUid, ids) => {
+      if (sessionAccountAmbiguous(sourceUid) || sessionAccountAmbiguous(targetUid)) return [];
+      const candidates = ids.map(sourceId => ({ sourceId, targetId: resolveAutoCopyTargetId(sourceUid, targetUid, sourceId) }))
+        .filter(item => isValidSessionId(item.sourceId) && isValidSessionId(item.targetId));
+      if (!candidates.length) return [];
+      const allIds = [...new Set(candidates.flatMap(item => [item.sourceId, item.targetId]))];
+      const rows = await sqliteQuery('SELECT id, user_id FROM sessions WHERE id IN (' + sqlPlaceholders(allIds) + ") AND deleted_at IS NULL AND COALESCE(status, '') != 'archived';", allIds);
+      const owners = new Map(rows.map(row => [String(row.id), String(row.user_id)]));
+      return candidates.filter(item => owners.get(item.sourceId) === sourceUid && owners.get(item.targetId) === targetUid);
+    },
+  });
+  return sessionPinSync;
+}
+async function evaluateSessionPins(fn, uid, ids) {
+  const account = currentAccount();
+  if (!cdp.connected || !account || String(account.uid) !== String(uid)) return null;
+  const expected = { uid: String(account.rawUid || account.uid), type: account.type || '', enterpriseId: account.enterpriseId || '' };
+  let timer;
+  try {
+    const result = await Promise.race([
+      cdpSend('Runtime.evaluate', {
+        expression: '(' + fn.toString() + ')(' + JSON.stringify(expected) + ',' + JSON.stringify(ids || []) + ')',
+        awaitPromise: true, returnByValue: true,
+      }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('同步会话置顶超时')), 3000); }),
+    ]);
+    if (result?.exceptionDetails) return null;
+    return result?.result?.value;
+  } finally { clearTimeout(timer); }
+}
+async function captureSessionPins() {
+  if (PROFILE.kind !== 'workbuddy') return;
+  const uid = String((currentAccount() || {}).uid || '');
+  if (!uid || sessionAccountAmbiguous(uid)) return;
+  try {
+    await getSessionPinSync().flush(uid);
+    await getSessionPinSync().capture(uid);
+  } catch (_) { log('[sessions-pins] 暂时无法读取置顶，保留原记录'); }
+}
+async function syncSessionPins(sourceUid, targetUid) {
+  if (PROFILE.kind !== 'workbuddy' || accountSwitchInProgress) return;
+  try { await getSessionPinSync().sync(sourceUid, targetUid); }
+  catch (_) { log('[sessions-pins] 置顶同步未确认，保留待处理记录'); }
+}
+async function flushSessionPins() {
+  if (PROFILE.kind !== 'workbuddy' || accountSwitchInProgress) return;
+  const uid = String((currentAccount() || {}).uid || '');
+  if (!uid || sessionAccountAmbiguous(uid)) return;
+  try { await getSessionPinSync().flush(uid); }
+  catch (_) { log('[sessions-pins] 置顶恢复未确认，稍后重试'); }
 }
 
 function resolveAutoCopyTargetId(sourceUid, targetUid, sessionId) {
@@ -6785,6 +7006,7 @@ async function refreshWorkBuddySessionList(targetUid, reason = 'sessions') {
 }
 
 async function refreshCopiedSessionList(job) {
+  if (job) await syncSessionPins(job.sourceUid, job.targetUid);
   if (!job || !(job.copied || job.partial || job.conflicts || job.openSessionId)) return false;
   return refreshWorkBuddySessionList(job.targetUid, 'sessions-auto-copy');
 }
@@ -8961,6 +9183,179 @@ function readBackgroundBlur() {
   return blur;
 }
 
+/** 当前挂载在页面里的视频壁纸标识（主题 + 文件名 + 大小 + 修改时间）。
+ *  空字符串表示「页面里没有视频层」，用来决定下一次应用要不要多跑一次清理。 */
+let lastVideoKey = '';
+
+/** 把视频壁纸装进渲染进程。key 命中时渲染进程直接复用已加载的 blob。 */
+async function applyVideoWallpaperByCdp(video, id) {
+  if (!cdp.connected) return false;
+  const key = [id, video.name, video.size, Math.round(video.mtime)].join(':');
+  try {
+    const r = await cdpSend('Runtime.evaluate', {
+      expression: '(' + updateVideoInRenderer.toString() + ')(' + JSON.stringify({
+        // v= 让 daemon 与浏览器缓存都以文件修改时间为准，换视频后不会放旧片
+        url: `http://${HOST}:${ACTUAL_PORT}/api/theme-video?id=${encodeURIComponent(id)}&v=${Math.round(video.mtime)}`,
+        token: API_TOKEN,
+        key,
+        // 视频层自带样式表，不随主题样式重写
+        css: VIDEO_LAYER_CSS,
+      }) + ')',
+      awaitPromise: true, returnByValue: true, timeout: 30000,
+    });
+    const ok = !!(r && r.result && r.result.value === true);
+    if (ok) lastVideoKey = key;
+    else log('[theme] 视频壁纸未能挂载: ' + key);
+    return ok;
+  } catch (e) {
+    log('[theme] 视频壁纸应用失败: ' + (e && e.message));
+    return false;
+  }
+}
+
+/** 摘掉视频层（切回图片壁纸 / 关闭接管 / 该主题没有视频）。 */
+async function disposeVideoWallpaperByCdp() {
+  lastVideoKey = '';
+  if (!cdp.connected) return false;
+  try {
+    await cdpSend('Runtime.evaluate', {
+      expression: '(' + disposeVideoInRenderer.toString() + ')()',
+      returnByValue: true, timeout: 5000,
+    });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/** 主题元数据文件位置：兼容 themes/<id>.json（扁平）与 themes/<id>/theme.json 两种布局。 */
+function themeMetaFile(rawId) {
+  const safeId = String(rawId || '').replace(/[^A-Za-z0-9_-]/g, '_');
+  if (!safeId) return null;
+  const dir = path.join(THEMES_DIR, safeId);
+  const flat = path.join(THEMES_DIR, safeId + '.json');
+  return { id: safeId, dir, file: fs.existsSync(flat) ? flat : path.join(dir, 'theme.json') };
+}
+
+/** 把请求体流式落盘（不整段进内存：视频可以有几十上百 MB）。返回文件头用于格式校验。 */
+function streamBodyToFile(req, dest, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const headChunks = [];
+    let headBytes = 0;
+    let size = 0;
+    let failure = null;
+    let settled = false;
+    const finish = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+    const stream = fs.createWriteStream(dest, { mode: 0o600 });
+    stream.on('error', (e) => { failure = failure || e; });
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        failure = failure || new Error('视频不能超过 ' + Math.round(maxBytes / 1048576) + 'MB');
+        req.destroy();
+        stream.destroy();
+        return;
+      }
+      if (headBytes < VIDEO_HEAD_BYTES) {
+        const take = chunk.subarray(0, VIDEO_HEAD_BYTES - headBytes);
+        headChunks.push(take);
+        headBytes += take.length;
+      }
+      if (failure) return;
+      stream.write(chunk);
+    });
+    req.on('aborted', () => {
+      failure = failure || new Error('视频上传已中断');
+      stream.destroy();
+    });
+    req.on('error', (e) => { failure = failure || e; stream.destroy(); });
+    req.on('end', () => {
+      stream.end(() => {
+        if (failure) { fs.promises.rm(dest, { force: true }).catch(() => {}); return finish(reject, failure); }
+        finish(resolve, { size, head: Buffer.concat(headChunks) });
+      });
+    });
+    // req.destroy() 之后 end 不一定触发，用它兜住超限/中断的分支
+    stream.on('close', () => {
+      if (failure) { fs.promises.rm(dest, { force: true }).catch(() => {}); finish(reject, failure); }
+    });
+  });
+}
+
+async function handleThemeVideoUpload(req, res, url) {
+  const meta = themeMetaFile(url.searchParams.get('id'));
+  if (!meta) return json(res, 400, { ok: false, error: '缺少主题 id' });
+  if (['default', 'dark', 'light', 'system'].includes(meta.id)) {
+    return json(res, 400, { ok: false, error: '官方浅色/深色主题不支持壁纸，请先切到毛玻璃主题' });
+  }
+  const existing = getTheme(meta.id);
+  if (!existing || !existing.colors) return json(res, 400, { ok: false, error: '主题不存在: ' + meta.id });
+  const declared = Number(req.headers['content-length'] || 0);
+  if (!Number.isFinite(declared) || declared <= 0) return json(res, 411, { ok: false, error: '缺少 Content-Length' });
+  if (declared > VIDEO_MAX_BYTES) return json(res, 413, { ok: false, error: '视频不能超过 ' + Math.round(VIDEO_MAX_BYTES / 1048576) + 'MB' });
+
+  fs.mkdirSync(meta.dir, { recursive: true });
+  const tmp = path.join(meta.dir, 'upload-' + Date.now().toString(36) + '.part');
+  const { size, head } = await streamBodyToFile(req, tmp, VIDEO_MAX_BYTES);
+  // 格式只认文件头：前端给的文件名/类型都可以伪造，落盘扩展名必须由魔数决定
+  const format = sniffVideo(head);
+  if (!format) {
+    await fs.promises.rm(tmp, { force: true }).catch(() => {});
+    return json(res, 400, { ok: false, error: '仅支持 MP4 / WebM 视频' });
+  }
+  const fileName = 'background.' + format.ext;
+  for (const ext of ['mp4', 'webm']) {
+    const old = path.join(meta.dir, 'background.' + ext);
+    try { if (fs.existsSync(old)) fs.rmSync(old, { force: true }); } catch (_) {}
+  }
+  fs.renameSync(tmp, path.join(meta.dir, fileName));
+  writeThemeMeta(meta, { video: fileName }, existing);
+  try {
+    fs.writeFileSync(path.join(DATA_DIR, 'current-theme.json'), JSON.stringify({ id: meta.id, at: new Date().toISOString() }, null, 2));
+  } catch (_) {}
+  // 视频与图片随机轮换互斥：抢的是同一层背景
+  await wallpaperRotation.configure({ mode: 'manual' }).catch(() => {});
+  log(`[theme] 上传视频壁纸 -> ${meta.id}/${fileName} (${size}B)`);
+  const info = await applyThemeByCdp(meta.id).catch(() => null);
+  // mounted 反映渲染进程是否真的把视频挂上了：解码失败或客户端未连接时为 false，
+  // 让面板能提示"存下了但没显示"，而不是一律报成功。
+  return json(res, 200, {
+    ok: true, video: fileName, size, mime: format.mime,
+    applied: !!info, mounted: !!(info && info.video), id: meta.id,
+  });
+}
+
+async function handleThemeVideoDelete(res, url) {
+  const meta = themeMetaFile(url.searchParams.get('id'));
+  if (!meta) return json(res, 400, { ok: false, error: '缺少主题 id' });
+  let removed = false;
+  for (const ext of ['mp4', 'webm']) {
+    const file = path.join(meta.dir, 'background.' + ext);
+    try { if (fs.existsSync(file)) { fs.rmSync(file, { force: true }); removed = true; } } catch (_) {}
+  }
+  try {
+    if (fs.existsSync(meta.file)) {
+      const theme = JSON.parse(fs.readFileSync(meta.file, 'utf8')) || {};
+      if (theme.video) { delete theme.video; fs.writeFileSync(meta.file, JSON.stringify(theme, null, 2)); removed = true; }
+    }
+  } catch (_) {}
+  if (removed) log('[theme] 移除视频壁纸 -> ' + meta.id);
+  const applied = await applyThemeByCdp(meta.id).then(() => true).catch(() => false);
+  return json(res, 200, { ok: true, removed, applied, id: meta.id });
+}
+
+function writeThemeMeta(meta, patch, fallback) {
+  let theme = null;
+  try { if (fs.existsSync(meta.file)) theme = JSON.parse(fs.readFileSync(meta.file, 'utf8')) || null; } catch (_) { theme = null; }
+  // 主题文件不存在时用 getTheme 的结果兜底（内置主题被显式改过的场景），
+  // 存在时只打补丁——不要把 getTheme 补出来的瞬态变量写回用户主题。
+  if (!theme) theme = { ...(fallback || {}) };
+  Object.assign(theme, patch);
+  fs.mkdirSync(path.dirname(meta.file), { recursive: true });
+  fs.writeFileSync(meta.file, JSON.stringify(theme, null, 2));
+  return theme;
+}
+
 async function applyThemeByCdp(id, options = {}) {
   const nativeOnly = options.nativeOnly === true || PROFILE.capabilities.nativeComposer === true;
   if (!PROFILE.capabilities.theme || (PROFILE.capabilities.themeTakeover === false && !nativeOnly)) throw new Error(`${PROFILE.name} 暂不支持毛玻璃主题`);
@@ -8988,7 +9383,7 @@ async function applyThemeByCdp(id, options = {}) {
   if (id === 'nebula' && takeoverEnabled) {
     // 分开两个 CDP 回合：释放自定义 CSS/守护，让官方深色真正渲染，再接管毛玻璃。
     // 不改持久化接管开关，避免中途失败或并发操作留下错误的用户设置。
-    await applyThemeByCdp('dark', { ...options, nativeOnly: true });
+    await applyThemeByCdp('dark', { ...options, nativeOnly: true, videoPreflight: true });
     if (applyGeneration !== themeApplyGeneration || readSessionState().themeTakeoverEnabled === false) return { applied: false, cancelled: true };
     // Electron 后台窗口会节流 setTimeout/暂停 rAF；由 daemon 等待，
     // 再同步检查官方底色，不能让开关响应依赖 renderer 的下一帧。
@@ -9026,70 +9421,91 @@ async function applyThemeByCdp(id, options = {}) {
   }
   const extrasCss = themeExtrasCss(id);
   const isDark = !!(theme && theme.dark);
-  // 背景图：主题 JSON 带 image 字段时，从 themes/<id>/<image> 读取转 data URL（WBSS 方案：#root 背景 + 容器透明化）
+  // 背景层：主题里带 video 且文件在时优先视频壁纸（#root 只留蒙版，画面交给 z-index:-1 的
+  // <video> 层，见 wallpaper-video.js）；否则沿用图片方案：#root 背景 = data URL + 容器透明化。
   let bgCssStr = '';
-  if (theme && theme.image) {
+  let themeVideo = null;
+  if (theme && theme.video) {
     try {
-      const safeId = String(theme.id || id).replace(/[^A-Za-z0-9_-]/g, '_');
-      const candidates = [
-        path.join(THEMES_DIR, safeId, String(theme.image).replace(/^\.\.?[/\\]/, '')),
-        path.join(THEMES_DIR, safeId, 'background.' + String(theme.image).split('.').pop()),
-        path.join(THEMES_DIR, String(theme.image).replace(/^\.\.?[/\\]/, '')),
-      ];
-      let imgPath = null;
-      for (const c of candidates) {
-        if (fs.existsSync(c)) { imgPath = c; break; }
+      const videoPath = resolveVideoFile(THEMES_DIR, theme.id || id, theme.video);
+      if (videoPath) {
+        const stat = fs.statSync(videoPath);
+        themeVideo = { path: videoPath, name: String(theme.video), size: stat.size, mtime: stat.mtimeMs };
+      } else {
+        log('[theme] 视频壁纸文件缺失，回落到图片背景: ' + theme.video);
       }
-      // 兜底：按文件名在 themes 所有子目录里搜索（兼容旧 build 上传时目录 id 与主题 id 不一致的情况）
-      if (!imgPath) {
-        try {
-          const wanted = String(theme.image).split('/').pop().split('\\').pop();
-          for (const sub of fs.readdirSync(THEMES_DIR)) {
-            const p = path.join(THEMES_DIR, sub, wanted);
-            if (fs.existsSync(p)) { imgPath = p; break; }
-          }
-        } catch (_) {}
-      }
-      if (imgPath) {
-        const buf = fs.readFileSync(imgPath);
-        const ext = path.extname(imgPath).toLowerCase().replace('.jpeg', '.jpg');
-        const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
-        const dataUrl = 'data:' + mime + ';base64,' + buf.toString('base64');
-        // WBSS 背景图方案：背景图铺 #root，容器透明 + 半透明毛玻璃让底图透出
-        // 遮罩/半透明度调低（40%/34%/30%）：背景图偏暗时让图更透出，毛玻璃更可见
-        // 全局黑色蒙版（默认 0.3，面板主题页可调）：rgba(0,0,0,α) 压在最上层，让背景图更沉、文字更可读
-        // 注意：opacity=0 是合法的「关闭蒙版」，不能用 || 兜底（0 会被当成 falsy 变成 0.1）
-        const maskFile = path.join(DATA_DIR, 'mask.json');
-        let mask = 0.3;
-        try {
-          if (fs.existsSync(maskFile)) {
-            const v = parseFloat(JSON.parse(fs.readFileSync(maskFile, 'utf8')).opacity);
-            if (!Number.isNaN(v)) mask = Math.min(1, Math.max(0, v));
-          }
-        } catch (_) {}
-        const blur = readBackgroundBlur();
-        const blurPx = Math.round(blur * MAX_BACKGROUND_BLUR_PX * 10) / 10;
-        const blurCss = blurPx > 0
-          ? 'backdrop-filter:blur(' + blurPx + 'px);-webkit-backdrop-filter:blur(' + blurPx + 'px);'
-          : 'backdrop-filter:none;-webkit-backdrop-filter:none;';
-        bgCssStr = [
-          '#root{background:',
-          'linear-gradient(rgba(0,0,0,' + mask + '),rgba(0,0,0,' + mask + ')),',
-          'linear-gradient(90deg,color-mix(in srgb,var(--wb-bg-primary) 40%,transparent) 0 18%,transparent 42%),',
-          'linear-gradient(180deg,transparent 0 58%,color-mix(in srgb,var(--wb-bg-primary) 50%,transparent) 100%),',
-          'var(--wbs-wallpaper-image,url(' + dataUrl + ')) right center / cover no-repeat fixed !important;}',
-          'body[data-vscode-theme-name] .teams-container,body[data-vscode-theme-name] .teams-container.is-mac{background:transparent !important;' + blurCss + '}',
-          'body[data-vscode-theme-name] [data-view-id]{background:transparent !important}',
-          'body[data-vscode-theme-name] .main-content{background:transparent !important}',
-          // 左侧菜单（会话列表）透明（用户 08-30 00:46 要求去掉毛玻璃，连同子组件全透明，背景图直接透出）
-          'body[data-vscode-theme-name] .conversation-list,body[data-vscode-theme-name] [data-view-id=sidebar]{background:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important}',
-          // 输入框区域：毛玻璃背景（用户要求加回：半透明 + 模糊，背景图透出）
-          // 注意：聊天页 [class*="input-area-container"] 父容器改为透明（patch-40 处理），
-          // 主页 .wb-home-composer 也改为透明（patch-37），毛玻璃只保留在输入框主体 _mainArea（patch-40）。
-          'body[data-vscode-theme-name] [class*="chat-input"]{background:color-mix(in srgb,var(--wb-bg-primary) 40%,transparent) !important;backdrop-filter:blur(20px) saturate(1.15);-webkit-backdrop-filter:blur(20px) saturate(1.15)}',
-          // 主内容区底部渐变保证可读
-          'body[data-vscode-theme-name] [data-view-id=main-content]{background:linear-gradient(180deg,transparent 0 38%,color-mix(in srgb,var(--wb-bg-primary) 55%,transparent) 100%) !important}',
-        ].join('');
+    } catch (_) {}
+  }
+  if (themeVideo || (theme && theme.image)) {
+    try {
+      // 全局黑色蒙版（默认 0.3，面板主题页可调）：rgba(0,0,0,α) 压在最上层，让背景更沉、文字更可读
+      // 注意：opacity=0 是合法的「关闭蒙版」，不能用 || 兜底（0 会被当成 falsy 变成 0.1）
+      const maskFile = path.join(DATA_DIR, 'mask.json');
+      let mask = 0.3;
+      try {
+        if (fs.existsSync(maskFile)) {
+          const v = parseFloat(JSON.parse(fs.readFileSync(maskFile, 'utf8')).opacity);
+          if (!Number.isNaN(v)) mask = Math.min(1, Math.max(0, v));
+        }
+      } catch (_) {}
+      const blur = readBackgroundBlur();
+      const blurPx = Math.round(blur * MAX_BACKGROUND_BLUR_PX * 10) / 10;
+      const blurCss = blurPx > 0
+        ? 'backdrop-filter:blur(' + blurPx + 'px);-webkit-backdrop-filter:blur(' + blurPx + 'px);'
+        : 'backdrop-filter:none;-webkit-backdrop-filter:none;';
+      // 容器透明化对图片与视频完全一致：底层是什么都必须能透出来
+      const containerCss = [
+        'body[data-vscode-theme-name] .teams-container,body[data-vscode-theme-name] .teams-container.is-mac{background:transparent !important;' + blurCss + '}',
+        'body[data-vscode-theme-name] [data-view-id]{background:transparent !important}',
+        'body[data-vscode-theme-name] .main-content{background:transparent !important}',
+        // 左侧菜单（会话列表）透明（用户 08-30 00:46 要求去掉毛玻璃，连同子组件全透明，背景图直接透出）
+        'body[data-vscode-theme-name] .conversation-list,body[data-vscode-theme-name] [data-view-id=sidebar]{background:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important}',
+        // 输入框区域：毛玻璃背景（用户要求加回：半透明 + 模糊，背景图透出）
+        // 注意：聊天页 [class*="input-area-container"] 父容器改为透明（patch-40 处理），
+        // 主页 .wb-home-composer 也改为透明（patch-37），毛玻璃只保留在输入框主体 _mainArea（patch-40）。
+        'body[data-vscode-theme-name] [class*="chat-input"]{background:color-mix(in srgb,var(--wb-bg-primary) 40%,transparent) !important;backdrop-filter:blur(20px) saturate(1.15);-webkit-backdrop-filter:blur(20px) saturate(1.15)}',
+        // 主内容区底部渐变保证可读
+        'body[data-vscode-theme-name] [data-view-id=main-content]{background:linear-gradient(180deg,transparent 0 38%,color-mix(in srgb,var(--wb-bg-primary) 55%,transparent) 100%) !important}',
+      ].join('');
+      if (themeVideo) {
+        bgCssStr = videoRootBackground(mask) + containerCss;
+      } else {
+        const safeId = String(theme.id || id).replace(/[^A-Za-z0-9_-]/g, '_');
+        const candidates = [
+          path.join(THEMES_DIR, safeId, String(theme.image).replace(/^\.\.?[/\\]/, '')),
+          path.join(THEMES_DIR, safeId, 'background.' + String(theme.image).split('.').pop()),
+          path.join(THEMES_DIR, String(theme.image).replace(/^\.\.?[/\\]/, '')),
+        ];
+        let imgPath = null;
+        for (const c of candidates) {
+          if (fs.existsSync(c)) { imgPath = c; break; }
+        }
+        // 兜底：按文件名在 themes 所有子目录里搜索（兼容旧 build 上传时目录 id 与主题 id 不一致的情况）
+        if (!imgPath) {
+          try {
+            const wanted = String(theme.image).split('/').pop().split('\\').pop();
+            for (const sub of fs.readdirSync(THEMES_DIR)) {
+              const p = path.join(THEMES_DIR, sub, wanted);
+              if (fs.existsSync(p)) { imgPath = p; break; }
+            }
+          } catch (_) {}
+        }
+        if (imgPath) {
+          const buf = fs.readFileSync(imgPath);
+          const ext = path.extname(imgPath).toLowerCase().replace('.jpeg', '.jpg');
+          const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+          const dataUrl = 'data:' + mime + ';base64,' + buf.toString('base64');
+          // WBSS 背景图方案：背景图铺 #root，容器透明 + 半透明毛玻璃让底图透出
+          // 遮罩/半透明度调低（40%/34%/30%）：背景图偏暗时让图更透出，毛玻璃更可见
+          bgCssStr = [
+            '#root{background:',
+            'linear-gradient(rgba(0,0,0,' + mask + '),rgba(0,0,0,' + mask + ')),',
+            'linear-gradient(90deg,color-mix(in srgb,var(--wb-bg-primary) 40%,transparent) 0 18%,transparent 42%),',
+            'linear-gradient(180deg,transparent 0 58%,color-mix(in srgb,var(--wb-bg-primary) 50%,transparent) 100%),',
+            'var(--wbs-wallpaper-image,url(' + dataUrl + ')) right center / cover no-repeat fixed !important;}',
+            containerCss,
+          ].join('');
+        }
       }
     } catch (e) {
       log('[theme] 背景图加载失败: ' + e.message);
@@ -9097,6 +9513,11 @@ async function applyThemeByCdp(id, options = {}) {
   }
   const expr = `(function(){
     if (window.__wbsWallpaperRuntime) window.__wbsWallpaperRuntime.dispose();
+    // 主题里没有视频就顺手摘掉视频层：daemon 重启后 lastVideoKey 是空的，
+    // 靠这一步兜住"页面里还挂着上一版视频"的情况，不必依赖 daemon 的内存状态。
+    // nebula 的官方深色预置（videoPreflight）不能摘：紧跟着就会重新挂载，
+    // 提前摘掉会让几十 MB 的视频重下一遍。
+    ${themeVideo || options.videoPreflight ? '' : 'if (window.__wbsVideoRuntime) window.__wbsVideoRuntime.dispose();'}
     var h = document.documentElement, b = document.body;
     if (!h || !b) return { pending: true };
     try {
@@ -9444,7 +9865,16 @@ async function applyThemeByCdp(id, options = {}) {
     log('[theme] 应用主题失败: ' + detail);
     throw new Error('应用主题失败: ' + detail);
   }
-  if (id === 'nebula' && takeoverEnabled && wallpaperRotation.status().mode === 'random') {
+  // 视频壁纸层在主题 CSS 之后挂载/摘除：此刻 #root 已经留出背景层，视频到位即可见。
+  // 同一个视频重复应用（拖蒙版、改毛玻璃）命中 key，不会重新拉流。
+  let videoMounted = null;
+  if (takeoverEnabled && themeVideo) {
+    videoMounted = await applyVideoWallpaperByCdp(themeVideo, id);
+  } else if (lastVideoKey && !options.videoPreflight) {
+    await disposeVideoWallpaperByCdp();
+  }
+  // 视频壁纸下不启用图片随机轮换：两者抢同一层背景。
+  if (!themeVideo && id === 'nebula' && takeoverEnabled && wallpaperRotation.status().mode === 'random') {
     wallpaperRotation.restore().catch(() => {});
   }
   // 浅色成功恢复官方样式时 applied=false（无自定义覆盖），仍须启动轮询并更新基线。
@@ -9453,6 +9883,7 @@ async function applyThemeByCdp(id, options = {}) {
     startSystemThemePolling();
   }
   return { ok: true, applied: v.applied, dark: v.dark, bg: v.bg, text: v.text,
+    ...(videoMounted === null ? {} : { video: videoMounted }),
     ...(systemMode ? { system: true, resolved: id } : {}) };
 }
 
@@ -10457,32 +10888,13 @@ function handleApi(req, res) {
     }).catch((error) => json(res, 400, { ok: false, error: error.message }));
   }
 
-  // 会话归属接管（rehome）：状态 / 开关 / 手动触发（支持干跑）
-  if (req.method === 'GET' && p === '/api/rehome/status') {
-    return json(res, 200, { ok: true, ...getRehomeRunner().status() });
-  }
-  if (req.method === 'POST' && p === '/api/rehome/config') {
-    return readBody(req).then((body) => {
-      if (!body || typeof body.enabled !== 'boolean') return json(res, 400, { ok: false, error: '缺少 enabled 布尔值' });
-      return json(res, 200, { ok: true, ...getRehomeRunner().setEnabled(body.enabled) });
-    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
-  }
-  if (req.method === 'POST' && p === '/api/rehome/run') {
-    return readBody(req).then(async (body) => {
-      const payload = body || {};
-      const uid = String(payload.uid || (currentAccount() || {}).uid || '').trim();
-      const result = await getRehomeRunner().run(uid, { dryRun: !!payload.dryRun });
-      return json(res, result.ok === false ? 500 : 200, result);
-    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
-  }
-  if (req.method === 'POST' && p === '/api/rehome/dedupe') {
-    return readBody(req).then(async (body) => {
-      const result = await getRehomeRunner().runDedupe({
-        dryRun: !!(body && body.dryRun),
-        aggressive: !!(body && body.aggressive),
-      });
-      return json(res, 200, { ok: true, ...result });
-    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
+  // 会话归属接管 / 去重：7 条接口已搬到 src/features/sessions/**/routes.js。
+  // 这里只留一行分发，把分叉对 daemon.js 的改动压到最小，减少同步上游时的冲突面。
+  // 用 typeof 守卫：部分测试会把 handleApi 的源码切片后放进 vm 执行，那个上下文里
+  // 没有本函数（也没有 FORK_NOT_HANDLED），守卫让这些用例继续只测它关心的接口。
+  if (typeof handleForkRoutes === 'function') {
+    const routed = handleForkRoutes(req, res, p);
+    if (routed !== FORK_NOT_HANDLED) return routed;
   }
 
   if (req.method === 'GET' && p === '/api/automations') {
@@ -11046,6 +11458,22 @@ function handleApi(req, res) {
     });
   }
 
+  if (req.method === 'GET' && p === '/api/client-temp') {
+    return inspectClientTemp(DATA_DIR, PROFILE).then(data => json(res, 200, { ok: true, ...data }))
+      .catch(() => json(res, 500, { ok: false, error: '无法统计临时文件，请检查目录权限后重试' }));
+  }
+  if (req.method === 'POST' && p === '/api/client-temp') {
+    return readBody(req).then(body => {
+      if (!body || typeof body.pending !== 'boolean' || process.platform !== 'win32' || PROFILE.customTarget ||
+          !['workbuddy-cn', 'workbuddy-ai'].includes(PROFILE.id)) {
+        return json(res, 400, { ok: false, error: '当前客户端不支持此清理请求' });
+      }
+      try {
+        return json(res, 200, { ok: true, ...requestClientTempCleanup(DATA_DIR, PROFILE, body.pending) });
+      } catch (_) { return json(res, 500, { ok: false, error: '保存清理请求失败，请重试' }); }
+    });
+  }
+
   if (req.method === 'GET' && p === '/api/client-launch-settings') {
     return json(res, 200, { ok: true, ...readClientLaunchSettings(DATA_DIR, PROFILE.id, process.platform) });
   }
@@ -11264,7 +11692,8 @@ function handleApi(req, res) {
           const checked = c && c.ok && (c.verified === true || classifyCheckinResult({ httpOk: true, code: c.code, message: c.message }).ok)
             ? c
             : null;
-          return Object.assign({}, a, { creditSegments: [] }, accountCreditCache.get(a.uid), {
+          const cachedCredit = isAccountIdentityExpired(a) ? null : accountCreditCache.get(a.uid);
+          return Object.assign({}, a, { creditSegments: [] }, cachedCredit || {}, {
             checkin: checkinDisplayValue(checked, today),
             activityStreak: growthStreakCache.peek(a.uid),
           });
@@ -11300,6 +11729,8 @@ function handleApi(req, res) {
         const file = accountBackupFile(uid);
         if (!fs.existsSync(file)) return json(res, 404, { ok: false, error: '账号备份不存在' });
         const j = wdCompatDecryptAuthJson(JSON.parse(fs.readFileSync(file, 'utf8'))); // [wd-compat]
+        const accountMeta = listAccounts(DATA_DIR).find(account => account.uid === uid);
+        if (isAccountIdentityExpired(accountMeta)) return json(res, 401, { ok: false, expired: true, error: '登录身份过期' });
         const tk = wdCompatAuthToken(j.auth);
         if (!tk) return json(res, 400, { ok: false, error: '备份中无 accessToken' });
         const current = currentAccount();
@@ -11419,12 +11850,14 @@ function handleApi(req, res) {
         try {
       const range = historyRange(url.searchParams.get('days') || 7);
       const accounts = listAccounts(DATA_DIR);
+      const activeAccounts = accounts.filter(account => !isAccountIdentityExpired(account));
       const uid = url.searchParams.get('account') || '';
-      const selected = uid ? accounts.filter(a => a.uid === uid) : accounts;
+      const selected = uid ? activeAccounts.filter(a => a.uid === uid) : activeAccounts;
       if (uid && !selected.length) return json(res, 400, { ok: false, error: '账号选择无效' });
+      if (!selected.length) return json(res, 400, { ok: false, error: '没有可查询积分的有效账号' });
       creditHistorySync.start({ accounts: selected, days: range.days });
       return creditHistorySync.wait().then(result => json(res, 200, { ok: true, ...result,
-        accounts: accounts.map(a => ({ uid: a.uid, nickname: a.nickname || '' })) }));
+        accounts: activeAccounts.map(a => ({ uid: a.uid, nickname: a.nickname || '' })) }));
     } catch (error) { return json(res, error.status || 400, { ok: false, error: error.message }); }
   }
   if (req.method === 'GET' && p === '/api/credit-stats/sync') {
@@ -11439,10 +11872,11 @@ function handleApi(req, res) {
         typeof uid !== 'string' || !accounts.some(account => account.uid === uid)))) {
         return json(res, 400, { ok: false, error: '账号选择无效' });
       }
-      const selected = requested === undefined ? accounts : accounts.filter(account => requested.includes(account.uid));
+      const activeAccounts = accounts.filter(account => !isAccountIdentityExpired(account));
+      const selected = requested === undefined ? activeAccounts : activeAccounts.filter(account => requested.includes(account.uid));
       if (!selected.length) return json(res, 400, { ok: false, error: '请先选择账号' });
       return json(res, 202, { ok: true, job: creditHistorySync.start({ accounts: selected, days: range.days }),
-        accounts: accounts.map(a => ({ uid: a.uid, nickname: a.nickname || '' })) });
+        accounts: activeAccounts.map(a => ({ uid: a.uid, nickname: a.nickname || '' })) });
     }).catch(error => json(res, error.status || 400, { ok: false,
       error: error.status === 409 ? '另一个积分查询正在进行，请稍后重试' : '查询参数无效，请选择近 7、30 或 90 天' }));
   }
@@ -11723,6 +12157,70 @@ function handleApi(req, res) {
     }
   }
 
+  // 视频壁纸（毛玻璃主题的背景层，方案见 scripts/wallpaper-video.js）
+  // GET    /api/theme-video?id=<主题 id>[&v=<mtime>]  字节流；渲染进程 fetch 成 blob 交给 <video>
+  // POST   /api/theme-video/upload?id=<主题 id>      裸流上传，落盘 themes/<id>/background.<mp4|webm>
+  // DELETE /api/theme-video?id=<主题 id>             移除视频，自动回落到图片背景
+  if (p === '/api/theme-video' || p === '/api/theme-video/upload') {
+    if (!PROFILE.capabilities.theme || PROFILE.capabilities.themeTakeover === false) {
+      return json(res, 400, { ok: false, error: '当前客户端不支持视频壁纸' });
+    }
+  }
+  if (req.method === 'GET' && p === '/api/theme-video') {
+    try {
+      const themeId = String(url.searchParams.get('id') || readSavedThemeId() || '');
+      const theme = getTheme(themeId);
+      const file = theme && theme.video ? resolveVideoFile(THEMES_DIR, theme.id || themeId, theme.video) : null;
+      if (!file) return json(res, 404, { ok: false, error: '当前主题没有视频壁纸' });
+      const stat = fs.statSync(file);
+      const ext = path.extname(file).toLowerCase();
+      const mime = ext === '.webm' ? 'video/webm' : 'video/mp4';
+      const headers = {
+        'Content-Type': mime, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+        'Accept-Ranges': 'bytes',
+      };
+      if (res.__wbsCorsOrigin) { headers['Access-Control-Allow-Origin'] = res.__wbsCorsOrigin; headers.Vary = 'Origin'; }
+      // Range：渲染进程目前整段 fetch，但保留分段能力，便于之后直接给 <video src> 用。
+      const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
+      let start = 0;
+      let end = stat.size - 1;
+      let status = 200;
+      if (range && stat.size > 0) {
+        const rawStart = range[1] === '' ? null : parseInt(range[1], 10);
+        const rawEnd = range[2] === '' ? null : parseInt(range[2], 10);
+        if (rawStart === null && rawEnd !== null) { start = Math.max(0, stat.size - rawEnd); }
+        else if (rawStart !== null) { start = rawStart; if (rawEnd !== null) end = Math.min(rawEnd, stat.size - 1); }
+        if (start > end || start >= stat.size) {
+          res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+          return res.end();
+        }
+        status = 206;
+        headers['Content-Range'] = `bytes ${start}-${end}/${stat.size}`;
+      }
+      headers['Content-Length'] = end - start + 1;
+      if (res.destroyed) return;
+      res.writeHead(status, headers);
+      const stream = fs.createReadStream(file, { start, end });
+      res.on('close', () => stream.destroy());
+      stream.on('error', () => res.destroy());
+      stream.pipe(res);
+      return;
+    } catch (e) {
+      if (!res.headersSent) return json(res, 500, { ok: false, error: e.message });
+      return;
+    }
+  }
+  if (req.method === 'POST' && p === '/api/theme-video/upload') {
+    return handleThemeVideoUpload(req, res, url).catch((e) => {
+      if (!res.headersSent) json(res, 500, { ok: false, error: e.message });
+    });
+  }
+  if (req.method === 'DELETE' && p === '/api/theme-video') {
+    return handleThemeVideoDelete(res, url).catch((e) => {
+      if (!res.headersSent) json(res, 500, { ok: false, error: e.message });
+    });
+  }
+
   // 官方背景图库列表（themes/wallpapers/*.webp），供面板「主题」页预览切换。
   // 附带 currentWallpaper：当前主题 background.webp 内容哈希匹配到的图库文件名（供面板高亮当前壁纸）
   // 附带 customWallpapers：用户上传的自定义壁纸（custom-*.webp），供面板分开展示
@@ -11735,15 +12233,23 @@ function handleApi(req, res) {
       const custom = files.filter((f) => /^custom-/i.test(f));
       // 当前背景 = 当前主题目录的 background.webp（哈希对比图库）
       let currentWallpaper = null;
+      // 视频壁纸在生效时占据整个背景层，图片选中态不再具有意义
+      let currentVideo = null;
       try {
         const cur = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'current-theme.json'), 'utf8')).id || '';
-        const bg = path.join(THEMES_DIR, String(cur).replace(/[^A-Za-z0-9_-]/g, '_'), 'background.webp');
-        if (fs.existsSync(bg)) {
-          const crypto = require('crypto');
-          const want = crypto.createHash('md5').update(fs.readFileSync(bg)).digest('hex');
-          for (const f of files) {
-            const p2 = path.join(WALLPAPERS_DIR, f);
-            if (crypto.createHash('md5').update(fs.readFileSync(p2)).digest('hex') === want) { currentWallpaper = f; break; }
+        const curTheme = getTheme(cur);
+        const videoFile = curTheme && curTheme.video ? resolveVideoFile(THEMES_DIR, curTheme.id || cur, curTheme.video) : null;
+        if (videoFile) {
+          currentVideo = { name: path.basename(videoFile), title: path.basename(videoFile), size: fs.statSync(videoFile).size };
+        } else {
+          const bg = path.join(THEMES_DIR, String(cur).replace(/[^A-Za-z0-9_-]/g, '_'), 'background.webp');
+          if (fs.existsSync(bg)) {
+            const crypto = require('crypto');
+            const want = crypto.createHash('md5').update(fs.readFileSync(bg)).digest('hex');
+            for (const f of files) {
+              const p2 = path.join(WALLPAPERS_DIR, f);
+              if (crypto.createHash('md5').update(fs.readFileSync(p2)).digest('hex') === want) { currentWallpaper = f; break; }
+            }
           }
         }
       } catch (_) {}
@@ -11752,6 +12258,7 @@ function handleApi(req, res) {
         wallpapers: official.map((f) => ({ name: f, title: '官方壁纸 ' + String(f.replace(/\.webp$/i, '')).replace(/^wallpaper-?0*/, '') })),
         customWallpapers: custom.map((f) => ({ name: f, title: '自定义壁纸 ' + String(f.replace(/\.webp$/i, '')).replace(/^custom-/, '') })),
         currentWallpaper,
+        currentVideo,
       });
     } catch (e) {
       return json(res, 500, { ok: false, error: e.message });
@@ -12374,6 +12881,7 @@ function handleApi(req, res) {
       const copyOperation = Symbol('manual-session-copy');
       sessionCopyLocks.set(copyOperation, true);
       try {
+        await captureSessionPins();
         // 1) 取出源会话（含 cwd 用于定位消息文件）
         const srcRows = await sqliteQuery(
           "SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, source_mode, is_background_automation, mode, model, expert_id, expert_locale, expert_runtime_identity, expert_marketplace, permission_mode, use_sandbox_cli, project_id FROM sessions WHERE id IN (" + sqlPlaceholders(ids) + ") AND deleted_at IS NULL AND COALESCE(is_background_automation, 0) = 0;",
@@ -12389,6 +12897,7 @@ function handleApi(req, res) {
           else if (result.status === 'skipped') skipped++;
           else copied++;
         }
+        for (const sourceUid of new Set(srcRows.map(row => String(row.user_id || '')))) await syncSessionPins(sourceUid, targetUid);
         // [CodeBuddy 会话同步] 同步到当前账号时刷新 IDE workbench：扩展宿主的
         // indexCache 不因外部写 index.json 失效，侧边栏要等 TTL/重启才显示（详见
         // reloadIdeWorkbenchWindows 注释）。同步到其他账号无需刷新——切号时
@@ -12453,7 +12962,7 @@ function handleApi(req, res) {
       }
     });
   }
-  // 删除会话（真实删除）：POST /api/sessions/delete { ids }——删除 DB 记录 + 该账号下全部会话文件（不可恢复）
+  // 删除会话：默认仅所选物理 ID；显式 lineage 范围须先预览并确认 previewToken。
   if (req.method === 'POST' && p === '/api/sessions/delete') {
     return readBody(req).then(async (body) => {
       let ids;
@@ -12461,6 +12970,10 @@ function handleApi(req, res) {
       catch (e) { return json(res, 400, { ok: false, error: e.message }); }
       if (!ids.length) return json(res, 400, { ok: false, error: '未选择会话' });
       if (!ids.every(isValidSessionId)) return json(res, 400, { ok: false, error: '包含无效的会话 ID' });
+      const scope = body.scope === undefined ? 'selected' : body.scope;
+      if (!['selected', 'lineage'].includes(scope) || (body.preview !== undefined && typeof body.preview !== 'boolean')) {
+        return json(res, 400, { ok: false, error: '无效的删除范围' });
+      }
       let releaseSessionSync = null;
       try {
         // A copy worker may have already read the source row and be about to
@@ -12470,10 +12983,9 @@ function handleApi(req, res) {
         if (typeof assertAccountSwitchIdle === 'function') {
           releaseSessionSync = await assertAccountSwitchIdle();
         }
-        // 展开目标会话所在的 lineage：其他账号自动复制出的同源副本一并级联删除，
-        // 避免删除后切走再切回时被 auto-copy 原样复制回来（会话「复活」）。
+        // #511: ordinary deletion is strictly local to the selected physical IDs.
         const requestedSet = new Set(ids.map(String));
-        const members = collectLineageMembersForDelete(DATA_DIR, ids);
+        const members = scope === 'lineage' ? collectLineageMembersForDelete(DATA_DIR, ids) : ids.map(id => ({ id }));
         const memberIds = Array.from(new Set(members.map((m) => m.id).filter((id) => isValidSessionId(id))));
         if (!memberIds.length) return json(res, 404, { ok: false, error: '会话不存在或已删除' });
         const placeholders = sqlPlaceholders(memberIds);
@@ -12482,20 +12994,25 @@ function handleApi(req, res) {
         const matchedSet = new Set(before.map((row) => String(row.id || '')));
         const matchedIds = memberIds.filter((id) => matchedSet.has(String(id)));
         const matchedRows = before.filter((row) => matchedSet.has(String(row.id || '')));
+        const cascaded = matchedIds.filter(id => !requestedSet.has(String(id))).length;
+        const previewToken = crypto.createHash('sha256').update(JSON.stringify([
+          scope, [...requestedSet].sort(), matchedRows.map(row => [String(row.id), String(row.user_id)]).sort((a, b) => a[0].localeCompare(b[0])),
+        ])).digest('hex');
+        if (body.preview === true) return json(res, 200, {
+          ok: true, scope, total: matchedIds.length, cascaded,
+          accounts: new Set(matchedRows.map(row => String(row.user_id))).size, previewToken,
+        });
+        if ((scope === 'lineage' || body.previewToken !== undefined) && body.previewToken !== previewToken) {
+          return json(res, 409, { ok: false, error: '删除范围已变化，请重新预览并确认' });
+        }
         // 1) 先完成可重试的文件与规则清理；失败时保留 DB 记录作为重试锚点。
         const wbHome = PROFILE.dataRoot;
         let filesRemoved = 0;
         if (codeBuddyFiles) await assertSessionSyncIdle(matchedIds);
         else for (const id of matchedIds) filesRemoved += deleteSessionFiles(wbHome, id);
-        let rulesRemoved = 0;
-        for (const row of matchedRows) {
-          try {
-            if (removeAutoCopySession(DATA_DIR, String(row.user_id || '').trim(), row.id)) rulesRemoved++;
-          } catch (e) {
-            log(`[sessions-auto-copy] 删除规则 ${row.id} 失败: ${e.message}`);
-            throw e;
-          }
-        }
+        // Persist the exclusion before removing DB retry anchors. File failures
+        // above leave the original relationship intact; later retries are safe.
+        const rulesRemoved = recordSessionDeletion(DATA_DIR, matchedRows, { preserveMembers: true });
         // 2) 最后真实删除 DB 记录（非软删）。若此步失败，重复请求可安全重试。
         if (matchedIds.length) {
           const removeRecords = () => sqliteRun(
@@ -12505,7 +13022,9 @@ function handleApi(req, res) {
           if (codeBuddyFiles) filesRemoved = await codeBuddyFiles.deleteSessions(matchedIds, removeRecords);
           else await removeRecords();
         }
-        const cascaded = matchedIds.filter((id) => !requestedSet.has(String(id))).length;
+        // Keep the family graph until DB deletion succeeds so a failed bulk
+        // delete can be previewed and retried with the same linked members.
+        recordSessionDeletion(DATA_DIR, matchedRows);
         log(`[sessions-delete] 已真实删除 ${matchedIds.length} 个会话（DB + ${filesRemoved} 项文件，级联副本 ${cascaded}）`);
         return json(res, 200, { ok: true, deleted: matchedIds.length, requested: ids.length, cascaded, filesRemoved, rulesRemoved });
       } catch (e) {
@@ -12715,8 +13234,14 @@ function handleApi(req, res) {
           try {
             const t = JSON.parse(fs.readFileSync(tf, 'utf8'));
             t.image = 'background.webp';
+            // 选图片就说明不要视频了：video 字段留着会让视频层继续压住这张图
+            delete t.video;
             fs.writeFileSync(tf, JSON.stringify(t, null, 2));
           } catch (_) {}
+        }
+        // 顺手清掉视频文件，避免磁盘里留一份再也不会被引用的片子
+        for (const ext of ['mp4', 'webm']) {
+          try { fs.rmSync(path.join(dir, 'background.' + ext), { force: true }); } catch (_) {}
         }
         // 记录当前主题并应用（reload 后 1.5s 恢复的就是这张新图，不再"切回最早背景图"）
         try {
@@ -13039,7 +13564,7 @@ function handleApi(req, res) {
     }
   }
 
-  // 手动补齐「允许完全访问」三层状态（偏好 / 会话字段 / 页面开关）。
+  // 手动补齐偏好 + 会话字段（开关 B 的手动动作）。不碰页面。
   if (req.method === 'POST' && p === '/api/permission/ensure') {
     return readBody(req).then(async (body) => {
       const acct = currentAccount() || {};
@@ -13047,7 +13572,6 @@ function handleApi(req, res) {
       if (!uid) return json(res, 400, { ok: false, error: '缺少 uid' });
       try {
         const report = await applyPermissionLayers(uid);
-        await installPermissionGuard('ensure');
         return json(res, 200, {
           ok: !!(report && report.ok),
           uid,
@@ -13060,13 +13584,57 @@ function handleApi(req, res) {
     });
   }
 
-  // 只看状态，不动任何东西：偏好文件 + 页面开关 + 守卫运行情况。
+  // 三个开关的读写。默认全关；autoApprove 拒绝开启。
+  if (req.method === 'GET' && p === '/api/permission/config') {
+    return getPermissionStatus({ send: cdpReadyForPermission() ? (m, p2) => cdpSend(m, p2) : null })
+      .then((status) => json(res, 200, { ok: true, ...status }))
+      .catch((e) => json(res, 500, { ok: false, error: e.message }));
+  }
+  if (req.method === 'POST' && p === '/api/permission/config') {
+    return readBody(req).then(async (body) => {
+      const payload = body || {};
+      const applied = [];
+      try {
+        for (const name of ['preferenceGuard', 'configRepair']) {
+          if (typeof payload[name] !== 'boolean') continue;
+          setGuardSwitch(name, payload[name]);
+          applied.push(`${name}=${payload[name]}`);
+        }
+        if (payload.autoApprove === true) {
+          return json(res, 400, { ok: false, error: '执行期自动批准已按策略移除，不能开启' });
+        }
+        // 开关 A 打开后立刻生效，关闭后彻底停止。
+        if (payload.preferenceGuard === true) {
+          if (preferenceGuard) { try { preferenceGuard.stop(); } catch (_) {} preferenceGuard = null; }
+          startPermissionPreferenceGuard();
+        } else if (payload.preferenceGuard === false) {
+          if (preferenceGuard) { try { preferenceGuard.stop(); } catch (_) {} preferenceGuard = null; }
+        }
+        const status = await getPermissionStatus({ send: cdpReadyForPermission() ? (m, p2) => cdpSend(m, p2) : null });
+        log(`[permission] 开关更新 ${applied.join(' ') || '(无变化)'}`);
+        return json(res, 200, { ok: true, ...status });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    }).catch((e) => json(res, 400, { ok: false, error: e.message }));
+  }
+
+  // 一键全停：定时器 + 页面守卫 + 已注册脚本 + 持久化关闭。
+  if (req.method === 'POST' && p === '/api/permission/off') {
+    return stopPermissionGuards({
+      send: cdpReadyForPermission() ? (m, p2) => cdpSend(m, p2) : null,
+      log: (msg) => { try { log(msg); } catch (_) {} },
+    })
+      .then((out) => { if (preferenceGuard) { try { preferenceGuard.stop(); } catch (_) {} preferenceGuard = null; } return json(res, 200, { ok: true, ...out }); })
+      .catch((e) => json(res, 500, { ok: false, error: e.message }));
+  }
+
+  // 只看状态，不动任何东西：开关、定时器、注册脚本、页面探针、各账号偏好。
   if (req.method === 'GET' && p === '/api/permission/status') {
     const acct = currentAccount() || {};
-    return Promise.resolve()
-      .then(() => readGuardState((m, p2) => cdpSend(m, p2)))
+    return getPermissionStatus({ send: cdpReadyForPermission() ? (m, p2) => cdpSend(m, p2) : null })
       .catch(() => null)
-      .then((guardPage) => {
+      .then((status) => {
         const prefs = {};
         try {
           const mod = require('./permission-sync.js');
@@ -13081,7 +13649,7 @@ function handleApi(req, res) {
           ok: true,
           uid: acct.uid || '',
           preferenceGuard: preferenceGuard ? preferenceGuard.stats() : null,
-          pageGuard: guardPage,
+          ...(status || {}),
           preferences: prefs,
         });
       });
@@ -13531,13 +14099,27 @@ function startServer() {
       writeUiPortFile(port);
       log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
       startRehomeWatcher();
-      // 偏好文件守卫（第 4 层）：任何时刻被写回默认值都还原，不依赖切号事件。
+      // 启动恢复检查：默认只读报告，不改数据库；startupReconcile=true 才自动接管。
+      setTimeout(() => {
+        const cfg = getRehomeRunner().readConfig();
+        rehomeWatcher.reconcile({ autoRun: cfg.startupReconcile === true })
+          .then((r) => {
+            if (!r || r.ok === false) {
+              log(`[rehome] 启动检查失败: ${(r && r.error) || 'unknown'}`);
+              return;
+            }
+            log(`[rehome] 启动检查 当前=${r.currentUid} 待接管=${r.wouldAffect} ` +
+              `autoRun=${r.applied ? 'yes' : 'no'}`);
+          })
+          .catch((e) => log(`[rehome] 启动检查异常: ${e.message}`));
+      }, 6000);
+      // 偏好文件守卫（开关 A）：默认关闭，只有显式开启才启动。
       startPermissionPreferenceGuard();
-      // 启动时只补偏好与会话字段，不动页面（避免每次开机弹一下权限面板）。
+      // 启动时补齐配置只在开关 B 打开时执行（默认不动用户的权限设置）。
       const bootAcct = currentAccount() || {};
-      if (bootAcct.uid) {
+      if (bootAcct.uid && readGuardConfig().configRepair) {
         setTimeout(() => {
-          applyPermissionLayers(bootAcct.uid, { renderer: false })
+          applyPermissionLayers(bootAcct.uid)
             .catch((error) => log(`[permission] 启动补齐失败: ${error.message}`));
         }, 4000);
       }

@@ -1,0 +1,76 @@
+name: Upstream Watch
+
+# 上游巡检：只读 + 开 issue。
+# 刻意不做的事：不建 PR、不合并、不打 tag、不推送任何东西。
+# 同步是人工审查后在本机完成的（流程见 docs/upstream-tracking.md），
+# 自动合并会把「上游改了什么」这件事变成黑箱。
+on:
+  schedule:
+    # 每周一 03:00 UTC（北京时间 11:00）
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: 检查上游是否有新提交
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 拉取上游
+        run: |
+          git remote add upstream https://github.com/babygoton/WorkDaddy.git
+          git fetch --no-tags upstream main
+
+      - name: 计算落后多少提交
+        id: diff
+        run: |
+          set -euo pipefail
+          BASE=$(git merge-base HEAD upstream/main)
+          COUNT=$(git rev-list --count "$BASE..upstream/main")
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 上游新提交（$COUNT 个）"
+            echo ""
+            echo '```'
+            git log --oneline --no-decorate "$BASE..upstream/main" | head -40
+            echo '```'
+          } > upstream-report.md
+          cat upstream-report.md
+
+      - name: 开 issue（有更新且没有未关闭的同名 issue 时）
+        if: steps.diff.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COUNT: ${{ steps.diff.outputs.count }}
+          BASE: ${{ steps.diff.outputs.base }}
+        run: |
+          set -euo pipefail
+          TITLE="上游有新提交：$COUNT 个（base ${BASE:0:7}）"
+          EXISTING=$(gh issue list --state open --search "上游有新提交 in:title" --json number --jq 'length')
+          if [ "$EXISTING" != "0" ]; then
+            echo "已有未关闭的巡检 issue，跳过创建（避免每周刷屏）"
+            exit 0
+          fi
+          {
+            cat upstream-report.md
+            echo ""
+            echo "### 下一步（人工，别自动合并）"
+            echo '```bash'
+            echo 'git switch -c sync/upstream-<版本> feat/full-fork-migration'
+            echo 'node tools/migration/inventory.js --fork HEAD --upstream upstream/main --out docs/migration/sync-<版本>'
+            echo 'git merge --no-commit --no-ff upstream/main'
+            echo 'node test/run-ci.js'
+            echo '```'
+            echo ""
+            echo "流程与冲突规则见 docs/upstream-tracking.md。"
+          } > body.md
+          gh issue create --title "$TITLE" --body-file body.md

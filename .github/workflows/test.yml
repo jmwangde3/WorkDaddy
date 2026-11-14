@@ -1,0 +1,288 @@
+name: Tests
+
+# 普通 CI：只读仓库，不发布、不写 Release。
+# 发布流程仍在 build-win.yml（仅 tag / 手动触发，权限另算）。
+on:
+  push:
+    branches: ['main', 'fix/**', 'feat/**', 'sync/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-tests:
+    name: Node ${{ matrix.node }} on Windows
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.14.0']
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 环境信息
+        shell: bash
+        run: |
+          node -v
+          npm -v
+          echo "runner: $RUNNER_OS $RUNNER_ARCH"
+
+      - name: 完整测试（只对新增失败报错）
+        shell: bash
+        run: node test/run-ci.js
+
+      - name: 上传 TAP（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tap-${{ matrix.node }}
+          path: test/last-run.tap
+          if-no-files-found: ignore
+
+  powershell-check:
+    name: PowerShell ${{ matrix.ps }} 语法 / 编码
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ps: '5.1'
+            exe: powershell.exe
+          - ps: '7'
+            exe: pwsh.exe
+    steps:
+      - uses: actions/checkout@v5
+
+      # 语法、BOM、CRLF 三项检查写在脚本里，用命令行参数指定用哪个解释器跑。
+      # 注意：GitHub Actions 的 shell: 字段不接受 ${{ matrix.* }} 表达式
+      # （会报 Unrecognized named-value: 'matrix'），所以这里用 bash 起进程。
+      - name: 语法 / BOM / CRLF 检查（PowerShell ${{ matrix.ps }}）
+        shell: bash
+        run: ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass -File .github/scripts/check-powershell.ps1
+
+      - name: 解释器版本回显
+        shell: bash
+        run: ${{ matrix.exe }} -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+
+  node-version-floor:
+    name: node:sqlite 最低版本检查
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.13.0'
+
+      - name: 验证 node:sqlite 无需实验开关
+        shell: bash
+        run: |
+          node -e "const {DatabaseSync}=require('node:sqlite'); const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE t(a)'); console.log('node:sqlite OK without flags');"
+          node test/rehome-dedupe.test.js
+          node test/session-scope.test.js
+
+  installer-tests:
+    # 安装 / 更新 / 卸载在临时目录里真跑 PowerShell 5.1：
+    #   装到 fixture 目录、坏包回滚、停服务、哈希变化跳过、越界路径防护。
+    # 全程不碰真实 %APPDATA%\WorkDaddy、不碰 WorkBuddy 安装目录、不建桌面快捷方式。
+    name: 安装器 / 更新回滚 / 卸载
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 安装器生命周期
+        shell: bash
+        run: node --test test/installer-lifecycle.test.js
+
+      - name: 安装器事务（故障注入）
+        shell: bash
+        run: node test/installer-transaction.test.js
+
+      - name: 安装记录与磁盘一致性（失败时留证据）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-tmp
+          path: tmp/
+          if-no-files-found: ignore
+
+  package:
+    # 产物检查：真打一次包，检查 zip 里到底装了什么。
+    # 「本机路径配置 / 测试夹具 / 迁移文档进了发布包」是发出去就收不回的事故。
+    name: 打包产物内容检查
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # git archive 要完整仓库，浅克隆会缺历史
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 便携包 / 源码包 / 哈希清单
+        shell: bash
+        env:
+          # 留档产物供人工核对；不设的话测试跑完会自己删掉
+          WD_PKG_KEEP: '1'
+        run: node test/package-hygiene.test.js
+
+      - name: 留档产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            tmp/pkg-hygiene-*/dist/*.zip
+            tmp/pkg-hygiene-*/dist/SHA256SUMS.txt
+          if-no-files-found: warn
+
+  tray-build:
+    # 托盘 EXE 不能再是「某台机器上手工编的黑盒」：
+    # 现编一份，记录编译器版本与参数，跑 --selftest / --status，
+    # 再和仓库里那份已提交的 EXE 比行为、比源码字面量。
+    name: 托盘编译与运行验证
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 编译（记录 csc 版本 / 参数 / 哈希）
+        shell: pwsh
+        run: |
+          ./installer/build-tray.ps1 `
+            -OutputPath tmp/tray/WorkDaddyTray.exe `
+            -ManifestPath tmp/tray/build.json `
+            -Verify `
+            -Json tmp/tray/report.json
+          Get-Content tmp/tray/build.json -Raw -Encoding UTF8
+
+      - name: 与仓库 EXE 对比（行为 + 字面量）
+        shell: bash
+        run: node --test test/tray-build.test.js
+
+      - name: 留档编译产物与清单
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tray-build
+          path: tmp/tray/
+          if-no-files-found: ignore
+
+  setup:
+    # Setup 只能在一次性机器上验证：它会真的装到 %LOCALAPPDATA%\Programs\WorkDaddy。
+    # workflow 的每一台 runner 都是用完就丢的 Windows VM，正好符合要求。
+    # 开发机没有 Inno Setup，这条是 .iss 唯一的编译与真机证据来源。
+    name: Setup 编译 / 静默安装 / 卸载保留数据
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 安装 Inno Setup 6
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'Inno Setup 装完了却找不到 ISCC.exe' }
+          & $iscc /? | Select-Object -First 3
+          "ISCC=$iscc"
+
+      - name: 打包（含 Setup 编译）
+        shell: pwsh
+        run: |
+          ./installer/build-package.ps1 -OutputDirectory tmp/dist -Setup -Json tmp/dist/report.json
+          Get-Content tmp/dist/report.json -Raw -Encoding UTF8
+
+      - name: 真机安装 / 卸载 / 数据保留
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem tmp/dist -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw '没有产出 setup.exe' }
+          ./installer/setup/verify-setup.ps1 -SetupExe $setup.FullName -IAmOnAThrowawayMachine -Json tmp/setup-verify.json
+          Get-Content tmp/setup-verify.json -Raw -Encoding UTF8
+
+      - name: 留档产物与验证报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-dist
+          path: |
+            tmp/dist/*.exe
+            tmp/dist/*.zip
+            tmp/dist/SHA256SUMS.txt
+            tmp/dist/report.json
+            tmp/setup-verify.json
+          if-no-files-found: warn
+
+  supply-chain:
+    # 这个项目刻意做到零运行时依赖：node_modules 不存在，供应链面就是 0。
+    # 一旦有人加依赖，这条会失败，必须在 PR 里显式讨论。
+    name: 依赖与供应链
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 断言零依赖并核对 engines
+        shell: bash
+        run: |
+          node -e "
+          const pkg = require('./package.json');
+          const deps = Object.keys(pkg.dependencies || {});
+          const dev = Object.keys(pkg.devDependencies || {});
+          if (deps.length || dev.length) {
+            console.error('本项目不引入第三方依赖，请先在 PR 里讨论：', deps, dev);
+            process.exit(1);
+          }
+          if (!pkg.engines || !pkg.engines.node) { console.error('package.json 缺 engines.node'); process.exit(1); }
+          console.log('零依赖 OK，engines.node =', pkg.engines.node);
+          "
+          test ! -d node_modules && echo "node_modules 不存在（符合预期）"
+
+      - name: 检查没有提交私密文件
+        shell: bash
+        run: |
+          set -e
+          BAD=$(git ls-files | grep -Ei '(^|/)(\.api-token|workbuddy-exe\.json|.*\.pem|.*\.pfx|credentials\.json)$' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::仓库里提交了疑似私密文件：$BAD"
+            exit 1
+          fi
+          echo "未发现私密文件"

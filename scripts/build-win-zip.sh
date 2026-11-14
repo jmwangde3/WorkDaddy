@@ -307,6 +307,14 @@ if [ "$PROFILE" = "workbuddy-ai" ]; then
 import os
 import sys
 
+# 控制台代码页不一定是 UTF-8：英文 Windows 上是 cp1252，此时 print 中文会
+# 抛 UnicodeEncodeError 让整个打包中断。这里显式把 stdout 切成 UTF-8
+# （Python 3.7+ 有 reconfigure，更低版本降级为忽略）。
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 stage = sys.argv[1]
 
 def patch(path, pairs):

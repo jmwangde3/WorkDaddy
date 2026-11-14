@@ -14,6 +14,21 @@ CodeBuddy support targets its **Electron agent window**, not the VS Code editor 
 
 ---
 
+## 💖 Sponsors
+
+> Want to be featured here? **Early sponsor slots are CNY 99/month.** Contact [richdaddycashmany@163.com](mailto:richdaddycashmany@163.com).
+
+<table>
+<tr>
+<td width="180" align="center" valign="middle">
+  <a href="https://nagora.ai/"><img src="docs/images/nagora.png" alt="Nagora" width="150"></a>
+</td>
+<td valign="middle"><a href="https://nagora.ai/">Nagora</a> is a multi-model AI API gateway built for developers and teams. With a single account and API key, you can access more than 26 leading text and image models through one unified interface. It is compatible with OpenAI, Anthropic, and Gemini protocols and integrates seamlessly with development tools such as Claude Code, Codex, and Gemini CLI. The platform provides intelligent routing, automatic failover, transparent pricing, and consolidated billing, along with budget management, rate limiting, and concurrency controls. This makes AI usage more reliable and manageable across individual development, team collaboration, and production environments. No changes to your existing application are required. Simply replace the Base URL and API key to complete the integration in as little as one minute.</td>
+</tr>
+</table>
+
+---
+
 ## Clients and feature scope
 
 | Official client | Package brand | Profile |
@@ -52,7 +67,7 @@ CodeBuddy support targets its **Electron agent window**, not the VS Code editor 
 - **Automation tasks:** discover and import tasks from public GitHub and Gitee repositories, or describe what you need and let WorkBuddy create a task. Supports manual, event, and scheduled triggers, run logs, stopping tasks, and JSON / ZIP export.
 - **Quiet approval mode:** automatically handle supported permission prompts while you are away.
 - **Stash prompts:** send drafts to WorkBuddy's pending message queue while preserving images, files, and quotes for later use.
-- **Themes:** WorkBuddy’s Manage theme switch offers Follow system, Light, Dark, Eye-care green, Cyber purple, and Frosted glass. “Follow system” tracks the operating system’s dark/light mode and switches automatically. Frosted glass supports preset and custom wallpapers; turning management off restores the client’s native appearance.
+- **Themes:** WorkBuddy’s Manage theme switch offers Follow system, Light, Dark, Eye-care green, Cyber purple, and Frosted glass. “Follow system” tracks the operating system’s dark/light mode and switches automatically. Frosted glass supports preset wallpapers, custom image wallpapers, and video wallpapers (MP4 / WebM, muted loop, paused while the window is in the background); turning management off restores the client’s native appearance.
 - **Session migration:** copy sessions between accounts automatically or manually and continue working where you left off.
 - **Session branching:** once enabled under Enhance, any reply can start a new conversation that keeps the chat up to that reply, while the original conversation stays untouched.
 - **Model tools:** manage and switch models more easily, including multiple configurations with the same model name.

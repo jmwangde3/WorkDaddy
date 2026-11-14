@@ -117,7 +117,20 @@ function wdCompatLog(msg) {
 // 校验的主程序路径；只在 Node/daemon 侧读取，注入到 renderer 的 compat 脚本不会触发。
 function wdCompatConfiguredExe() {
   if (!IS_WIN || typeof module === 'undefined' || !module.exports) return '';
-  // [rehome] 自定义安装盘符：同目录 workbuddy-exe.json 指定客户端路径。
+  // 显式配置优先：<数据目录>\workbuddy-target.json 是新版配置入口，会随安装迁移，
+  // 也是测试/安装器唯一可靠的注入点。旧补丁版遗留的 <scripts>\workbuddy-exe.json
+  // 只在没有显式 target 时兜底 —— 否则开发机上那份指向本机安装目录的遗留文件
+  // 会盖掉用户（或测试）显式配置的路径，取钥走错二进制。
+  try {
+    const target = require('./workbuddy-target.js').readWorkBuddyTarget({
+      dataDir: process.env.WBSWITCH_DATA_DIR || undefined,
+      profileId: process.env.WBSWITCH_PROFILE || undefined,
+    });
+    if (target && target.configured && typeof target.binary === 'string' && target.binary.trim()) {
+      return target.binary.trim();
+    }
+  } catch (_) {}
+  // [rehome] 旧补丁版兜底：同目录 workbuddy-exe.json 指定客户端路径。
   // 官方默认只找 %LOCALAPPDATA%\Programs\WorkBuddy，装在其它盘时取钥失败，
   // 会把 nickname / phone 显示成「(已加密)」，积分与成长接口也拿不到明文 token。
   try {
@@ -1172,6 +1185,9 @@ function mergeAutoCopyLineages(dataDir, fromLineageId, intoLineageId) {
   const fromLineage = config.sessions[from];
   const intoLineage = config.sessions[into];
   if (!fromLineage || !intoLineage) return { ok: false, reason: 'missing' };
+  if (fromLineage.excludedUids || intoLineage.excludedUids) {
+    intoLineage.excludedUids = Array.from(new Set([...(intoLineage.excludedUids || []), ...(fromLineage.excludedUids || [])]));
+  }
 
   const knownMembers = new Set((intoLineage.members || []).map((member) =>
     JSON.stringify([String(member && member.uid || ''), String(member && member.id || '')])));
@@ -1297,15 +1313,52 @@ function removeAutoCopySession(dataDir, uid, sessionId) {
   return true;
 }
 
-// 真实删除路径的展开器：把要删除的会话按 lineage 扩展到全部物理副本（其他
-// 账号自动复制出来的同源会话）。否则删除某个账号的会话后，副本仍留在其他
-// 账号，切换回来时 auto-copy 会把它们原样复制回来（用户观察到的「删除后
-// 切走再切回、会话复活」现象）。无 lineage 的会话映射回自身。
+// #511: a local deletion is a destination exclusion, never permission to erase
+// surviving siblings. Keep provenance so an all/workspace sync cannot recreate
+// the deleted copy. Explicit manual copy can still restore it.
+function recordSessionDeletion(dataDir, rows, options = {}) {
+  const families = rows.map(row => {
+    const lineageIds = new Set();
+    collectLineageMembersForDelete(dataDir, [row.id], lineageIds);
+    return { row, lineageIds };
+  });
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  for (const { row, lineageIds } of families) {
+    const uid = String(row.user_id || '').trim();
+    const id = String(row.id || '').trim();
+    if (!uid || !id) continue;
+    for (const lineageId of lineageIds) {
+      const lineage = config.sessions[lineageId];
+      if (!lineage) continue;
+      lineage.excludedUids = Array.from(new Set([...(Array.isArray(lineage.excludedUids) ? lineage.excludedUids : []), uid]));
+    }
+    if (options.preserveMembers) continue;
+    for (const lineage of Object.values(config.sessions)) {
+      lineage.members = (lineage.members || []).filter(member => !(member.uid === uid && member.id === id));
+    }
+    if (config.sessionIndex[uid]) delete config.sessionIndex[uid][id];
+    for (const [key, mapping] of Object.entries(config.copies)) {
+      if (mapping && String(mapping.targetId || '') === id) delete config.copies[key];
+    }
+  }
+  if (!options.preserveMembers) config.duplicates = collectAutoCopyDuplicates(config);
+  writeMeta(dataDir, meta);
+  return rows.length;
+}
+
+function isAutoCopyTargetExcluded(dataDir, lineageId, uid) {
+  const lineage = readAutoCopyConfig(dataDir).sessions[String(lineageId || '')];
+  return !!(lineage && Array.isArray(lineage.excludedUids) && lineage.excludedUids.includes(String(uid || '').trim()));
+}
+
+// 仅供显式「所有账号」删除及来源关系检查使用；普通删除不展开。
+// 按 lineage 扩展到全部已关联物理副本；无 lineage 的会话映射回自身。
 // 返回 [{ uid, id, lineageId }]；uid 可能为空（脏索引），id 必有值。
 // Copy guards consult provenance repeatedly. Rebuild its graph only after the
 // meta-file fingerprint changes, rather than scanning every account per guard.
 const lineageDeleteIndexes = new WeakMap();
-function collectLineageMembersForDelete(dataDir, sessionIds) {
+function collectLineageMembersForDelete(dataDir, sessionIds, relatedLineageIds) {
   const config = readAutoCopyConfig(dataDir);
   const ids = new Set(
     (Array.isArray(sessionIds) ? sessionIds : [])
@@ -1368,6 +1421,7 @@ function collectLineageMembersForDelete(dataDir, sessionIds) {
       const lineageId = pending[i];
       if (seenLineages.has(lineageId)) continue;
       seenLineages.add(lineageId);
+      if (relatedLineageIds) relatedLineageIds.add(lineageId);
       const lineage = config.sessions[lineageId];
       const origin = String(lineage.originLineageId || lineageId);
       for (const related of lineagesByOrigin.get(origin) || []) {
@@ -2112,6 +2166,8 @@ module.exports = {
   removeAutoCopySession,
   removeAutoCopyAccount,
   collectLineageMembersForDelete,
+  recordSessionDeletion,
+  isAutoCopyTargetExcluded,
   getAutoCopyMapping,
   getAutoCopyMappings,
   migrateAutoCopyTargetRevisions,
