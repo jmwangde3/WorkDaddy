@@ -78,6 +78,7 @@ if (Test-Path -LiteralPath (Join-Path $appDir 'scripts\daemon.js')) {
 # 哪怕这一次安装其实一个文件都没落地。
 $statePath = Join-Path $dataDir 'install-state.json'
 $installReport = Join-Path $dataDir 'install-report.json'
+$tracePath = Join-Path $dataDir 'install-trace.log'
 if (Test-Path -LiteralPath $statePath) {
     Fail-Setup ('数据目录里已有安装记录：' + $statePath + '；这台机器不是干净的，验证结论无效') 3
 }
@@ -88,45 +89,56 @@ if (Test-Path -LiteralPath $installReport) { Remove-Item -LiteralPath $installRe
 $installArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-')
 $p = Start-Process -FilePath $SetupExe -ArgumentList $installArgs -Wait -PassThru
 $report.install.exitCode = [int]$p.ExitCode
-if ($p.ExitCode -ne 0) { Fail-Setup ('Setup 退出码 ' + $p.ExitCode) 4 }
 
-# Inno 的 [Run] 不传递子进程退出码，所以结果只能看落盘
-if (-not (Test-Path -LiteralPath $statePath)) {
-    # 安装器自己写的报告是唯一的失败线索（Setup 报成功不代表脚本成功）
-    $why = ''
+# 失败时的取证：Setup 的退出码只说明「失败」，说明不了「哪一步失败」。
+# 安装器自己写的报告 + 阶段痕迹 + 安装目录的文件数，三个一起看才够定位。
+function Get-InstallDiagnostics {
+    $bits = @()
     if (Test-Path -LiteralPath $installReport) {
         try {
             $jr = Get-Content -LiteralPath $installReport -Raw -Encoding UTF8 | ConvertFrom-Json
-            $why = '；安装器报告：exitCode=' + [string]$jr.exitCode + ' error=' + [string]$jr.error
+            $bits += ('安装器报告：exitCode=' + [string]$jr.exitCode + ' error=' + [string]$jr.error)
+            if ($null -ne $jr.exitCode) { $report.install.reportExitCode = [int]$jr.exitCode }
+            if ([string]$jr.error) { $report.install.reportError = [string]$jr.error }
         } catch {
-            $why = '；安装器报告无法解析：' + $_.Exception.Message
+            $bits += ('安装器报告无法解析：' + $_.Exception.Message)
         }
     } else {
-        $why = '；没有安装器报告（' + $installReport + '），说明脚本可能根本没跑起来'
+        $bits += ('没有安装器报告（' + $installReport + '）')
+    }
+    if (Test-Path -LiteralPath $tracePath) {
+        $tail = @(Get-Content -LiteralPath $tracePath -Encoding UTF8 -ErrorAction SilentlyContinue)
+        if ($tail.Count -gt 0) {
+            $bits += ('阶段痕迹最后 ' + [Math]::Min(12, $tail.Count) + ' 行：' + ((@($tail) | Select-Object -Last 12) -join ' / '))
+        }
     }
     if (Test-Path -LiteralPath $appDir) {
-        $files = @(Get-ChildItem -LiteralPath $appDir -Recurse -File -ErrorAction SilentlyContinue)
-        $why += '；安装目录里有 ' + $files.Count + ' 个文件'
+        $n = @(Get-ChildItem -LiteralPath $appDir -Recurse -File -ErrorAction SilentlyContinue).Count
+        $bits += ('安装目录里有 ' + $n + ' 个文件')
     } else {
-        $why += '；安装目录不存在'
+        $bits += '安装目录不存在'
     }
-    $report.install.reportError = $why
-    Fail-Setup ('装完没有安装记录：' + $statePath + $why) 5
+    return ($bits -join '；')
 }
-if (Test-Path -LiteralPath $installReport) {
-    try {
-        $jr = Get-Content -LiteralPath $installReport -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -ne $jr.exitCode) { $report.install.reportExitCode = [int]$jr.exitCode }
-        if ([string]$jr.error) { $report.install.reportError = [string]$jr.error }
-    } catch {
-        $report.install.reportError = '报告无法解析：' + $_.Exception.Message
-    }
-    # 报告是一次性的：留着会让下一轮的「装完有记录」判断失去意义
-    Remove-Item -LiteralPath $installReport -Force -ErrorAction SilentlyContinue
+
+if ($p.ExitCode -ne 0) {
+    $report.install.reportError = Get-InstallDiagnostics
+    Fail-Setup ('Setup 退出码 ' + $p.ExitCode + '；' + $report.install.reportError) 4
+}
+
+# Setup 现在会把安装脚本的退出码带出来（[Code] 里 Exec + RaiseException），
+# 所以正常路径上这里一定能看到记录。仍然保留落盘核对：那是最终判据。
+if (-not (Test-Path -LiteralPath $statePath)) {
+    $report.install.reportError = Get-InstallDiagnostics
+    Fail-Setup ('装完没有安装记录：' + $statePath + '；' + $report.install.reportError) 5
 }
 # 脚本自己报失败，就算文件碰巧落了盘，也不能算装好了
 if ($null -ne $report.install.reportExitCode -and $report.install.reportExitCode -ne 0) {
     Fail-Setup ('安装器报告退出码 ' + [string]$report.install.reportExitCode + '：' + [string]$report.install.reportError) 5
+}
+# 报告与痕迹都是一次性的：留着会让下一轮的「装完有记录」判断失去意义
+foreach ($f in @($installReport, $tracePath)) {
+    if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $appDir 'scripts\daemon.js'))) { Fail-Setup '装完没有 scripts\daemon.js' 5 }
 $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json

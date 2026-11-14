@@ -56,18 +56,8 @@ Source: "{#OutDir}\{#PayloadName}"; DestDir: "{tmp}\workdaddy-setup"; DestName: 
 Source: "{#RepoRoot}\installer\uninstall-workdaddy.ps1"; DestDir: "{app}\_setup"; Flags: ignoreversion
 Source: "{#RepoRoot}\installer\lib\common.ps1"; DestDir: "{app}\_setup\lib"; Flags: ignoreversion
 
-[Run]
-; Step 1：解包
-Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Expand-Archive -LiteralPath '{tmp}\workdaddy-setup\payload.zip' -DestinationPath '{tmp}\workdaddy-setup\payload' -Force"""; \
-  StatusMsg: "正在解包..."; Flags: waituntilterminated runhidden
-; Step 2：走测试过的安装器（快捷方式、数据初始化、安装记录都由它负责）
-; -Json 写到数据目录：Inno 的 [Run] 不传递子进程退出码，安装失败在 Setup 层面
-; 看不出来。这份报告是唯一的失败线索，verify-setup.ps1 会读它。
-; 不用 {tmp}：那是 Inno 自己的临时子目录，Setup 退出时会被删掉。
-Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\workdaddy-setup\payload\installer\install-workdaddy.ps1"" -SourceDir ""{tmp}\workdaddy-setup\payload"" -AppDir ""{localappdata}\Programs\WorkDaddy"" -DataDir ""{userappdata}\WorkDaddy"" -Json ""{userappdata}\WorkDaddy\install-report.json"""; \
-  StatusMsg: "正在安装 WorkDaddy..."; Flags: waituntilterminated
+; 没有 [Run] 段：解包与安装都在 [Code] 的 CurStepChanged(ssPostInstall) 里做。
+; 理由见那里 —— [Run] 拿不到子进程退出码，装失败 Setup 照样报成功。
 
 [UninstallRun]
 ; 卸载交给脚本：按安装记录逐条删，数据默认保留
@@ -78,3 +68,59 @@ Filename: "powershell.exe"; \
 [UninstallDelete]
 ; 只清 Setup 自己解出来的临时目录；程序文件由安装器按清单删
 Type: filesandordirs; Name: "{tmp}\workdaddy-setup"
+
+[Code]
+// Step 1（解包）与 Step 2（安装）放在这里而不是 [Run]，只有一个原因：
+// [Run] 无法把子进程的退出码带回来。以前安装脚本失败，Setup 仍然报「成功」，
+// 用户看到的是一个装了一半、还提示装好了的程序；CI 那边也只能靠「装完有没有
+// 安装记录」倒推。用 Exec 拿 ResultCode，失败就 RaiseException，让 Setup
+// 自己以非零码退出 —— 这样「装失败」在系统层面就是一个可观测的事实。
+//
+// 顺序注意：CurStepChanged(ssPostInstall) 在 [Run] 之前执行，所以两步必须
+// 都在这里，不能一步在 [Code] 一步在 [Run]。
+
+procedure SetStatusText(const Text: String);
+begin
+  if Assigned(WizardForm) then
+    if Assigned(WizardForm.StatusLabel) then
+      WizardForm.StatusLabel.Caption := Text;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+  SetupDir, PayloadDir, ZipPath, AppDir, DataDir, Args: String;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+
+  SetupDir   := ExpandConstant('{tmp}\workdaddy-setup');
+  ZipPath    := SetupDir + '\payload.zip';
+  PayloadDir := SetupDir + '\payload';
+  AppDir     := ExpandConstant('{localappdata}\Programs\WorkDaddy');
+  DataDir    := ExpandConstant('{userappdata}\WorkDaddy');
+
+  // ---- Step 1：解包 ----
+  SetStatusText('正在解包...');
+  Args := '-NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '''
+        + ZipPath + ''' -DestinationPath ''' + PayloadDir + ''' -Force"';
+  if not Exec('powershell.exe', Args, SetupDir, SW_HIDE, ewWaitUntilTerminated, Code) then
+    RaiseException('无法启动解包步骤（powershell.exe 调用失败）');
+  if Code <> 0 then
+    RaiseException('解包失败：powershell 返回 ' + IntToStr(Code));
+
+  // ---- Step 2：走测试过的安装器 ----
+  // -Json / -Trace 都落在数据目录：Setup 退出时不会删它，失败后还能查。
+  SetStatusText('正在安装 WorkDaddy...');
+  Args := '-NoProfile -ExecutionPolicy Bypass -File "' + PayloadDir + '\installer\install-workdaddy.ps1"'
+        + ' -SourceDir "' + PayloadDir + '"'
+        + ' -AppDir "' + AppDir + '"'
+        + ' -DataDir "' + DataDir + '"'
+        + ' -Json "' + DataDir + '\install-report.json"'
+        + ' -Trace "' + DataDir + '\install-trace.log"';
+  if not Exec('powershell.exe', Args, PayloadDir, SW_HIDE, ewWaitUntilTerminated, Code) then
+    RaiseException('无法启动安装脚本（powershell.exe 调用失败）');
+  if Code <> 0 then
+    RaiseException('安装脚本返回 ' + IntToStr(Code)
+      + '。详见 ' + DataDir + '\install-report.json 与 install-trace.log');
+end;

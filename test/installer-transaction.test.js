@@ -356,6 +356,40 @@ function main() {
     }
     assert.deepEqual(fs.readdirSync(dataDir).filter((n) => n.startsWith('.install-state.tmp-')), []);
   });
+
+  // ---- 阶段痕迹：只为「脚本什么都没留下就消失了」这类失败准备 ----
+  // 报告只在成功和「已经处理过的失败」路径上写。进程被外部杀掉、或直接崩掉时，
+  // 什么都不会留下 —— CI 上 Setup 装到一半无声失败就是这么被发现的。
+
+  test('安装：成功时不留阶段痕迹，失败时留下且能看出停在哪一步', () => {
+    const root = tmpRoot('tx-trace');
+
+    // 成功：痕迹是临时诊断物，不该留在用户数据目录里
+    const srcOk = makeSource(root, '1.3.0');
+    const traceOk = path.join(root, 'trace-ok.log');
+    const ok = runPs(installPs1, installerArgs(srcOk, path.join(root, 'app-ok'), path.join(root, 'data-ok'))
+      .concat(['-Trace', traceOk]), root);
+    assert.equal(ok.code, 0, ok.stdout + ok.stderr);
+    assert.equal(fs.existsSync(traceOk), false, '成功后不该留下阶段痕迹');
+
+    // 失败：痕迹必须还在，且最后一行要指向失败的那一步
+    const srcBad = makeSource(root, '1.3.0');
+    const traceBad = path.join(root, 'trace-bad.log');
+    const bad = runPs(installPs1, installerArgs(srcBad, path.join(root, 'app-bad'), path.join(root, 'data-bad'))
+      .concat(['-Trace', traceBad, '-InjectFault', 'state-write']), root);
+    assert.equal(bad.code, 7, bad.stdout + bad.stderr);
+    assert.equal(fs.existsSync(traceBad), true, '失败后必须留下阶段痕迹');
+    const lines = fs.readFileSync(traceBad, 'utf8').split(/\r?\n/).filter(Boolean);
+    assert.ok(lines.length >= 5, '痕迹太短：' + lines.join(' / '));
+    assert.match(lines[0], /^\d\d:\d\d:\d\d\.\d\d\d start$/);
+    // 状态写入失败发生在 copy/verify/shortcut/datadir 之后
+    const stages = lines.map((l) => l.replace(/^\S+ /, ''));
+    for (const need of ['preflight', 'copy', 'verify', 'datadir']) {
+      assert.ok(stages.includes(need), '痕迹缺阶段 ' + need + '：' + stages.join('/'));
+    }
+    assert.ok(/^state:hashing /.test(stages[stages.length - 1]),
+      '最后一步应停在状态提交，实际：' + stages[stages.length - 1]);
+  });
 }
 
 try {

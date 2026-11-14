@@ -59,17 +59,38 @@ function findCsc() {
 }
 
 /** 跑托盘：GUI 子系统没有 stdout，结果看 %TEMP%\WorkDaddyTray-cli.txt。 */
-function runTray(exe, action, tempDir) {
+function runTray(exe, action, tempDir, extraEnv) {
   const cli = path.join(tempDir, 'WorkDaddyTray-cli.txt');
   try { fs.rmSync(cli, { force: true }); } catch (_) {}
-  const res = spawnSync(exe, [action], {
-    encoding: 'utf8',
-    timeout: 60000,
-    env: Object.assign({}, process.env, { TEMP: tempDir, TMP: tempDir }),
-  });
+  const env = Object.assign({}, process.env, { TEMP: tempDir, TMP: tempDir }, extraEnv || {});
+  const res = spawnSync(exe, [action], { encoding: 'utf8', timeout: 60000, env });
   let text = '';
   if (fs.existsSync(cli)) text = fs.readFileSync(cli, 'utf8');
   return { status: res.status, text: text.trim(), stderr: res.stderr || '' };
+}
+
+/**
+ * 造一个假的 scripts 目录。
+ *
+ * 为什么要这么干：托盘用 ResolveScripts() 找脚本目录，候选里既有
+ * %LOCALAPPDATA%\Programs\WorkDaddy\scripts，也有「exe 同级的 ../scripts」。
+ * 于是同一台机器上，仓库里那份 EXE（在 tray\ 下）会认到仓库自带的 scripts\，
+ * 而现编产物（在 tmp\tray-xxx\ 下）认不到 —— 两个二进制的输出差别来自
+ * 「它站在哪个目录」，跟源码版本毫无关系。开发机上 %LOCALAPPDATA% 那份
+ * 恰好存在，两边都命中第一个候选，这个坑就被盖住了；CI 上没装过，坑就露出来。
+ *
+ * 用 WORKDADDY_SCRIPTS 钉住同一个目录，比较的才是二进制本身。
+ */
+function makeScriptsFixture(dir, opts) {
+  const withLauncher = !(opts && opts.bare);
+  fs.mkdirSync(dir, { recursive: true });
+  // daemon.js 是 ResolveScripts 认目录的凭据，必须存在
+  fs.writeFileSync(path.join(dir, 'daemon.js'), '// fixture: 只为满足 File.Exists\n');
+  if (withLauncher) {
+    fs.writeFileSync(path.join(dir, 'launcher.cmd'), '@echo off\r\n');
+    fs.writeFileSync(path.join(dir, 'watchdog.js'), '// fixture\n');
+  }
+  return dir;
 }
 
 /** 去掉随环境变化的行（exe 路径、进程数、端口状态），只留结构。 */
@@ -300,13 +321,36 @@ function main() {
   // ==================== 2. 与已提交的 EXE 对比 ====================
 
   test('托盘：仓库 EXE 与现编产物的 CLI 行为一致', () => {
-    const freshSelf = normalizeCli(runTray(outExe, '--selftest', root).text);
-    const repoSelf = normalizeCli(runTray(committedExe, '--selftest', root).text);
+    // 两个二进制必须看着同一个 scripts 目录，否则比的是「谁站在哪个目录」
+    const full = makeScriptsFixture(path.join(root, 'fx-full'));
+    const envFull = { WORKDADDY_SCRIPTS: full };
+
+    const freshSelf = normalizeCli(runTray(outExe, '--selftest', root, envFull).text);
+    const repoSelf = normalizeCli(runTray(committedExe, '--selftest', root, envFull).text);
     assert.equal(repoSelf, freshSelf, '仓库 EXE 的 --selftest 输出与现编产物不一致（二进制可能对应旧源码）');
 
-    const freshStatus = normalizeCli(runTray(outExe, '--status', root).text);
-    const repoStatus = normalizeCli(runTray(committedExe, '--status', root).text);
+    // 确认真的是「看着同一个目录」在比，而不是碰巧两边都看错到同一个地方
+    const freshRaw = runTray(outExe, '--selftest', root, envFull).text;
+    const repoRaw = runTray(committedExe, '--selftest', root, envFull).text;
+    assert.ok(freshRaw.includes('wd scripts : ' + full), '现编产物没用 WORKDADDY_SCRIPTS 指定的目录：' + freshRaw);
+    assert.ok(repoRaw.includes('wd scripts : ' + full), '仓库 EXE 没用 WORKDADDY_SCRIPTS 指定的目录：' + repoRaw);
+
+    const freshStatus = normalizeCli(runTray(outExe, '--status', root, envFull).text);
+    const repoStatus = normalizeCli(runTray(committedExe, '--status', root, envFull).text);
     assert.equal(repoStatus, freshStatus, '仓库 EXE 的 --status 输出与现编产物不一致');
+
+    // 光「两边一样」不够：两边一样地看错目录也是一样的。钉死这个分支的真实取值。
+    assert.match(freshSelf, /^launcher\s*: exists=True$/m, '有 launcher.cmd 时应报 True');
+    assert.match(freshSelf, /^watchdog\s*: exists=True$/m, '有 watchdog.js 时应报 True');
+
+    // 反过来再验一遍「目录里没有就是 False」，两条分支都落到断言上
+    const bare = makeScriptsFixture(path.join(root, 'fx-bare'), { bare: true });
+    const envBare = { WORKDADDY_SCRIPTS: bare };
+    const bareFresh = normalizeCli(runTray(outExe, '--selftest', root, envBare).text);
+    const bareRepo = normalizeCli(runTray(committedExe, '--selftest', root, envBare).text);
+    assert.equal(bareRepo, bareFresh, '空 scripts 目录下两个 EXE 的行为仍应一致');
+    assert.match(bareFresh, /^launcher\s*: exists=False$/m, '没有 launcher.cmd 时应报 False');
+    assert.match(bareFresh, /^watchdog\s*: exists=False$/m, '没有 watchdog.js 时应报 False');
   });
 
   test('托盘：源码字面量全部能在两个 EXE 里找到（正查）', () => {

@@ -27,6 +27,10 @@ param(
     [switch]$SkipClientCheck,
     [switch]$Force,
     [string]$Json = '',
+    # 仅诊断用：把「走到哪一步」逐行追加到这个文件。
+    # 用途是查「脚本没有留下任何报告就消失了」这类问题 —— 报告只在成功和已处理的
+    # 失败路径上写，进程被外部杀掉或直接崩掉时什么都不会留下，只能靠这个痕迹。
+    [string]$Trace = '',
     # 仅供故障注入测试：copy-mid / verify / state-write
     [string]$InjectFault = ''
 )
@@ -34,6 +38,30 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $here 'lib\common.ps1')
+
+$script:tracePath = $Trace
+function Write-Stage {
+    param([string]$Name)
+    if (-not $script:tracePath) { return }
+    try {
+        $line = (Get-Date).ToString('HH:mm:ss.fff') + ' ' + $Name + "`r`n"
+        $dir = Split-Path -Parent $script:tracePath
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        }
+        [IO.File]::AppendAllText($script:tracePath, $line, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+# 兜底：任何没被本地 try/catch 接住的终止性错误都记一笔再退出，
+# 免得又变成「什么都没留下」。
+trap {
+    Write-Stage ('UNHANDLED ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message)
+    Write-Line ('未捕获的错误：' + $_.Exception.Message)
+    try { Write-Report -Report $report -JsonPath $Json } catch { }
+    exit 9
+}
+
+Write-Stage 'start'
 
 $report = [ordered]@{
     schema         = 1
@@ -108,6 +136,7 @@ $files = Get-InstallFileList $SourceDir
 if (-not $files -or $files.Count -lt 20) { Fail-Install ('源目录文件清单异常（' + $files.Count + ' 个），拒绝安装') 1 }
 
 # ---- 1. 预检 ----
+Write-Stage 'preflight'
 $osv = [Environment]::OSVersion.Version
 $report.preflight.windowsVersion = $osv.ToString()
 $report.preflight.windowsOk = ($osv.Major -ge 10)
@@ -184,6 +213,7 @@ if (-not $writable) { Fail-Install ('安装目录不可写：' + $AppDir) 3 }
 if (-not $report.preflight.windowsOk) { Fail-Install '预检未通过：Windows 版本过低' 2 }
 
 # ---- 2. 旧补丁版识别与配置导入 ----
+Write-Stage 'migrate'
 $legacyHit = $null
 if ($LegacyScriptsDir) {
     if (Test-Path -LiteralPath $LegacyScriptsDir) { $legacyHit = [IO.Path]::GetFullPath($LegacyScriptsDir).TrimEnd('\') }
@@ -241,6 +271,7 @@ if ($legacyHit) {
 $report.migration = $migration
 
 # ---- 3. 已有安装：先备份（程序 + 状态）----
+Write-Stage 'backup'
 # 任何已有安装都备份，不再只备份「版本不同」的情况：同版本重装一样可能在
 # 复制中途失败，没有备份就只剩一堆半新半旧的文件，那是最难收拾的状态。
 $statePath = Join-Path $DataDir 'install-state.json'
@@ -394,6 +425,7 @@ function Invoke-InstallRollback {
 }
 
 # ---- 4. 复制 ----
+Write-Stage 'copy'
 if ($DryRun) {
     Write-Line ('预检模式：将安装 ' + $files.Count + ' 个文件到 ' + $AppDir)
 } else {
@@ -415,6 +447,7 @@ if ($DryRun) {
 }
 
 # ---- 5. 校验 ----
+Write-Stage 'verify'
 if (-not $DryRun) {
     if ($InjectFault -eq 'verify') {
         # 模拟「复制没报错但落盘字节不对」：改掉一个清单文件让哈希比对失败
@@ -434,6 +467,7 @@ if (-not $DryRun) {
 $report.fileCount = $files.Count
 
 # ---- 6. 快捷方式（先做，路径要写进安装记录，卸载时只认这一条）----
+Write-Stage 'shortcut'
 # 只在「用户没有同名快捷方式」时创建；已存在就不动 —— 那是用户自己的东西。
 $shortcutPath = ''
 $script:createdShortcut = ''
@@ -469,6 +503,7 @@ if (-not $NoShortcut -and -not $DryRun) {
 }
 
 # ---- 7. 数据目录初始化 + 状态提交 ----
+Write-Stage 'datadir'
 $configPath = Join-Path $DataDir 'config.json'
 if (-not $DryRun) {
     try {
@@ -492,6 +527,7 @@ if (-not $DryRun) {
     $stateTmp = Join-Path $DataDir ('.install-state.tmp-' + $stamp + '.json')
     $report.state.tmpPath = $stateTmp
     try {
+        Write-Stage ('state:hashing ' + $files.Count + ' files')
         $table = Get-InstalledFileTable -AppDir $AppDir -Files $files
         $payload = [ordered]@{
             schema        = 1
@@ -507,9 +543,11 @@ if (-not $DryRun) {
             files         = $table
         }
         if ($InjectFault -eq 'state-write') { throw '故障注入：状态文件无法写入（模拟磁盘/权限问题）' }
+        Write-Stage 'state:write-tmp'
         Write-JsonFile -Path $stateTmp -Value $payload
         $err = Test-InstallStatePayload -Path $stateTmp -ExpectVersion $version -ExpectAppDir $AppDir -MinFiles $files.Count
         if ($err) { throw ('新状态校验失败：' + $err) }
+        Write-Stage 'state:validated'
         $report.state.validated = $true
 
         if (Test-Path -LiteralPath $statePath) {
@@ -519,6 +557,7 @@ if (-not $DryRun) {
         }
         $err = Test-InstallStatePayload -Path $statePath -ExpectVersion $version -ExpectAppDir $AppDir -MinFiles $files.Count
         if ($err) { throw ('提交后校验失败：' + $err) }
+        Write-Stage 'state:committed'
         $report.state.committed = $true
     } catch {
         if (Test-Path -LiteralPath $stateTmp) { Remove-Item -LiteralPath $stateTmp -Force -ErrorAction SilentlyContinue }
@@ -530,6 +569,7 @@ if (-not $DryRun) {
 }
 
 # ---- 8. 收尾 ----
+Write-Stage 'finalize'
 if (-not $report.preflight.clientDetected) {
     $report.warnings += '未检测到 WorkBuddy 官方客户端：WorkDaddy 已安装，但需要先安装并登录客户端才能接管账号。'
 }
@@ -538,4 +578,9 @@ Write-Line ('安装完成：' + $version + ' → ' + $AppDir)
 Write-Line ('数据目录：' + $DataDir)
 foreach ($w in $report.warnings) { Write-Line ('提示：' + $w) }
 Write-Report -Report $report -JsonPath $Json
+Write-Stage 'done'
+# 成功时把痕迹清掉：它只是诊断用的，不该在用户数据目录里留垃圾
+if ($script:tracePath -and (Test-Path -LiteralPath $script:tracePath)) {
+    Remove-Item -LiteralPath $script:tracePath -Force -ErrorAction SilentlyContinue
+}
 exit 0

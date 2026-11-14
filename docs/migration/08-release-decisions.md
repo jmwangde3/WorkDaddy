@@ -149,14 +149,24 @@
 1. `choco install innosetup` → 找到 `ISCC.exe`；
 2. `installer/build-package.ps1 -Setup` → 出便携包 + 源码包 + `setup.exe` + `SHA256SUMS.txt`；
 3. `installer/setup/verify-setup.ps1 -IAmOnAThrowawayMachine`：
-   - 前置：这台机器上不能已有 `…\Programs\WorkDaddy\scripts\daemon.js`，否则 exit 3；
+   - 前置：这台机器上不能已有 `…\Programs\WorkDaddy\scripts\daemon.js`，
+     数据目录里也不能已有 `install-state.json`，否则 exit 3。
+     第二条是必须的 —— 有残留记录时「装完有记录」这条断言会平凡地通过，
+     哪怕这一次安装一个文件都没落地；
    - `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART` 静默安装；
+   - 读安装器自己写的 `install-report.json`（见下），确认它是脚本跑出来且 `exitCode=0`，
+     读完即删，避免污染下一轮判断；
    - 检查 `install-state.json`、`daemon.js`、清单里**每一条**的 SHA-256 与磁盘一致；
    - 检查 `config.json` 已生成；
    - 跑 `unins*.exe /VERYSILENT` 卸载；
    - 检查程序文件没了、`install-state.json` 还在（数据默认保留）、快捷方式没了。
 
 `verify-setup.ps1` 不带 `-IAmOnAThrowawayMachine` 会直接 exit 2，防止有人在开发机上顺手跑。
+
+Setup 的 `[Run]` 拿不到子进程退出码，所以安装器额外的 `-Json`（写到
+`%APPDATA%\WorkDaddy\install-report.json`，不用 `{tmp}` —— 那是 Inno 自己的临时目录，
+Setup 退出就删）是唯一能把「脚本没跑起来」和「跑起来但失败了」区分开的线索。
+失败消息里会带出脚本的 `exitCode`、`error` 和安装目录的文件数。
 
 ### 3.3 仍然未验证 / 未实现（不要当成已完成）
 
