@@ -37,8 +37,9 @@ async function main() {
     ['s4', B, 'H:/ws/a', 'archived-B', 'archived', null, 0, 1000, 2003],
     ['s5', B, 'H:/ws/a', 'deleted-B', 'completed', 1, 0, 1000, 2004],
     ['s6', B, 'H:/ws/a', 'automation-B', 'completed', null, 1, 1000, 2005],
-    // cloud 会话用 deleted_at = -1 表示「未删除」（客户端原文：transport='cloud' AND deleted_at = -1）
-    ['s7', B, 'H:/ws/a', 'cloud-B', 'completed', -1, 0, 1000, 2006],
+    // 老库（没有 transport 列）里出现的 deleted_at = -1：客户端原文只证明 cloud 行
+    // 用过这个值，老库是否也用过没有证据 —— 语义未确认，因此永不接管，且默认阻断写入。
+    ['s7', B, 'H:/ws/a', 'legacy-minus-one-B', 'completed', -1, 0, 1000, 2006],
   ];
   for (const row of fixtures) await db.run(INSERT, row);
 
@@ -55,15 +56,34 @@ async function main() {
   const dry = await runner.run(A, { dryRun: true });
   assert.equal(dry.ok, true, 'dry run ok');
   assert.equal(dry.dryRun, true, 'dry run flagged');
-  assert.equal(dry.affected, 5, 's2/s3/s4(archived)/s6(automation)/s7(cloud,-1) are rehomed, s5(deleted) is not');
+  // 能接管的只有 deleted_at IS NULL 的 s2/s3/s4(archived)/s6(automation)；
+  // s5 是 deleted_at=1（回收站），s7 是老库里的 deleted_at=-1（语义未确认）。
+  assert.equal(dry.affected, 4, '只有 deleted_at IS NULL 的行在写入范围内');
+  assert.equal(dry.blocked, true, 'dry-run 也必须提前说明：真实写入会被阻断');
+  assert.equal(dry.ambiguity && dry.ambiguity.rows, 1, '老库检出 1 行 deleted_at=-1');
+  assert.equal(dry.scope, 'legacy-no-transport(strict)', '老库范围只认 NULL');
   assert.equal(dry.backup, null, 'dry run makes no backup');
   const afterDry = await db.all('SELECT id, user_id FROM sessions ORDER BY id');
   assert.deepEqual(afterDry, before, 'dry run left data untouched');
 
-  // real run
+  // 老库出现 -1 行且未确认 → 真实写入必须硬停，不能只报警然后照写
+  const blockedRun = await runner.run(A);
+  assert.equal(blockedRun.ok, false, '默认必须阻断，不能只报警');
+  assert.equal(blockedRun.skipped, 'legacy-deleted-at-ambiguous');
+  assert.equal(blockedRun.blocked, true);
+  assert.equal(blockedRun.affected, 0, '被阻断时 affected 必须是 0');
+  assert.ok(blockedRun.hint && blockedRun.hint.includes('allowLegacyAmbiguous'), '必须告诉用户怎样显式承认');
+  const afterBlocked = await db.all('SELECT id, user_id FROM sessions ORDER BY id');
+  assert.deepEqual(afterBlocked, before, '阻断时一行都不能动');
+
+  // 显式承认风险之后才允许写；即使承认，-1 行仍然不进写入范围
+  fs.writeFileSync(
+    path.join(tmp, 'rehome-sessions.json'),
+    JSON.stringify({ enabled: true, allowLegacyAmbiguous: true }, null, 2) + '\n',
+  );
   const applied = await runner.run(A);
   assert.equal(applied.ok, true, 'apply ok: ' + (applied.error || ''));
-  assert.equal(applied.affected, 5, 'five rows changed');
+  assert.equal(applied.affected, 4, '只写 deleted_at IS NULL 的四行');
   assert.ok(applied.backup && fs.existsSync(applied.backup), 'backup file created');
 
   const rows = await db.all('SELECT id, user_id FROM sessions ORDER BY id');
@@ -74,7 +94,7 @@ async function main() {
   assert.equal(byId.s4, A, 'archived row is rehomed (归档也接管)');
   assert.equal(byId.s5, B, 'deleted row untouched (回收站不接管)');
   assert.equal(byId.s6, A, 'background automation row is rehomed (运行记录也接管)');
-  assert.equal(byId.s7, A, 'cloud row with deleted_at=-1 is rehomed (云端会话也接管)');
+  assert.equal(byId.s7, B, 'legacy deleted_at=-1 row untouched (语义未确认，永不接管)');
 
   // idempotent second run
   const second = await runner.run(A);

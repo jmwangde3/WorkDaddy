@@ -22,7 +22,7 @@ const http = require('http');
 
 const DISPLAY_FILE = 'account-display.json';
 const STATES = Object.freeze([
-  'idle', 'detecting', 'pending', 'running', 'retrying', 'succeeded', 'failed',
+  'idle', 'detecting', 'pending', 'running', 'retrying', 'succeeded', 'failed', 'blocked',
 ]);
 const MAX_BACKOFF_MS = 60000;
 
@@ -176,6 +176,17 @@ function createAccountWatcher(options = {}) {
 
     attempts += 1;
     lastError = (error && error.message) || (result && result.error) || 'unknown';
+    // 「语义未确认」「配置不允许」这类是**永久性阻断**，重试一万次也不会变。
+    // 重试只对瞬时故障（数据库忙、文件正在写）有意义；阻塞态直接停在这里等人处理。
+    if (!error && result && result.retryable === false) {
+      lastError = result.skipped || result.error || 'blocked';
+      lastResult = result;
+      attempts = 0;
+      targetUid = null;
+      setState('blocked', `uid=${uid} reason=${lastError}`);
+      log(`[rehome] watcher 停止重试：${lastError}（需人工处理）`);
+      return;
+    }
     setState('failed', `uid=${uid} error=${lastError}`);
     log(`[rehome] watcher 失败（第 ${attempts} 次）: ${lastError}`);
     // 失败不丢目标：按退避继续重试，直到成功或账号再次变化。

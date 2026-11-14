@@ -15,8 +15,10 @@
  *     并且 `deleted_at IS NULL`（严格按 local 语义）。`deleted_at = -1` 出现在
  *     local 行上属**异常**：既不能确认是活的，也不能确认是回收站，一律不碰。
  *     既不是 local 也不是 cloud 的 transport 值 = 来源不明 → 永不接管（只读）。
- *   - 没有 transport 列 → 老库，全部是 local（客户端那时还没有云会话）。
- *     保留旧的 `IS NULL OR = -1` 行为，但把异常行数暴露出来供人工核对。
+ *   - 没有 transport 列 → 老库。**不能再假设 `-1` 是未删除**：这个哨兵值只在
+ *     cloud 行上被观察到，老库是否用过没有证据。默认只取 `deleted_at IS NULL`，
+ *     `-1` 行整行排除在写入范围之外；存在这类歧义行时，调用方必须**阻止写入**
+ *     （见 rehome-sessions.js 的 `legacy-ambiguous` 判定），除非用户显式承认。
  *   - 云端会话必须同时满足「配置开启 cloudTakeover」且「cloudVerified 已验证」。
  *
  * 本模块只生成 SQL 片段，不执行写入。
@@ -26,6 +28,8 @@ const LIVE_LOCAL = 'deleted_at IS NULL';
 const LIVE_CLOUD = 'deleted_at = -1';
 const NOT_DELETED = `(${LIVE_LOCAL} OR ${LIVE_CLOUD})`;
 const LOCAL_TRANSPORT = "(transport IS NULL OR transport = 'local')";
+/** 精确口径：local 用 NULL、cloud 用 -1，不互相套用。 */
+const PRECISE_LIVE = `((${LOCAL_TRANSPORT}) AND ${LIVE_LOCAL}) OR (transport = 'cloud' AND ${LIVE_CLOUD})`;
 const KNOWN_TRANSPORTS = new Set(['local', 'cloud', '(null)', '']);
 
 /**
@@ -45,19 +49,26 @@ function buildTakeoverScope(columns, options = {}) {
 
   if (!transportAware) {
     return {
-      where: NOT_DELETED, params: [],
-      description: 'legacy-no-transport',
+      // 老库：来源可确定（全 local），但 deleted_at 的编码无法交叉核对。
+      // 只认 NULL；`-1` 行不在写入范围内 —— 这一条不接受任何配置改写。
+      where: LIVE_LOCAL, params: [],
+      description: 'legacy-no-transport(strict)',
       cloud: false, transportAware: false,
-      verified: false,          // 老库：编码无法交叉核对，但来源可确定（全 local）
+      legacy: true,
+      verified: false,
       unknownOrigin: false,
+      // 需要调用方先做「歧义行体检」，有 -1 行时默认阻止写入。
+      requiresAmbiguityCheck: true,
     };
   }
   if (cloud) {
     return {
-      where: NOT_DELETED, params: [],
+      where: PRECISE_LIVE, params: [],
       description: 'local+cloud(verified)',
       cloud: true, transportAware: true,
+      legacy: false,
       verified: true, unknownOrigin: false,
+      requiresAmbiguityCheck: false,
     };
   }
   return {
@@ -65,7 +76,9 @@ function buildTakeoverScope(columns, options = {}) {
     params: [],
     description: 'local-only(strict)',
     cloud: false, transportAware: true,
+    legacy: false,
     verified: true, unknownOrigin: false,
+    requiresAmbiguityCheck: false,
   };
 }
 
@@ -88,15 +101,19 @@ async function assessDeletedSemantics(db) {
       `SUM(CASE WHEN deleted_at = 0 THEN 1 ELSE 0 END) AS zero, COUNT(*) AS total FROM sessions`
     );
     const r = rows[0] || {};
+    const ambiguous = Number(r.liveMinusOne || 0);
     return {
       ok: true,
       transportAware: false,
       verified: false,
       description: 'legacy-no-transport',
-      issues: Number(r.liveMinusOne || 0) > 0 ? [`legacy-minus-one-rows:${Number(r.liveMinusOne)}`] : [],
+      // 老库的 -1 语义没有证据可交叉核对：出现一行就算歧义，默认阻止写入。
+      blocking: ambiguous > 0,
+      blockReason: ambiguous > 0 ? `legacy-minus-one-rows:${ambiguous}` : null,
+      issues: ambiguous > 0 ? [`legacy-minus-one-rows:${ambiguous}`] : [],
       counts: {
         live: Number(r.liveNull || 0),
-        ambiguous: Number(r.liveMinusOne || 0),
+        ambiguous,
         trashed: Number(r.trashed || 0),
         zero: Number(r.zero || 0),
         total: Number(r.total || 0),
@@ -140,6 +157,8 @@ async function assessDeletedSemantics(db) {
     transportAware: true,
     verified,
     description: verified ? 'local/cloud-consistent' : 'inconsistent',
+    blocking: false,          // 异常行已被排除在范围之外，不需要额外阻断
+    blockReason: null,
     issues,
     unknownTransports,
     rows: buckets,
@@ -157,8 +176,8 @@ async function readTransportStats(db) {
   if (!cols.has('transport')) return { transportAware: false, rows: [] };
   const alive = await db.all(
     `SELECT COALESCE(transport, '(null)') AS transport, ` +
-    `SUM(CASE WHEN ${NOT_DELETED} THEN 1 ELSE 0 END) AS alive, ` +
-    `SUM(CASE WHEN ${NOT_DELETED} THEN 0 ELSE 1 END) AS trashed ` +
+    `SUM(CASE WHEN ${PRECISE_LIVE} THEN 1 ELSE 0 END) AS alive, ` +
+    `SUM(CASE WHEN ${PRECISE_LIVE} THEN 0 ELSE 1 END) AS trashed ` +
     'FROM sessions GROUP BY COALESCE(transport, \'(null)\')'
   );
   return {
@@ -175,6 +194,7 @@ module.exports = {
   LIVE_LOCAL,
   LIVE_CLOUD,
   NOT_DELETED,
+  PRECISE_LIVE,
   buildTakeoverScope,
   assessDeletedSemantics,
   readTransportStats,

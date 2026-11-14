@@ -24,21 +24,21 @@ const CONFIG_FILE = 'rehome-sessions.json';
 const BACKUP_DIR = 'rehome-backups';
 
 /**
- * 接管口径：只排除回收站。
+ * 历史口径说明（**不再用于接管写入**，接管一律走 session-scope.buildTakeoverScope）：
  *
- * 「未删除」有两种编码（客户端 app.asar 里的原文）：
+ * 「未删除」有两种编码：
  *   - local 会话：deleted_at IS NULL
  *   - cloud 会话：deleted_at = -1
- * 客户端活跃判定就是 `(transport='local' AND deleted_at IS NULL) OR (transport='cloud' AND deleted_at = -1)`。
+ * 客户端活跃判定是 `(transport='local' AND deleted_at IS NULL) OR (transport='cloud' AND deleted_at = -1)`。
  *
- * 云端会话默认不自动接管（见 session-scope.js / cloudTakeover 配置）：
- * 服务端语义未验证前，改本地归属不等于改云端归属。
+ * 下面这两个常量保留给调用方做「历史行为」对照与测试断言；真正的写入范围由
+ * buildTakeoverScope 生成，老库（无 transport 列）只认 `deleted_at IS NULL`。
  */
 const NOT_DELETED = "(deleted_at IS NULL OR deleted_at = -1)";
 const WHERE = NOT_DELETED;
 
 /**
- * 去重口径：在接管口径上再排除后台自动化任务会话。
+ * 去重口径（同样只作对照）：后台自动化任务会话有独立入口。
  * 归档会话按产品既定规则参与（与 README 一致，不再有「注释说排除、SQL 却没排除」的矛盾）。
  */
 const WHERE_DEDUPE = NOT_DELETED + " AND COALESCE(is_background_automation, 0) = 0";
@@ -135,6 +135,10 @@ function createRehomeRunner(options = {}) {
       // 云端接管默认关闭；cloudVerified 只能由人工验证后手写，代码不自动置真。
       cloudTakeover: !!(parsed && parsed.cloudTakeover === true),
       cloudVerified: !!(parsed && parsed.cloudVerified === true),
+      // 老库（无 transport 列）出现 deleted_at = -1 行时，默认阻止写入。
+      // 该值只被观察到用于 cloud 行，老库是否用过没有证据；承认风险才继续，
+      // 且即使承认，-1 行仍然不进写入范围（只能写 NULL 行）。
+      allowLegacyAmbiguous: !!(parsed && parsed.allowLegacyAmbiguous === true),
       // 启动恢复检查默认只读；autoRun 必须显式开启。
       startupReconcile: !!(parsed && parsed.startupReconcile === true),
     };
@@ -156,6 +160,7 @@ function createRehomeRunner(options = {}) {
       dedupeMode: cur.dedupeMode,
       cloudTakeover: cur.cloudTakeover,
       cloudVerified: cur.cloudVerified,
+      allowLegacyAmbiguous: cur.allowLegacyAmbiguous,
     });
   }
 
@@ -167,6 +172,7 @@ function createRehomeRunner(options = {}) {
       dedupeMode: DEDUPE_MODES.has(mode) ? mode : cur.dedupeMode,
       cloudTakeover: cur.cloudTakeover,
       cloudVerified: cur.cloudVerified,
+      allowLegacyAmbiguous: cur.allowLegacyAmbiguous,
     });
   }
 
@@ -179,6 +185,8 @@ function createRehomeRunner(options = {}) {
       dedupe: cfg.dedupe,
       dedupeMode: cfg.dedupeMode,
       dedupeDefault: false,
+      cloudTakeover: cfg.cloudTakeover,
+      allowLegacyAmbiguous: cfg.allowLegacyAmbiguous,
       dbPath, dataRoot,
       dbExists: !!dbPath && fs.existsSync(dbPath),
       backend: db ? db.backend : null,
@@ -270,6 +278,15 @@ function createRehomeRunner(options = {}) {
     });
     // 来源不明的 transport 一律不写入：范围 SQL 已经把非 local 排除在外，
     // 这里再把「体检不通过」作为可见状态报出去，而不是悄悄扩大范围。
+    const ambiguousRows = Number((semantics && semantics.counts && semantics.counts.ambiguous) || 0);
+    const ambiguity = {
+      required: scope.requiresAmbiguityCheck === true,
+      rows: ambiguousRows,
+      // 只有老库需要这道闸：有 transport 列时异常行已被范围 SQL 排除。
+      blocking: scope.requiresAmbiguityCheck === true && ambiguousRows > 0,
+      acknowledged: cfg.allowLegacyAmbiguous === true,
+      marker: scope.requiresAmbiguityCheck === true ? 'deleted_at=-1' : null,
+    };
     const scopeReport = {
       mode: scope.description,
       cloud: scope.cloud,
@@ -279,15 +296,34 @@ function createRehomeRunner(options = {}) {
         verified: !!(semantics && semantics.verified),
         issues: (semantics && semantics.issues) || [],
       },
+      ambiguity,
     };
     const rows = await db.all(`SELECT user_id, COUNT(*) AS n FROM sessions WHERE ${scope.where} GROUP BY user_id`, scope.params);
     const byUid = rows.map((r) => ({ uid: String(r.user_id || ''), count: Number(r.n || 0) }));
     const affected = byUid.filter((r) => r.uid !== targetUid).reduce((sum, r) => sum + r.count, 0);
 
+    // 老库有 -1 行且用户没有显式承认 → 不写库。这不是「提醒」，是硬停：
+    // 我们无法证明这些行是活的还是回收站，改归属可能把已删会话搬给新账号。
+    if (ambiguity.blocking && !ambiguity.acknowledged && !dryRun) {
+      log(`[rehome] 中止：老库存在 ${ambiguousRows} 行 deleted_at=-1，语义未确认`);
+      return {
+        ok: false,
+        skipped: 'legacy-deleted-at-ambiguous',
+        blocked: true,
+        retryable: false,                 // 语义未确认属于永久阻断，重试无意义
+        affected: 0, byUid, backup: null,
+        scope: scope.description, scopeReport, ambiguity,
+        hint: '确认旧库 deleted_at=-1 的实际含义后，在配置里写 "allowLegacyAmbiguous": true 再执行；'
+          + '即使承认，这些行也不会被接管（只处理 deleted_at IS NULL）。',
+      };
+    }
+
     if (dryRun) {
       return {
         ok: true, dryRun: true, affected, byUid, backup: null,
-        scope: scope.description, scopeReport, dedupe: { skipped: 'manual-only' },
+        scope: scope.description, scopeReport, ambiguity,
+        blocked: ambiguity.blocking && !ambiguity.acknowledged,
+        dedupe: { skipped: 'manual-only' },
       };
     }
 
@@ -316,7 +352,7 @@ function createRehomeRunner(options = {}) {
       ok: true,
       affected: changed === null ? affected : changed,
       byUid, backup: backupPath, backend: db.backend,
-      scope: scope.description, scopeReport,
+      scope: scope.description, scopeReport, ambiguity,
       dedupe: { skipped: 'manual-only' },
     };
   }

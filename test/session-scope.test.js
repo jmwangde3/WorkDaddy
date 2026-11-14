@@ -54,8 +54,9 @@ async function main() {
   // ---- 纯函数层 ----
   const legacy = buildTakeoverScope(['id', 'deleted_at']);
   assert.equal(legacy.transportAware, false);
-  assert.equal(legacy.description, 'legacy-no-transport');
-  assert.match(legacy.where, /deleted_at IS NULL OR deleted_at = -1/);
+  assert.equal(legacy.description, 'legacy-no-transport(strict)');
+  assert.equal(legacy.where, 'deleted_at IS NULL', '老库只认 NULL，-1 不进写入范围');
+  assert.equal(legacy.requiresAmbiguityCheck, true, '老库必须先做歧义行体检');
 
   const localOnly = buildTakeoverScope(['id', 'transport', 'deleted_at']);
   assert.equal(localOnly.description, 'local-only(strict)');
@@ -68,7 +69,13 @@ async function main() {
 
   const cloudVerified = buildTakeoverScope(['id', 'transport'], { cloudTakeover: true, cloudVerified: true });
   assert.equal(cloudVerified.description, 'local+cloud(verified)');
-  assert.equal(cloudVerified.where, '(deleted_at IS NULL OR deleted_at = -1)');
+  assert.match(cloudVerified.where, /transport = 'cloud' AND deleted_at = -1/, 'cloud 用 -1 判定');
+  assert.match(cloudVerified.where, /deleted_at IS NULL/, 'local 仍用 NULL 判定');
+  assert.doesNotMatch(
+    cloudVerified.where.replace(/transport = 'cloud' AND deleted_at = -1/g, ''),
+    /deleted_at = -1/,
+    'local 分支不得混入 -1'
+  );
 
   // ---- 真实 SQL 行为（临时库）----
   const { root, dbPath } = await seed();
@@ -166,6 +173,62 @@ async function main() {
     assert.equal(map['local-minus-one'], 'uid-a', 'local 上的 -1 语义不确定，不碰');
     assert.equal(map['proxy-alive'], 'uid-a', '来源不明不碰');
     assert.equal(map['cloud-normal'], 'uid-a', 'cloud 未验证不碰');
+  });
+
+  await test('老库 deleted_at=-1 行不被接管（默认阻断写入）', async () => {
+    const dir = tempDir('legacy');
+    const p = path.join(dir, 'workbuddy.db');
+    const ldb = createSessionDb({ dbPath: p });
+    // 老库结构：没有 transport 列（客户端还没有云会话时的库）。
+    await ldb.run(
+      'CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id TEXT, cwd TEXT, title TEXT, ' +
+      'status TEXT, created_at INTEGER, updated_at INTEGER, deleted_at INTEGER, is_background_automation INTEGER)'
+    );
+    const ins = (id, deleted) => ldb.run(
+      'INSERT INTO sessions (id,user_id,cwd,title,status,created_at,updated_at,deleted_at,is_background_automation) ' +
+      'VALUES (?,?,?,?,?,?,?,?,?)',
+      [id, 'uid-a', 'H:/ws', 't', 'completed', 1, 2, deleted, 0]
+    );
+    await ins('legacy-alive', null);
+    await ins('legacy-minus-one', -1);              // 语义未知：可能是存活哨兵，也可能是别的编码
+    await ins('legacy-trashed', 1700000000000);
+
+    const sem = await assessDeletedSemantics(ldb);
+    assert.equal(sem.transportAware, false);
+    assert.equal(sem.verified, false, '老库永远无法判为已验证');
+    assert.equal(sem.blocking, true, '存在 -1 行时必须阻断写入');
+    assert.equal(sem.counts.ambiguous, 1);
+    assert.deepEqual(sem.issues, ['legacy-minus-one-rows:1']);
+
+    const cfgDir = path.join(dir, 'cfg');
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.writeFileSync(path.join(cfgDir, 'rehome-sessions.json'), JSON.stringify({ enabled: true }));
+    const runner = createRehomeRunner({ dataDir: cfgDir, dataRoot: dir, dbPath: p });
+
+    const blocked = await runner.run('uid-target');
+    assert.equal(blocked.ok, false, '默认必须阻断，不能只报警');
+    assert.equal(blocked.skipped, 'legacy-deleted-at-ambiguous');
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.affected, 0);
+    assert.equal(blocked.scope, 'legacy-no-transport(strict)', '范围只认 NULL');
+    const afterBlock = Object.fromEntries(
+      (await ldb.all('SELECT id, user_id FROM sessions')).map((r) => [r.id, r.user_id])
+    );
+    assert.equal(afterBlock['legacy-alive'], 'uid-a', '阻断时一行都不许改');
+    assert.equal(afterBlock['legacy-minus-one'], 'uid-a');
+
+    // 承认风险后仍然不碰 -1 行：范围永远是 `deleted_at IS NULL`。
+    fs.writeFileSync(path.join(cfgDir, 'rehome-sessions.json'),
+      JSON.stringify({ enabled: true, allowLegacyAmbiguous: true }));
+    const acked = await runner.run('uid-target');
+    assert.equal(acked.ok, true, JSON.stringify(acked));
+    assert.equal(acked.scopeReport.ambiguity.acknowledged, true);
+    const afterAck = Object.fromEntries(
+      (await ldb.all('SELECT id, user_id FROM sessions')).map((r) => [r.id, r.user_id])
+    );
+    assert.equal(afterAck['legacy-alive'], 'uid-target', '承认后才接管 NULL 行');
+    assert.equal(afterAck['legacy-minus-one'], 'uid-a', '承认风险不等于接管 -1 行');
+    assert.equal(afterAck['legacy-trashed'], 'uid-a', '回收站不动');
   });
 
   console.log('PASS session-scope.test.js — local/cloud 边界 + 语义体检');
