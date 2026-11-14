@@ -2,6 +2,92 @@
 
 **语言：** [简体中文](README.md) · [English](README_en.md) · [日本語](README_ja.md)
 
+---
+
+> ## ⚠️ 这是个人改版（fork），不是上游发行版
+>
+> - 本仓库是 [babygoton/WorkDaddy](https://github.com/babygoton/WorkDaddy) 的**个人 fork**，当前版本 `1.3.0`（已并入上游 `1.2.22`），按 **AGPL-3.0** 分发，保留上游全部版权与许可声明。
+> - **与 WorkBuddy 官方没有任何关系**：WorkDaddy 不是腾讯 / WorkBuddy 的产品，也未获其背书；它不修改官方客户端的安装包、签名或数据，只通过本机回环 CDP 与已安装的客户端交互。
+> - 与上游的差别：上游是「补丁式部署」（把脚本覆盖进 WorkBuddy 安装目录），本 fork 改成**独立程序 + 独立数据目录**，自己安装、更新、回滚、卸载，并保留旧补丁版的配置迁移路径。差异逐文件记录在 [`docs/migration/`](docs/migration/)，同步流程见 [`docs/upstream-tracking.md`](docs/upstream-tracking.md)。
+> - 下面的「它能做什么」等章节继承自上游文档，功能在本 fork 中同样可用。
+
+## 安装
+
+### 方式一：装到本机（推荐，可更新可卸载）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\install-workdaddy.ps1
+```
+
+- 程序：`%LOCALAPPDATA%\Programs\WorkDaddy`；数据：`%APPDATA%\WorkDaddy`（两者必须分开）
+- 预检：Windows 10+、是否装了 WorkBuddy 客户端、Node ≥ 22.13、磁盘余量、目标目录可写
+- 装后逐文件校验 SHA-256，写 `install-state.json` 作为卸载依据
+- 检测到旧补丁版时**只复制**配置到 `%APPDATA%\WorkDaddy\legacy-import\<时间戳>\`，原目录不动
+- 常用参数：`-AppDir` `-DataDir` `-NoShortcut` `-SkipClientCheck` `-DryRun` `-Force`
+- 退出码：`0` 成功 / `1` 源目录问题 / `2` 预检或路径越界 / `3` 不可写 / `4` 复制失败 / `5` 校验失败 / `6` 数据初始化失败
+
+### 方式二：便携版（解压即用，不写注册表）
+
+解开 `WorkDaddy-<版本>-portable-win-x64.zip`，双击 `scripts\launcher.cmd`。
+
+## 更新
+
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\update-workdaddy.ps1 -SourceDir <新版本解压目录>
+```
+
+顺序是固定的：版本闸门（拒绝降级，需 `-Force`）→ 暂存到临时目录并逐文件验哈希 → 停掉**本安装目录**的 `daemon.js`/`watchdog.js`（按命令行路径精确匹配，不碰其它进程）→ 整目录备份 → 替换 → 装后校验 → `node --check` 四项健康检查 → 写状态 → 清理暂存。
+
+- 任何一步失败都自动回滚，报告里 `rolledBack` 写明结果；回滚不成功会直接给出备份路径，不会假装成功
+- 可恢复版本留在 `%APPDATA%\WorkDaddy\backups\app-<旧版本>-preupdate-<时间戳>`
+- 加 `-Restart` 才会在更新后用 `scripts\launcher.cmd` 重新拉起（与双击快捷方式同一条路径）
+
+## 卸载
+
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\uninstall-workdaddy.ps1
+```
+
+- 只删 `install-state.json` 里登记过的文件，逐条比对哈希；**用户改过的文件默认跳过**（退出码 `3`），`-Force` 才删
+- 桌面快捷方式只删安装时记录的那一条，不按名字猜
+- 默认**保留**全部用户数据；要清理必须双开关：`-PurgeData -YesPurgeData`
+
+## 数据在哪、怎么备份
+
+| 用途 | 路径 |
+| --- | --- |
+| 程序 | `%LOCALAPPDATA%\Programs\WorkDaddy` |
+| 配置与账号缓存 | `%APPDATA%\WorkDaddy`（`config.json`、`accounts\`、`credit-usage.db` 等） |
+| 版本备份 | `%APPDATA%\WorkDaddy\backups\` |
+| 旧补丁配置导入 | `%APPDATA%\WorkDaddy\legacy-import\<时间戳>\` |
+| 日志 | `%APPDATA%\WorkDaddy\logs\`、`daemon.log` |
+
+备份：整体复制 `%APPDATA%\WorkDaddy` 即可（数据库是单文件，直接复制是安全的；运行中复制建议先停服务）。
+恢复：先 `scripts\stop-workdaddy.ps1` 停服务 → 把备份目录内容覆盖回 `%APPDATA%\WorkDaddy` → 重新启动。
+版本回退：把 `backups\app-<版本>-preupdate-<时间戳>` 的内容覆盖回程序目录即可，它就是更新前的完整副本。
+
+## 支持范围
+
+| 项目 | 支持 |
+| --- | --- |
+| 系统 | Windows 10 / 11 x64（安装器与托盘） |
+| Node | ≥ 22.13（CI 固定 22.14；`node:sqlite` 不需要实验开关） |
+| PowerShell | Windows PowerShell 5.1 与 PowerShell 7 都跑过语法/编码检查 |
+| 客户端 | WorkBuddy / WorkBuddy AI / CodeBuddy CN / CodeBuddy 桌面端（Electron 窗口） |
+
+## 已知限制
+
+- 仓库里有 49 条**历史测试失败**（`test/known-failures.json` 逐条登记了文件、用例名与错误指纹），不是本次迁移引入的；CI 只对「新增失败」报警。
+- `installer/setup/workdaddy.iss`（Inno Setup 引导器）尚未在真机编译验证 —— 开发环境没有 ISCC。便携包与源码包已实测可用。
+- 独立安装器目前只有 Windows 版；macOS / Linux 仍按上游方式使用。
+- 卸载不会碰 WorkBuddy 客户端自己的数据目录，也不会替你删旧补丁版留下的文件。
+
+## 许可证
+
+[AGPL-3.0](LICENSE)，与上游一致。上游版权归其作者所有；本 fork 的修改同样以 AGPL-3.0 发布。二次分发请保留 `LICENSE` 与来源说明（见 [`docs/upstream-tracking.md`](docs/upstream-tracking.md)）。
+
+---
+
 > **WorkDaddy 是 WorkBuddy 和 CodeBuddy 桌面端增强助手：多账号独立备份、点切即用，跨账号会话迁移、模型管理与自动化任务。WorkBuddy 还支持免打扰、异常中断自动续接、暂存/快捷提示词和五种主题。账号与配置全部留在本机。**
 > 本机回环 CDP 注入 · 不改官方安装包。
 
