@@ -1,26 +1,27 @@
 {
   "schema": 4,
   "note": "CI 基线：按「文件 + 用例名 + 规范化错误签名」三重匹配。这些失败在本轮改造前就存在（环境/平台相关），不阻塞 CI；新增失败、以及同名但错误内容变化的失败都会报错。更新必须人工确认，不得用来消除新增失败。",
-  "generatedAt": "2026-11-14T10:40:18.039Z",
+  "generatedAt": "2026-11-14T12:17:18.822Z",
   "node": "v22.14.0",
   "platform": "win32",
   "counts": {
-    "tests": 1612,
-    "pass": 1548,
-    "fail": 57,
+    "tests": 1699,
+    "pass": 1643,
+    "fail": 49,
     "skipped": 7,
-    "scenarios": 33,
-    "files": 185
+    "scenarios": 71,
+    "files": 193
   },
   "fileTests": {
     "account-credit-cache.test.js": 2,
     "account-identity.test.js": 6,
     "account-import-clipboard.test.js": 7,
-    "account-list-stability.test.js": 16,
+    "account-list-stability.test.js": 21,
     "account-order.test.js": 4,
     "account-snapshot-reload.test.js": 14,
     "account-sort.test.js": 1,
     "account-switch-session-rules.test.js": 12,
+    "account-travel-badge.test.js": 2,
     "activity-refresh.test.js": 7,
     "agent-create-dialog.test.js": 2,
     "agent-new-task-draft.test.js": 13,
@@ -57,40 +58,45 @@
     "cdp-click-api.test.js": 2,
     "cdp-custom-target.test.js": 4,
     "cdp-focus-diagnostics.test.js": 2,
-    "cdp-targets.test.js": 15,
+    "cdp-targets.test.js": 16,
     "checkin-result.test.js": 3,
     "checkin-schedule.test.js": 2,
     "client-debug-relaunch.test.js": 10,
     "client-launch-settings.test.js": 5,
+    "client-temp.test.js": 12,
     "codebuddy-badge-contrast.test.js": 2,
     "codebuddy-compat.test.js": 17,
     "codebuddy-files.test.js": 13,
-    "codebuddy-ide-credits.test.js": 7,
+    "codebuddy-ide-credits.test.js": 8,
     "codebuddy-ide-recovery.test.js": 7,
     "codebuddy-native-recovery.test.js": 5,
     "codebuddy-native.test.js": 7,
     "codebuddy-session-store.test.js": 4,
     "completion-report.test.js": 6,
     "composer-button-visibility.test.js": 12,
+    "conversation-area.test.js": 10,
     "conversation-usage.test.js": 7,
-    "credit-history-sync.test.js": 14,
+    "credit-history-sync.test.js": 15,
     "credit-request-usage.test.js": 6,
     "credit-rotation.test.js": 7,
     "credit-segments.test.js": 14,
-    "credit-summary.test.js": 3,
+    "credit-summary.test.js": 5,
     "credit-usage-store.test.js": 7,
     "credits-401.test.js": 2,
     "daemon-status-nonblocking.test.js": 11,
     "deploy-safety.test.js": 1,
     "element-inspector.test.js": 13,
     "enterprise-target.test.js": 15,
-    "fab-quiet-mode.test.js": 5,
+    "fab-quiet-mode.test.js": 6,
+    "fork-routes.test.js": 9,
+    "fork-sync-contract.test.js": 1,
     "growth-active.test.js": 10,
     "growth-credit-refresh.test.js": 4,
     "growth-daily.test.js": 17,
     "growth-rings-ui.test.js": 23,
     "i18n-coverage.test.js": 11,
     "i18n.test.js": 4,
+    "installer-lifecycle.test.js": 1,
     "linux-daemon-process.test.js": 2,
     "linux-paths.test.js": 9,
     "linux-release-script.test.js": 6,
@@ -101,7 +107,7 @@
     "macos-launcher-nounset.test.js": 1,
     "macos-runtime-dependencies.test.js": 1,
     "message-navigation-removal.test.js": 3,
-    "message-navigation.test.js": 16,
+    "message-navigation.test.js": 17,
     "model-rate-limit.test.js": 12,
     "no-disturb-match.test.js": 1,
     "no-disturb.test.js": 1,
@@ -142,8 +148,8 @@
     "session-copy-rate.test.js": 6,
     "session-cwd-repair.test.js": 10,
     "session-db.test.js": 6,
-    "session-delete-confinement.test.js": 18,
-    "session-delete-ui.test.js": 4,
+    "session-delete-confinement.test.js": 19,
+    "session-delete-ui.test.js": 5,
     "session-deletion-sync.test.js": 5,
     "session-export-jobs.test.js": 4,
     "session-export-ui.test.js": 5,
@@ -153,14 +159,15 @@
     "session-fork.test.js": 15,
     "session-health.test.js": 12,
     "session-monitor.test.js": 24,
-    "session-pin-sync.test.js": 1,
+    "session-pin-sync-queue.test.js": 1,
+    "session-pin-sync.test.js": 10,
     "session-refresh-ui.test.js": 7,
     "session-scope.test.js": 1,
     "session-send.test.js": 1,
     "session-size-filter.test.js": 6,
     "session-size-summary.test.js": 3,
     "session-sizes.test.js": 3,
-    "session-sync-daemon.test.js": 50,
+    "session-sync-daemon.test.js": 63,
     "session-sync.test.js": 35,
     "session-transfer.test.js": 9,
     "session-usage-copy.test.js": 3,
@@ -172,6 +179,7 @@
     "theme-patches.test.js": 12,
     "theme-restore-stability.test.js": 41,
     "theme-text-shadow.test.js": 2,
+    "theme-video.test.js": 10,
     "third-party-model-ui.test.js": 3,
     "third-party-models.test.js": 15,
     "toast-runtime.test.js": 6,
@@ -193,9 +201,9 @@
     "windows-launcher-boundary-repair.test.js": 26,
     "windows-native-flow.test.js": 32,
     "windows-powershell-boundary.test.js": 4,
-    "windows-privilege-boundary.test.js": 18,
+    "windows-privilege-boundary.test.js": 19,
     "windows-release-script.test.js": 6,
-    "windows-startup-recovery.test.js": 9,
+    "windows-startup-recovery.test.js": 13,
     "workbuddy-compat.test.js": 16,
     "workbuddy-launch-env.test.js": 11
   },
@@ -316,16 +324,6 @@
       "signature": "getRehomeRunner is not defined"
     },
     {
-      "file": "cdp-targets.test.js",
-      "name": "isTargetForProfile 企业配置只接受自身域名或路径提示",
-      "signature": "Expected values to be strictly equal:\n\nfalse !== true"
-    },
-    {
-      "file": "cdp-targets.test.js",
-      "name": "isTargetForProfile Linux 双实例：CN 与 AI 互不认领（两端可执行文件同名 workbuddy）",
-      "signature": "Expected values to be strictly equal:\n\nfalse !== true"
-    },
-    {
       "file": "enterprise-target.test.js",
       "name": "macOS enterprise auth discovery matches the app suffix when multiple files exist",
       "signature": "authFile 路径必须是 absolute path"
@@ -356,11 +354,6 @@
       "signature": "daemon 未覆盖文案:\n1. (无变化)\n2. (无文件)\n+ actual - expected\n\n+ [\n+ '(无变化)',\n+ '(无文件)'\n+ ]\n- []"
     },
     {
-      "file": "i18n.test.js",
-      "name": "README language switch links are reciprocal",
-      "signature": "The input did not match the regular expression /\\[English\\]\\(README_en\\.md\\)/. Input:\n\n'<h1><img src=\"docs<PATH>\" alt=\"\" width=\"40\" height=\"40\" align=\"absmiddle\"> WorkDaddy 多账号会话接管版</h1>\\n' +\n'\\n' +\n'**一句话**：让多个 WorkBuddy 账号看到同一批会话 —— 切换账号时，会话原地改归属，**不复制、不改 ID、不产生副本**。附带一个 Windows 托盘控制器，负责启动<PATH>' +\n'\\n' +\n'> 这是 [babygoton/workdaddy](https:/<PATH>) 的个人改造版。\\n' +\n'> 上游负责「账号切换 + 界面面板」，我在这之上加了两块：**会话"
-    },
-    {
       "file": "linux-release-script.test.js",
       "name": "cross-packager writes tar headers supported by older dpkg with fractional file timestamps",
       "signature": "Traceback (most recent call last):\nFile \"<stdin>\", line 98, in <module>\nAssertionError\n\n1 !== 0"
@@ -379,11 +372,6 @@
       "file": "runtime-dependencies.test.js",
       "name": "macOS release stages every daemon startup dependency",
       "signature": "macOS package omits startup dependency daemon.js -> rehome-sessions.js\n\nfalse !== true"
-    },
-    {
-      "file": "sentry.test.js",
-      "name": "privacy documentation distinguishes local data from required remote services",
-      "signature": "The input did not match the regular expression <PATH> Input:\n\n'<h1><img src=\"docs<PATH>\" alt=\"\" width=\"40\" height=\"40\" align=\"absmiddle\"> WorkDaddy 多账号会话接管版</h1>\\n' +\n'\\n' +\n'**一句话**：让多个 WorkBuddy 账号看到同一批会话 —— 切换账号时，会话原地改归属，**不复制、不改 ID、不产生副本**。附带一个 Windows 托盘控制器，负责启动<PATH>' +\n'\\n' +\n'> 这是 [babygoton/workdaddy](https:/<PATH>) 的个人改造版。\\n' +\n'> 上游负责「账号切换 + 界面面板」，我在这之上加了两块：**会话归属接管** 和 **系统托盘**，其余功能全部是"
     },
     {
       "file": "session-filter.test.js",
@@ -449,26 +437,6 @@
       "file": "session-sync.test.js",
       "name": "backup pruning removes completed and stale crash journals but keeps recovery-needed data",
       "signature": "Expected values to be strictly equal:\n\n2 !== 4"
-    },
-    {
-      "file": "token-refresh-persistence.test.js",
-      "name": "codebuddy-cn encrypted refresh survives cache loss and reaches native switch storage",
-      "signature": "module is not defined"
-    },
-    {
-      "file": "token-refresh-persistence.test.js",
-      "name": "codebuddy-cn plaintext refresh survives cache loss and reaches native switch storage",
-      "signature": "module is not defined"
-    },
-    {
-      "file": "token-refresh-persistence.test.js",
-      "name": "codebuddy-intl encrypted refresh survives cache loss and reaches native switch storage",
-      "signature": "module is not defined"
-    },
-    {
-      "file": "token-refresh-persistence.test.js",
-      "name": "codebuddy-intl plaintext refresh survives cache loss and reaches native switch storage",
-      "signature": "module is not defined"
     },
     {
       "file": "update-layout.test.js",
