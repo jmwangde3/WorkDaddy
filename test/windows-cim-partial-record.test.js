@@ -104,6 +104,39 @@ test('解析器：部分可读时返回可读的那些', () => {
   assert.equal(rows[0].ProcessId, 12852);
 });
 
+test('解析器：全部读不到时，错误消息要指出权限问题而不是让人重试', () => {
+  // 跨完整性级别（客户端以管理员运行、WorkDaddy 以普通权限运行）的表现：
+  // 进程都在，但路径和命令行全读不到。重试多少次都一样，必须说清楚怎么办。
+  const stderr = [
+    'WBD-PROCESS-SKIPPED 12852 NO-ACCESS CIM 进程身份字段不完整',
+    'WBD-PROCESS-SKIPPED 35616 NO-ACCESS CIM 进程身份字段不完整',
+  ].join('\r\n');
+  assert.throws(
+    () => boundary.parseCimProcessResult({ status: 0, stdout: '', stderr }),
+    (err) => {
+      assert.match(err.message, /管理员权限/, '应指出客户端可能是管理员权限运行');
+      assert.match(err.message, /完全退出客户端/, '应给出可执行的处置办法');
+      assert.equal(/稍后重试/.test(err.message), false, '权限问题不该让人反复重试');
+      return true;
+    }
+  );
+});
+
+test('解析器：混合原因时不误报成权限问题', () => {
+  const stderr = [
+    'WBD-PROCESS-SKIPPED 12852 NO-ACCESS CIM 进程身份字段不完整',
+    'WBD-PROCESS-SKIPPED 35616 CIM 进程身份字段不完整',
+  ].join('\r\n');
+  assert.throws(
+    () => boundary.parseCimProcessResult({ status: 0, stdout: '', stderr }),
+    (err) => {
+      assert.equal(/管理员权限/.test(err.message), false, '只要有一条不是 NO-ACCESS，就不能断言是权限问题');
+      assert.match(err.message, /一个都无法确认身份/);
+      return true;
+    }
+  );
+});
+
 test('解析器：真的没有进程时返回空数组', () => {
   assert.deepEqual(boundary.parseCimProcessResult({ status: 0, stdout: '', stderr: '' }), []);
 });

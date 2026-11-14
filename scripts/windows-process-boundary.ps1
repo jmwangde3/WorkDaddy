@@ -157,6 +157,14 @@ function ConvertTo-WorkDaddyProcessRecordIfPresent {
     $skippedPid = '?'
     try { if ($null -ne $Process) { $skippedPid = [string]$Process.ProcessId } } catch { }
     $skippedReason = ([string]$_.Exception.Message) -replace '\r', ' ' -replace '\n', ' '
+    # 跨完整性级别时 Windows 的表现就是「进程在，但路径和命令行都读不到」。
+    # 单独标出来：这不是客户端刚重启的竞态，重试多少次都一样，得让用户改权限。
+    $noAccess = $false
+    try {
+      $noAccess = [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath) -and
+                  [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)
+    } catch { }
+    if ($noAccess) { $skippedReason = 'NO-ACCESS ' + $skippedReason }
     [Console]::Error.WriteLine('WBD-PROCESS-SKIPPED ' + $skippedPid + ' ' + $skippedReason)
     return $null
   }

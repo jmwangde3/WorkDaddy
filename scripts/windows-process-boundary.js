@@ -127,13 +127,28 @@ function parseCimProcessResult(result, options = {}) {
     throw new Error(`CIM process query exited with status ${result.status}${detail ? ': ' + detail : ''}`);
   }
   const skipped = parseSkippedProcesses(result.stderr);
+  // 一条都认不出来时，把第一条失败原因带出去：没有它只能看到一堆 PID，
+  // 现场排查等于从零开始（这次就卡在「字段不完整」到底缺哪个字段上）。
+  const describeSkipped = () => {
+    const ids = skipped.map((item) => item.pid || '?').join(',');
+    // 全部 NO-ACCESS = 对端进程的完整性级别高于本进程。重试没有意义，
+    // 直接说清楚怎么办，别再让用户对着「字段不完整」猜。
+    const allNoAccess = skipped.length > 0 && skipped.every((item) => /^NO-ACCESS\b/.test(String(item.reason || '')));
+    if (allNoAccess) {
+      return `检测到 ${skipped.length} 个客户端进程，但一个都读不到（PID=${ids}）。` +
+        '客户端多半是以管理员权限运行的，而 WorkDaddy 以普通权限运行 —— ' +
+        '这种情况下 Windows 不允许读取对方进程信息，也不允许结束它。' +
+        '请先完全退出客户端（主窗口和托盘一起），再双击 WorkDaddy 桌面图标，' +
+        '由 WorkDaddy 以普通权限重新启动它。';
+    }
+    const first = skipped.find((item) => item.reason) || {};
+    const detail = first.reason ? `；首个原因：${String(first.reason).slice(0, 180)}` : '';
+    return `检测到 ${skipped.length} 个进程，但一个都无法确认身份（PID=${ids}）${detail}；` +
+      '通常是客户端刚重启或权限不同，稍后重试即可';
+  };
   const output = String(result.stdout || '').trim();
   if (!output) {
-    if (skipped.length) {
-      const ids = skipped.map((item) => item.pid || '?').join(',');
-      throw new Error(`检测到 ${skipped.length} 个进程，但一个都无法确认身份（PID=${ids}）；` +
-        '通常是客户端刚重启或权限不同，稍后重试即可');
-    }
+    if (skipped.length) throw new Error(describeSkipped());
     return [];
   }
   let parsed;
@@ -145,11 +160,7 @@ function parseCimProcessResult(result, options = {}) {
   const rows = (Array.isArray(parsed) ? parsed : [parsed])
     .map((row) => validateProcessRecord(row, options))
     .filter(Boolean);
-  if (!rows.length && skipped.length) {
-    const ids = skipped.map((item) => item.pid || '?').join(',');
-    throw new Error(`检测到 ${skipped.length} 个进程，但一个都无法确认身份（PID=${ids}）；` +
-      '通常是客户端刚重启或权限不同，稍后重试即可');
-  }
+  if (!rows.length && skipped.length) throw new Error(describeSkipped());
   return rows;
 }
 
