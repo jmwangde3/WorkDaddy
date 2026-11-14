@@ -186,6 +186,10 @@ daemon 的 `POST /api/rehome/dedupe/background` 同步改为默认 `dryRun`。�
 退出码 0
 ```
 
+同一个 commit 在 CI（run `43588287807`）上是 **1612 用例 / 1554 通过 / 51 失败 /
+7 跳过 / 新增失败 0**。差的 2 条是 `automation-packages` 与 `workbuddy-compat`
+在 CI 通过、本机失败 —— 环境相关的历史噪声，两边「新增失败」都是 0。
+
 | 套件 | 结果 |
 |---|---|
 | `rehome-dedupe.test.js` | PASS — 24 类场景（含同 ID 乱序 / 无 ID 乱序 / 混合乱序） |
@@ -440,6 +444,19 @@ daemon 的 `POST /api/rehome/dedupe/background` 同步改为默认 `dryRun`。�
 
 这条测试本身就是「元数据必须与真实字节一致」的守卫 —— 它抓到的第一个问题
 是它自己的输入，属于正常工作。
+
+### 9.9 第二轮 CI 结果（run 43588287807，2026-11-14）
+
+| Job | 结果 | 耗时 |
+| --- | --- | --- |
+| Node 22.14.0 on Windows | 通过（1612 用例 / 1554 通过 / 51 失败 / 7 跳过 / 新增失败 0） | 3m8s |
+| PowerShell 5.1 语法 / 编码 | 通过 | 12s |
+| PowerShell 7 语法 / 编码 | 通过 | 11s |
+| node:sqlite 最低版本检查 | 通过 | 24s |
+
+`actions/checkout@v5` 与 `actions/setup-node@v5` 生效，Node 20 runtime 弃用警告
+只剩 `upload-artifact@v4` 一条（仅失败时触发，暂不升级）。
+
 
 
 
