@@ -202,48 +202,22 @@ if (-not $DryRun) {
 }
 
 # ---- 2.5 停服务 ----
-# 只停「命令行里跑的是本安装目录 scripts\daemon.js / watchdog.js」的 node 进程。
-# 按路径精确匹配，所以绝不会波及 WorkBuddy 客户端、其它 WorkDaddy 安装、或 CI 里的无关 node。
-# 顺序要点：watchdog 会在 daemon 退出 3 秒后把它拉回来，两个都得停，且在替换之前停。
-function Get-ServiceProcesses {
-    param([string]$Dir)
-    $d = [IO.Path]::GetFullPath($Dir).TrimEnd('\')
-    $patDaemon = [regex]::Escape($d + '\scripts\daemon.js')
-    $patWatch = [regex]::Escape($d + '\scripts\watchdog.js')
-    $ids = @()
-    $procs = @()
-    try { $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue) } catch { $procs = @() }
-    foreach ($p in $procs) {
-        $cmd = [string]$p.CommandLine
-        if (-not $cmd) { continue }
-        if ($cmd -match $patDaemon -or $cmd -match $patWatch) { $ids += [int]$p.ProcessId }
-    }
-    return $ids
-}
-
+# 停托盘 + watchdog + daemon，三者都必须在替换之前停。
+# 顺序要点：watchdog 会在 daemon 退出 3 秒后把它拉回来，所以不能只停 daemon。
+# 托盘是最容易被忽略的一个 —— 它的 EXE 就在 AppDir\tray 下，被占用时替换会失败，
+# 而且回滚也会因为同样原因失败，最后停在「程序缺文件、安装记录还是旧的」。
+# 以前这里遇到 CommandLine 读不到就 continue，等于把「读不到」当成「不是我的进程」；
+# 现在统一走 Stop-WorkDaddyProcesses，读不到身份就失败关闭。
 if (-not $DryRun) {
-    $running = @(Get-ServiceProcesses $AppDir)
-    $report.service.detected = $running
-    if ($running.Count -gt 0) {
-        Write-Line ('检测到运行中的 WorkDaddy 进程：' + ($running -join ','))
-        foreach ($procId in $running) {
-            try {
-                Stop-Process -Id $procId -Force -ErrorAction Stop
-                $report.service.stopped += $procId
-            } catch {
-                $report.warnings += ('结束进程 ' + $procId + ' 失败：' + $_.Exception.Message)
-            }
-        }
-        # 等它真的退出：Windows 上 Stop-Process 返回后文件句柄可能还没放
-        for ($i = 0; $i -lt 20; $i++) {
-            if (@(Get-ServiceProcesses $AppDir).Count -eq 0) { break }
-            Start-Sleep -Milliseconds 250
-        }
-        $left = @(Get-ServiceProcesses $AppDir)
-        if ($left.Count -gt 0) {
-            Fail-Update ('守护进程停不下来（pid ' + ($left -join ',') + '）；为避免替换到运行中的程序，已中止，未改动任何文件') 6
-        }
-        Write-Line ('已停止：' + ($report.service.stopped -join ','))
+    $stopResult = Stop-WorkDaddyProcesses -AppDir $AppDir
+    $report.service.stopped = @($stopResult.stopped)
+    if (-not $stopResult.ok) {
+        Fail-Update ('无法停止运行中的 WorkDaddy 进程：' + $stopResult.error +
+            '；为避免替换到运行中的程序，已中止，未改动任何文件') 6
+    }
+    if (@($stopResult.stopped).Count -gt 0) {
+        $report.service.detected = @($stopResult.stopped)
+        Write-Line ('已停止：' + (@($stopResult.stopped) -join ','))
     }
 }
 

@@ -153,7 +153,9 @@ foreach ($p in @($portable, $sourceZip)) {
 }
 $sums = Join-Path $OutputDirectory 'SHA256SUMS.txt'
 $enc = New-Object System.Text.UTF8Encoding($false)
-[IO.File]::WriteAllText($sums, (($lines -join "`r`n") + "`r`n"), $enc)
+# LF 行尾：sha256sum -c 在 Linux/macOS 上读 CRLF 会把 \r 当成文件名的一部分而全部失败。
+# 这份清单是给人跨平台校验用的，所以按 sha256sum 的原生格式走。
+[IO.File]::WriteAllText($sums, (($lines -join "`n") + "`n"), $enc)
 $report.artifacts += [pscustomobject]@{ path = 'SHA256SUMS.txt'; sha256 = (Get-Sha256 $sums); size = (Get-Item -LiteralPath $sums).Length }
 
 # ---- 可选：编译 Setup ----
@@ -187,7 +189,7 @@ if ($Setup) {
         if (-not (Test-Path -LiteralPath $setupExe)) { $report.setup = 'failed'; Fail-Package 'ISCC 成功但没找到 setup.exe' 3 }
         $h = Get-Sha256 $setupExe
         $report.artifacts += [pscustomobject]@{ path = (Split-Path -Leaf $setupExe); sha256 = $h; size = (Get-Item -LiteralPath $setupExe).Length }
-        [IO.File]::AppendAllText($sums, ($h + '  ' + (Split-Path -Leaf $setupExe) + "`r`n"), $enc)
+        [IO.File]::AppendAllText($sums, ($h + '  ' + (Split-Path -Leaf $setupExe) + "`n"), $enc)
         $report.setup = 'built'
     }
 }

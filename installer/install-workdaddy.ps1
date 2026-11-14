@@ -436,6 +436,23 @@ function Invoke-InstallRollback {
 
 # ---- 4. 复制 ----
 Write-Stage 'copy'
+
+# 复制前先停掉本安装自己的进程（托盘 / watchdog / daemon）。
+# 托盘 EXE 被占用时复制会中途失败，而回滚同样被占用 —— 实测会停在
+# 「程序缺文件、安装记录还是旧的」这种半安装状态，比直接失败更难收拾。
+# 停不下来就中止：此时还没动过任何程序文件，退出是干净的。
+if (-not $DryRun) {
+    Write-Stage 'stop-processes'
+    $stopResult = Stop-WorkDaddyProcesses -AppDir $AppDir
+    $report['service'] = [ordered]@{ stopped = @($stopResult.stopped); error = [string]$stopResult.error }
+    if (-not $stopResult.ok) {
+        Fail-Install ('无法停止正在运行的 WorkDaddy 进程：' + $stopResult.error + '；未改动任何程序文件') 8
+    }
+    if (@($stopResult.stopped).Count -gt 0) {
+        Write-Line ('已停止运行中的进程：' + (@($stopResult.stopped) -join ','))
+    }
+}
+
 # 从这里开始磁盘会被改动：之后任何未捕获的错误都要回滚
 $script:mutated = $true
 if ($DryRun) {
