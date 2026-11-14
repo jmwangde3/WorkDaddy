@@ -116,6 +116,10 @@ jobs:
         shell: bash
         run: node test/installer-transaction.test.js
 
+      - name: 卸载器路径边界（盘根 / 穿越 / 重叠 / 重解析点）
+        shell: bash
+        run: node test/installer-boundary.test.js
+
       - name: 安装记录与磁盘一致性（失败时留证据）
         if: failure()
         uses: actions/upload-artifact@v4
