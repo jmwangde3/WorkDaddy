@@ -4,20 +4,31 @@
 # 本脚本是「把 WorkDaddy 装到自己的目录，通过 CDP 与官方客户端交互」。
 # 两者互不替代：旧补丁版用户先用本脚本迁移配置，再决定是否卸载旧补丁。
 #
-# 流程：预检 → 识别旧补丁版并导入配置 → 备份旧版本 → 复制 → 校验 → 初始化数据目录 → 快捷方式 → 报告
+# 流程：预检 → 识别旧补丁版并导入配置 → 备份旧版本 → 复制 → 校验 → 数据目录 → 快捷方式 → 状态提交 → 报告
 #
-# 退出码：0 成功 / 1 源目录无效 / 2 预检未通过 / 3 目标目录不可写 / 4 复制失败 / 5 校验失败 / 6 数据目录初始化失败
+# 事务边界（失败时磁盘上是什么状态）：
+#   * 已有安装：替换前整目录备份 + 旧状态备份；任一步失败都回滚到备份，
+#     报告里分开写「程序是否恢复」「状态是否恢复」。
+#   * 全新安装：只删本次清单内的文件，再删空目录；用户自己的文件和整个数据目录不动。
+#   * 快捷方式：只删本次创建的那一条（路径先记进内存，提交失败就删掉）。
+#
+# 退出码：0 成功 / 1 源目录无效 / 2 预检未通过 / 3 目标目录不可写 / 4 复制失败（已回滚）
+#         / 5 校验失败（已回滚）/ 6 数据目录初始化失败 / 7 状态提交失败（已回滚）
 param(
     [string]$SourceDir = '',
     [string]$AppDir = '',
     [string]$DataDir = '',
     [string]$ClientProfile = 'workbuddy-cn',
     [string]$LegacyScriptsDir = '',
+    # 仅测试用：把桌面目录指到临时目录，避免测试碰真实桌面
+    [string]$DesktopDir = '',
     [switch]$DryRun,
     [switch]$NoShortcut,
     [switch]$SkipClientCheck,
     [switch]$Force,
-    [string]$Json = ''
+    [string]$Json = '',
+    # 仅供故障注入测试：copy-mid / verify / state-write
+    [string]$InjectFault = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,6 +49,17 @@ $report = [ordered]@{
     preflight      = [ordered]@{}
     migration      = $null
     backup         = $null
+    # 安装事务：成功的判据是「清单文件全在 + 校验全过 + 状态提交成功」，
+    # 失败时这里能看出回滚到了哪一步。
+    rollback       = [ordered]@{
+        attempted       = $false
+        programRestored = $false
+        stateRestored   = $false
+        cleaned         = $false
+        shortcutRemoved = $false
+        note            = ''
+    }
+    state          = [ordered]@{ previousSaved = ''; tmpPath = ''; validated = $false; committed = $false }
     fileCount      = 0
     warnings       = @()
     error          = ''
@@ -140,6 +162,9 @@ if (-not $report.preflight.diskOk) {
     Fail-Install ('磁盘空间不足：需要约 ' + $needMb + ' MB，可用 ' + $freeMb + ' MB') 2
 }
 
+# 记录「安装前 AppDir 是否存在」：新安装失败时只有本次新建的空目录才删，
+# 用户原本就有的目录即使被清空也留着（里面可能有他自己的东西）。
+$appDirExistedBefore = Test-Path -LiteralPath $AppDir
 $writable = $true
 if (-not $DryRun) {
     try {
@@ -215,33 +240,157 @@ if ($legacyHit) {
 }
 $report.migration = $migration
 
-# ---- 3. 已有安装：备份后覆盖 ----
+# ---- 3. 已有安装：先备份（程序 + 状态）----
+# 任何已有安装都备份，不再只备份「版本不同」的情况：同版本重装一样可能在
+# 复制中途失败，没有备份就只剩一堆半新半旧的文件，那是最难收拾的状态。
 $statePath = Join-Path $DataDir 'install-state.json'
 $oldState = Read-JsonFile $statePath
-if ($oldState -and (Test-Path -LiteralPath (Join-Path $AppDir 'scripts\daemon.js'))) {
+$existingInstall = Test-Path -LiteralPath (Join-Path $AppDir 'scripts\daemon.js')
+$stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+$backupDir = ''
+$stateBackupPath = ''
+if ($existingInstall) {
     $oldVersion = [string]$oldState.version
-    if ($oldVersion -and $oldVersion -ne $version) {
-        $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
-        $backupDir = Join-Path $DataDir ('backups\app-' + $oldVersion + '-' + $stamp)
-        if (-not $DryRun) {
-            try {
-                New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
-                Copy-Item -Path (Join-Path $AppDir '*') -Destination $backupDir -Recurse -Force -ErrorAction Stop
-                $report.backup = $backupDir
-                Write-Line ('已备份旧版本 ' + $oldVersion + ' → ' + $backupDir)
-                # 只保留最近 2 个备份
-                $all = @(Get-ChildItem -LiteralPath (Join-Path $DataDir 'backups') -Directory -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -like 'app-*' } | Sort-Object Name -Descending)
-                if ($all.Count -gt 2) {
-                    for ($i = 2; $i -lt $all.Count; $i++) { Remove-Item -LiteralPath $all[$i].FullName -Recurse -Force -ErrorAction SilentlyContinue }
-                }
-            } catch {
-                Fail-Install ('备份旧版本失败，已中止以免无法回滚：' + $_.Exception.Message) 4
+    if (-not $oldVersion) { $oldVersion = 'unknown' }
+    $backupDir = Join-Path $DataDir ('backups\app-' + $oldVersion + '-' + $stamp)
+    $stateBackupPath = Join-Path $DataDir ('backups\install-state-' + $oldVersion + '-' + $stamp + '.json')
+    if (-not $DryRun) {
+        try {
+            New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+            Copy-Item -Path (Join-Path $AppDir '*') -Destination $backupDir -Recurse -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $statePath) {
+                Copy-Item -LiteralPath $statePath -Destination $stateBackupPath -Force -ErrorAction Stop
+                $report.state.previousSaved = $stateBackupPath
             }
-        } else {
-            $report.backup = '(dry-run: ' + $backupDir + ')'
+            $report.backup = $backupDir
+            Write-Line ('已备份当前安装 ' + $oldVersion + ' → ' + $backupDir)
+            # 只保留最近 2 个程序备份；同代的 install-state 快照一并清掉
+            $all = @(Get-ChildItem -LiteralPath (Join-Path $DataDir 'backups') -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like 'app-*' } | Sort-Object Name -Descending)
+            if ($all.Count -gt 2) {
+                for ($i = 2; $i -lt $all.Count; $i++) { Remove-Item -LiteralPath $all[$i].FullName -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+            $snaps = @(Get-ChildItem -LiteralPath (Join-Path $DataDir 'backups') -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like 'install-state-*.json' } | Sort-Object Name -Descending)
+            if ($snaps.Count -gt 2) {
+                for ($i = 2; $i -lt $snaps.Count; $i++) { Remove-Item -LiteralPath $snaps[$i].FullName -Force -ErrorAction SilentlyContinue }
+            }
+        } catch {
+            Fail-Install ('备份当前安装失败，已中止以免无法回滚：' + $_.Exception.Message) 4
+        }
+    } else {
+        $report.backup = '(dry-run: ' + $backupDir + ')'
+    }
+}
+
+# ---- 3.5 事务辅助 ----
+function Restore-AppBackup {
+    param([string]$From, [string]$To)
+    try {
+        if (-not (Test-Path -LiteralPath $From)) { return $false }
+        Get-ChildItem -LiteralPath $To -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Copy-Item -Path (Join-Path $From '*') -Destination $To -Recurse -Force -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-InstallStatePayload {
+    param([string]$Path, [string]$ExpectVersion, [string]$ExpectAppDir, [int]$MinFiles)
+    $o = Read-JsonFile $Path
+    if (-not $o) { return 'JSON 解析失败' }
+    if ([string]$o.version -ne $ExpectVersion) { return ('版本不符：' + [string]$o.version + ' != ' + $ExpectVersion) }
+    if ([string]$o.appDir -ne $ExpectAppDir) { return ('appDir 不符：' + [string]$o.appDir) }
+    $rows = @($o.files)
+    if ($rows.Count -lt $MinFiles) { return ('文件清单条目不足：' + $rows.Count + ' < ' + $MinFiles) }
+    foreach ($row in $rows) {
+        if (-not ([string]$row.path) -or -not ([string]$row.sha256)) { return '文件清单里有缺 path/sha256 的条目' }
+    }
+    return ''
+}
+
+# 安装失败时的收尾。两条路径必须区分清楚：
+#   * 已有安装 → 从备份恢复程序与状态；备份不可用就明确报「未恢复」。
+#   * 新安装   → 只删本次清单内的文件；用户自己的文件和数据目录一律不动。
+function Invoke-InstallRollback {
+    param([string]$Why, [int]$Code)
+    $report.rollback.attempted = $true
+
+    # 快捷方式先撤：它指向的程序马上要被删/回滚，留着就是死链
+    if ($script:createdShortcut) {
+        try {
+            Remove-Item -LiteralPath $script:createdShortcut -Force -ErrorAction Stop
+            $report.rollback.shortcutRemoved = $true
+        } catch {
+            $report.rollback.note = '快捷方式删除失败：' + $_.Exception.Message
         }
     }
+
+    if ($existingInstall -and $backupDir) {
+        $report.rollback.programRestored = [bool](Restore-AppBackup -From $backupDir -To $AppDir)
+        if (-not $report.rollback.programRestored) {
+            $report.rollback.note = '程序恢复失败，需手动从 ' + $backupDir + ' 恢复'
+        }
+    } else {
+        $removed = 0
+        $failed = 0
+        foreach ($rel in $files) {
+            $p = Join-Path $AppDir $rel
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop; $removed++ }
+            catch { $failed++ }
+        }
+        Remove-EmptyDirs $AppDir
+        # 只有本次新建、且已经清空的目录才删；用户原本就有的目录留着
+        if (-not $appDirExistedBefore -and (Test-Path -LiteralPath $AppDir)) {
+            $left = @(Get-ChildItem -LiteralPath $AppDir -Force -ErrorAction SilentlyContinue)
+            if ($left.Count -eq 0) { Remove-Item -LiteralPath $AppDir -Force -ErrorAction SilentlyContinue }
+        }
+        $report.rollback.cleaned = ($failed -eq 0)
+        $report.rollback.programRestored = ($failed -eq 0)
+        if (-not $report.rollback.note) {
+            $report.rollback.note = '新安装失败：已清理本次复制的 ' + $removed + ' 个文件（用户数据未动）'
+        }
+    }
+
+    # 状态一律以「磁盘上的版本」为准判定，而不是假设自己没写过
+    $expected = ''
+    if ($oldState -and [string]$oldState.version) { $expected = [string]$oldState.version }
+    $stateOk = $false
+    try {
+        $cur = Read-JsonFile $statePath
+        if ($expected) {
+            if (-not $cur -or ([string]$cur.version -ne $expected)) {
+                if ($stateBackupPath -and (Test-Path -LiteralPath $stateBackupPath)) {
+                    Copy-Item -LiteralPath $stateBackupPath -Destination $statePath -Force -ErrorAction Stop
+                    $cur = Read-JsonFile $statePath
+                }
+            }
+            $stateOk = [bool]($cur -and ([string]$cur.version -eq $expected))
+        } else {
+            # 本次之前没有安装记录：回滚后也不该凭空多出一条
+            $stateOk = -not (Test-Path -LiteralPath $statePath)
+        }
+    } catch {
+        $stateOk = $false
+        $report.rollback.note = '状态检查异常：' + $_.Exception.Message
+    }
+    $report.rollback.stateRestored = $stateOk
+
+    $parts = @()
+    if ($existingInstall) {
+        if ($report.rollback.programRestored) { $parts += ('程序已恢复到 ' + [string]$oldState.version) }
+        else { $parts += ('程序恢复失败，备份在 ' + $backupDir) }
+    } else {
+        if ($report.rollback.cleaned) { $parts += '本次复制的程序文件已清理' }
+        else { $parts += '部分程序文件未能清理，需手动删除' }
+    }
+    if ($stateOk) { $parts += '安装记录与安装前一致' }
+    else { $parts += ('安装记录不一致（期望 ' + $expected + '），请从 ' + $stateBackupPath + ' 恢复') }
+    Fail-Install ($Why + '；' + ($parts -join '；')) $Code
 }
 
 # ---- 4. 复制 ----
@@ -249,14 +398,28 @@ if ($DryRun) {
     Write-Line ('预检模式：将安装 ' + $files.Count + ' 个文件到 ' + $AppDir)
 } else {
     try {
-        Copy-InstallFiles -SourceDir $SourceDir -AppDir $AppDir -Files $files
+        if ($InjectFault -eq 'copy-mid') {
+            # 5 个文件之后失败：足够留下半套文件，用来验证清理逻辑
+            $n = 0
+            foreach ($rel in $files) {
+                if ($n -ge 5) { throw ('故障注入：复制到第 ' + ($n + 1) + ' 个文件时失败') }
+                Copy-InstallFiles -SourceDir $SourceDir -AppDir $AppDir -Files @($rel)
+                $n++
+            }
+        } else {
+            Copy-InstallFiles -SourceDir $SourceDir -AppDir $AppDir -Files $files
+        }
     } catch {
-        Fail-Install ('复制失败：' + $_.Exception.Message) 4
+        Invoke-InstallRollback -Why ('复制失败：' + $_.Exception.Message) -Code 4
     }
 }
 
 # ---- 5. 校验 ----
 if (-not $DryRun) {
+    if ($InjectFault -eq 'verify') {
+        # 模拟「复制没报错但落盘字节不对」：改掉一个清单文件让哈希比对失败
+        Set-Content -LiteralPath (Join-Path $AppDir 'scripts\lib.js') -Value 'corrupted by fault injection' -Encoding UTF8 -Force
+    }
     $bad = @()
     foreach ($rel in $files) {
         $srcHash = Get-Sha256 (Join-Path $SourceDir $rel)
@@ -265,7 +428,7 @@ if (-not $DryRun) {
         if ($srcHash -ne $dstHash) { $bad += ($rel + '（哈希不一致）') }
     }
     if ($bad.Count -gt 0) {
-        Fail-Install ('装后校验失败：' + ($bad -join '; ')) 5
+        Invoke-InstallRollback -Why ('装后校验失败：' + ($bad -join '; ')) -Code 5
     }
 }
 $report.fileCount = $files.Count
@@ -273,8 +436,16 @@ $report.fileCount = $files.Count
 # ---- 6. 快捷方式（先做，路径要写进安装记录，卸载时只认这一条）----
 # 只在「用户没有同名快捷方式」时创建；已存在就不动 —— 那是用户自己的东西。
 $shortcutPath = ''
+$script:createdShortcut = ''
 if (-not $NoShortcut -and -not $DryRun) {
-    $desktop = Get-DesktopDir
+    $desktop = ''
+    if ($DesktopDir) {
+        # 测试注入：绝不允许测试在真实桌面上留下东西
+        if (-not (Test-Path -LiteralPath $DesktopDir)) { New-Item -ItemType Directory -Force -Path $DesktopDir | Out-Null }
+        $desktop = [IO.Path]::GetFullPath($DesktopDir).TrimEnd('\')
+    } else {
+        $desktop = Get-DesktopDir
+    }
     $launcher = Join-Path $AppDir 'scripts\launcher.cmd'
     $launcherVbs = Join-Path $AppDir 'scripts\launcher-hidden.vbs'
     if ($desktop -and (Test-Path -LiteralPath $launcher)) {
@@ -289,7 +460,7 @@ if (-not $NoShortcut -and -not $DryRun) {
             } else {
                 $okLnk = New-Shortcut -LnkPath $lnk -Target $launcher -Arguments '' -WorkDir (Join-Path $AppDir 'scripts') -IconPath $icon
             }
-            if ($okLnk) { $shortcutPath = $lnk; $report.shortcut = $lnk }
+            if ($okLnk) { $shortcutPath = $lnk; $script:createdShortcut = $lnk; $report.shortcut = $lnk }
             else { $report.warnings += '创建桌面快捷方式失败（不影响安装）' }
         }
     } else {
@@ -297,7 +468,7 @@ if (-not $NoShortcut -and -not $DryRun) {
     }
 }
 
-# ---- 7. 数据目录初始化（不覆盖已有配置）----
+# ---- 7. 数据目录初始化 + 状态提交 ----
 $configPath = Join-Path $DataDir 'config.json'
 if (-not $DryRun) {
     try {
@@ -311,22 +482,50 @@ if (-not $DryRun) {
                 permission   = [ordered]@{ preferenceGuard = $false; configRepair = $false; autoApprove = $false }
             })
         }
-        $table = Get-InstalledFileTable -AppDir $AppDir -Files $files
-        Write-JsonFile -Path $statePath -Value ([ordered]@{
-            schema      = 1
-            product     = 'WorkDaddy'
-            channel     = 'fork'
-            version     = $version
-            appDir      = $AppDir
-            dataDir     = $DataDir
-            clientProfile = $ClientProfile
-            installedAt = (Get-Date).ToString('o')
-            source      = 'installer/install-workdaddy.ps1'
-            shortcut    = $shortcutPath
-            files       = $table
-        })
     } catch {
-        Fail-Install ('数据目录初始化失败：' + $_.Exception.Message) 6
+        Invoke-InstallRollback -Why ('数据目录初始化失败：' + $_.Exception.Message) -Code 6
+    }
+
+    # 状态提交：写临时文件 → 校验 → 原子替换 → 再校验。
+    # 直接写目标文件的话，写到一半失败会留下一个「能解析但清单不全」的记录，
+    # 卸载时按它删就会漏文件。
+    $stateTmp = Join-Path $DataDir ('.install-state.tmp-' + $stamp + '.json')
+    $report.state.tmpPath = $stateTmp
+    try {
+        $table = Get-InstalledFileTable -AppDir $AppDir -Files $files
+        $payload = [ordered]@{
+            schema        = 1
+            product       = 'WorkDaddy'
+            channel       = 'fork'
+            version       = $version
+            appDir        = $AppDir
+            dataDir       = $DataDir
+            clientProfile = $ClientProfile
+            installedAt   = (Get-Date).ToString('o')
+            source        = 'installer/install-workdaddy.ps1'
+            shortcut      = $shortcutPath
+            files         = $table
+        }
+        if ($InjectFault -eq 'state-write') { throw '故障注入：状态文件无法写入（模拟磁盘/权限问题）' }
+        Write-JsonFile -Path $stateTmp -Value $payload
+        $err = Test-InstallStatePayload -Path $stateTmp -ExpectVersion $version -ExpectAppDir $AppDir -MinFiles $files.Count
+        if ($err) { throw ('新状态校验失败：' + $err) }
+        $report.state.validated = $true
+
+        if (Test-Path -LiteralPath $statePath) {
+            [IO.File]::Replace($stateTmp, $statePath, ($statePath + '.bak'), $true)
+        } else {
+            Move-Item -LiteralPath $stateTmp -Destination $statePath -Force
+        }
+        $err = Test-InstallStatePayload -Path $statePath -ExpectVersion $version -ExpectAppDir $AppDir -MinFiles $files.Count
+        if ($err) { throw ('提交后校验失败：' + $err) }
+        $report.state.committed = $true
+    } catch {
+        if (Test-Path -LiteralPath $stateTmp) { Remove-Item -LiteralPath $stateTmp -Force -ErrorAction SilentlyContinue }
+        Invoke-InstallRollback -Why ('状态提交失败：' + $_.Exception.Message) -Code 7
+    }
+    if (Test-Path -LiteralPath ($statePath + '.bak')) {
+        Remove-Item -LiteralPath ($statePath + '.bak') -Force -ErrorAction SilentlyContinue
     }
 }
 

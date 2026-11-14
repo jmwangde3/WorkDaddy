@@ -15,170 +15,17 @@
  * 断言一律读 -Json 报告与磁盘状态，不解析 stdout：PowerShell 5.1 在 CJK
  * 控制台下的输出编码不可靠（默认 OEM 936），拿它做断言会引入假失败。
  */
-const assert = require('node:assert/strict');
-const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
+
+const {
+  assert, installPs1, updatePs1, uninstallPs1,
+  tmpRoot, sha256, sleepSync, alive, writeFile,
+  fileList, makeSource, seedInstall, runPs, cleanup,
+} = require('./helpers/installer-fixture');
 
 const isWin = process.platform === 'win32';
-const repo = path.join(__dirname, '..');
-const installPs1 = path.join(repo, 'installer', 'install-workdaddy.ps1');
-const updatePs1 = path.join(repo, 'installer', 'update-workdaddy.ps1');
-const uninstallPs1 = path.join(repo, 'installer', 'uninstall-workdaddy.ps1');
-
-const roots = [];
-let counter = 0;
-
-/**
- * 测试根目录固定放在仓库内的 tmp/ 下，而不是 os.tmpdir()。
- *
- * 原因：本机（以及某些被客户端改过 TEMP 的环境）os.tmpdir() 会指向
- * %APPDATA%\WorkDaddy\client-tmp\... —— 那正是真实用户数据目录内部。
- * 安装/更新/卸载测试会成批复制并删除整棵目录树，不能让它跑在用户数据目录里。
- * 仓库内 tmp/ 已 gitignore，且安装清单本身就把 tmp 排除在外。
- */
-const tmpBase = path.join(repo, 'tmp');
-
-function tmpRoot(tag) {
-  fs.mkdirSync(tmpBase, { recursive: true });
-  const d = fs.mkdtempSync(path.join(tmpBase, `inst-${tag}-`));
-  roots.push(d);
-  return d;
-}
-
-function sha256(file) {
-  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-}
-
-/** 同步睡眠：这些测试是自上而下的顺序脚本，等进程真正退出比分段异步更好读。 */
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-/** 进程是否还活着（pid 可能被系统复用，这里只做「刚刚被停掉」这个场景的判定）。 */
-function alive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-function writeFile(file, content) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, content);
-}
-
-// ---- 与 installer/lib/common.ps1 的清单规则保持一致（Fixture 里不含被排除项）----
-const INCLUDE_DIRS = ['scripts', 'src', 'schemas', 'examples', 'release', 'tray'];
-const INCLUDE_FILES = ['LICENSE', 'README.md', 'README_en.md', 'README_ja.md', 'package.json'];
-const EXCLUDE_NAMES = new Set(['.git', '.github', 'node_modules', 'test', 'tools', 'docs', 'tmp', '__pycache__']);
-
-function fileList(dir) {
-  const out = [];
-  for (const f of INCLUDE_FILES) {
-    if (fs.existsSync(path.join(dir, f))) out.push(f);
-  }
-  for (const d of INCLUDE_DIRS) {
-    const root = path.join(dir, d);
-    if (!fs.existsSync(root)) continue;
-    const walk = (cur) => {
-      for (const e of fs.readdirSync(cur, { withFileTypes: true })) {
-        const full = path.join(cur, e.name);
-        if (e.isDirectory()) { walk(full); continue; }
-        const rel = path.relative(dir, full).split(path.sep).join('\\');
-        const parts = rel.split('\\');
-        if (parts.some((p) => EXCLUDE_NAMES.has(p))) continue;
-        if (/\.log$/i.test(rel)) continue;
-        out.push(rel);
-      }
-    };
-    walk(root);
-  }
-  return out;
-}
-
-/**
- * 造一个假的发布源目录。文件数必须超过 20（安装器有下限保护），
- * 且 scripts 下四个核心文件必须是合法 JS —— 更新器会用 node --check 做健康检查。
- */
-function makeSource(root, version, opts = {}) {
-  const dir = path.join(root, 'src-' + version + (opts.tag ? '-' + opts.tag : ''));
-  const files = {
-    'package.json': JSON.stringify({ name: 'workdaddy', version, private: true }, null, 2) + '\n',
-    'LICENSE': 'GNU AFFERO GENERAL PUBLIC LICENSE Version 3\n',
-    'README.md': '# WorkDaddy ' + version + '\n',
-    'scripts/daemon.js': "'use strict';\nconst DAEMON_VERSION = '" + version + "';\nmodule.exports = { DAEMON_VERSION };\n",
-    'scripts/inject.js': "'use strict';\n// inject " + version + '\n',
-    'scripts/lib.js': opts.brokenLib
-      ? "'use strict';\nconst broken = ;\n"
-      : "'use strict';\n// lib " + version + '\n',
-    'scripts/win-launcher.js': "'use strict';\n// launcher\n",
-    'scripts/launcher.cmd': '@echo off\r\nnode daemon.js\r\n',
-    'scripts/launcher-hidden.vbs': 'CreateObject("WScript.Shell").Run "launcher.cmd", 0\r\n',
-    'src/features/integration/fork-routes.js': "'use strict';\n",
-    'src/features/sessions/takeover/routes.js': "'use strict';\n",
-    'release/WorkDaddy.ico': 'ICO',
-    'tray/README.txt': 'tray placeholder\n',
-  };
-  for (let i = 1; i <= 10; i++) {
-    const n = String(i).padStart(2, '0');
-    files[`scripts/mod-${n}.js`] = "'use strict';\nmodule.exports = " + i + ';\n';
-  }
-  for (const [rel, content] of Object.entries(files)) writeFile(path.join(dir, rel), content);
-  return dir;
-}
-
-/** 直接从磁盘模拟一次「已安装」：复制文件 + 写 install-state.json。比跑安装器快，也解耦。 */
-function seedInstall(root, opts) {
-  const { version, sourceDir, appDir, dataDir } = opts;
-  const list = fileList(sourceDir);
-  for (const rel of list) {
-    writeFile(path.join(appDir, rel), fs.readFileSync(path.join(sourceDir, rel)));
-  }
-  const table = list.map((rel) => ({
-    path: rel,
-    sha256: sha256(path.join(appDir, rel)),
-    size: fs.statSync(path.join(appDir, rel)).size,
-  }));
-  const extra = opts.extraFiles || [];
-  writeFile(path.join(dataDir, 'install-state.json'), JSON.stringify({
-    schema: 1,
-    product: 'WorkDaddy',
-    channel: 'fork',
-    version,
-    appDir,
-    dataDir,
-    clientProfile: 'workbuddy-cn',
-    installedAt: new Date().toISOString(),
-    source: 'test-fixture',
-    shortcut: opts.shortcut || '',
-    files: table.concat(extra),
-  }, null, 2));
-  return { appDir, dataDir, list };
-}
-
-/** 跑一个安装器脚本，返回 { code, report }。TEMP/TMP 指到测试根目录，避免污染真实 %TEMP%。 */
-function runPs(script, args, tempDir) {
-  const out = path.join(tempDir, 'report-' + (counter++) + '.json');
-  const res = spawnSync('powershell.exe', [
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-    '-File', script,
-  ].concat(args, ['-Json', out]), {
-    encoding: 'utf8',
-    timeout: 120000,
-    env: Object.assign({}, process.env, { TEMP: tempDir, TMP: tempDir }),
-  });
-  let report = null;
-  try {
-    if (fs.existsSync(out)) report = JSON.parse(fs.readFileSync(out, 'utf8'));
-  } catch (error) {
-    throw new Error('报告不是合法 JSON：' + error.message + '\n' + fs.readFileSync(out, 'utf8'));
-  }
-  return { code: res.status, report, stdout: res.stdout || '', stderr: res.stderr || '' };
-}
 
 function test(name, fn) {
   if (!isWin) {
@@ -235,7 +82,7 @@ function main() {
     assert.equal(config.permission.preferenceGuard, false, '默认不得写偏好');
   });
 
-  test('重复安装（同版本）：成功且不产生备份目录', () => {
+  test('重复安装（同版本）：同样先备份，成功后再覆盖', () => {
     const root = tmpRoot('repeat');
     const src = makeSource(root, '1.3.0');
     const appDir = path.join(root, 'app');
@@ -248,11 +95,17 @@ function main() {
     const second = runPs(installPs1, base, root);
     assert.equal(second.code, 0, second.stdout);
     assert.equal(second.report.ok, true);
-    assert.equal(second.report.backup, null, '同版本重装不该产生备份');
+    // 同版本重装也可能在复制中途失败，所以必须有可恢复备份（不再按版本差异决定）
+    assert.ok(second.report.backup, '同版本重装也应留备份');
+    assert.ok(fs.existsSync(second.report.backup), '备份目录必须存在');
 
     const backups = path.join(dataDir, 'backups');
-    const dirs = fs.existsSync(backups) ? fs.readdirSync(backups) : [];
-    assert.deepEqual(dirs, [], '同版本重装不该产生备份目录');
+    const dirs = fs.readdirSync(backups).filter((n) => n.startsWith('app-'));
+    assert.equal(dirs.length, 1, '应有一个程序备份：' + dirs.join(','));
+    assert.match(dirs[0], /^app-1\.3\.0-\d{8}-\d{6}$/);
+    assert.ok(fs.existsSync(path.join(backups, dirs[0], 'scripts', 'daemon.js')));
+    // 状态也留一份快照，回滚时用它证明「安装前记录是什么」
+    assert.ok(fs.readdirSync(backups).some((n) => /^install-state-1\.3\.0-\d{8}-\d{6}\.json$/.test(n)), '应保留状态快照');
   });
 
   test('升级安装（旧版本已装）：先备份再覆盖，备份里是旧内容', () => {
@@ -468,12 +321,18 @@ function main() {
     assert.equal(state.updatedFrom, '1.3.0');
     assert.ok(state.files.length >= 20);
 
-    // 备份：一个 app-<旧版本>-preupdate-<时间戳>，里面是旧内容
-    const backupDirs = fs.readdirSync(path.join(dataDir, 'backups'));
+    // 备份：一个 app-<旧版本>-preupdate-<时间戳>，里面是旧内容；
+    // 同一代际还有一份 install-state 快照（更新事务回滚要用）
+    const backupDirs = fs.readdirSync(path.join(dataDir, 'backups')).filter((n) => n.startsWith('app-'));
     assert.equal(backupDirs.length, 1, '应保留一个可恢复版本：' + backupDirs.join(','));
     assert.match(backupDirs[0], /^app-1\.3\.0-preupdate-\d{8}-\d{6}$/);
     const backed = fs.readFileSync(path.join(dataDir, 'backups', backupDirs[0], 'scripts', 'daemon.js'), 'utf8');
     assert.match(backed, /1\.3\.0/);
+    assert.ok(
+      fs.readdirSync(path.join(dataDir, 'backups')).some((n) => /^install-state-1\.3\.0-\d{8}-\d{6}\.json$/.test(n)),
+      '应保留旧状态的快照'
+    );
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'install-state.json'), 'utf8')).version, '1.3.1', '状态应提交新版本');
 
     // 用户数据保留
     assert.equal(fs.readFileSync(path.join(dataDir, 'logs', 'daemon-2026-11-14.log'), 'utf8'), 'user log\n');
@@ -731,26 +590,6 @@ try {
   console.error('FAIL installer-lifecycle.test.js:', error);
   process.exitCode = 1;
 } finally {
+  // 夹具模块自己也挂了 process.on('exit')，这里是「测试结束立刻清」的快路径
   cleanup();
 }
-
-function cleanup() {
-  const failed = [];
-  for (const d of roots) {
-    // Windows 上刚退出的 powershell.exe 句柄、杀软扫描会短暂占用目录，
-    // 直接 rmSync 偶尔 EBUSY/EPERM。交给 Node 自己按 maxRetries 重试。
-    try {
-      fs.rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-    } catch (error) {
-      failed.push(d + ' :: ' + error.code + ' :: ' + error.message);
-    }
-  }
-  if (failed.length) {
-    // 不抛：清理失败不该把「测试通过」变成失败，但必须留痕，否则会悄悄堆垃圾
-    try { console.error('清理失败 ' + failed.length + '/' + roots.length + '：\n' + failed.join('\n')); } catch (_) {}
-  }
-}
-
-// node --test 会在文件执行完后立刻收走子进程，finally 不保证跑完；
-// exit 钩子里的同步操作才是唯一可靠的收尾点。
-process.on('exit', cleanup);

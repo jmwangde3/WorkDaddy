@@ -8,6 +8,8 @@
 #
 # 退出码：0 成功 / 1 状态或源目录问题 / 2 版本闸门（降级或同版本） / 3 暂存失败
 #         / 4 替换失败并已回滚 / 5 健康检查失败并已回滚 / 6 守护进程停不下来
+#         / 7 状态提交失败（程序与状态一起回滚，报告里分开写是否都成功）
+#         / 8 上次更新事务未完成（journal 判定不一致，拒绝在未知状态上继续）
 param(
     [string]$SourceDir = '',
     [string]$AppDir = '',
@@ -15,7 +17,9 @@ param(
     [switch]$DryRun,
     [switch]$Force,
     [switch]$Restart,
-    [string]$Json = ''
+    [string]$Json = '',
+    # 仅供故障注入测试：state-write / state-replace / state-restore
+    [string]$InjectFault = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,6 +49,24 @@ $report = [ordered]@{
     rolledBack = $false
     fileCount  = 0
     health     = [ordered]@{}
+    # 状态提交是更新事务的一部分，逐阶段留证据：写临时文件 → 校验 → 原子替换 → 校验
+    state      = [ordered]@{
+        previousSaved = ''
+        tmpPath       = ''
+        validated     = $false
+        committed     = $false
+        restored      = $false
+        note          = ''
+    }
+    # 回滚结果必须分开报告：程序恢复 ≠ 状态恢复。两者只成一个就是半完成状态。
+    rollback   = [ordered]@{
+        attempted       = $false
+        programRestored = $false
+        stateRestored   = $false
+        backup          = ''
+        note            = ''
+    }
+    previousJournal = $null
     warnings   = @()
     error      = ''
     exitCode   = 0
@@ -73,6 +95,33 @@ $state = Read-JsonFile $statePath
 if (-not $state) { Fail-Update ('找不到安装记录：' + $statePath + '；请先用 install-workdaddy.ps1 安装') 1 }
 $report.fromVersion = [string]$state.version
 if ([string]$state.appDir) { $AppDir = ([string]$state.appDir).TrimEnd('\') }
+
+# ---- 0.5 上次事务残留检查 ----
+# 如果上一次更新崩在「文件已替换、状态未提交」之间，磁盘上会留一份 journal。
+# 这里不猜也不自动修：把两侧版本读出来，能判定的清掉，判不定的拒绝继续。
+# 目的只有一个 —— 不在「程序是新版本、记录是旧版本」这种未知状态上再做一次替换。
+$journalPath = Join-Path $DataDir 'update-journal.json'
+$journal = Read-JsonFile $journalPath
+if ($journal) {
+    $diskVer = [string](Get-SourceVersion $AppDir)
+    $jFrom = [string]$journal.from
+    $jTo = [string]$journal.to
+    $report.previousJournal = [ordered]@{
+        from = $jFrom; to = $jTo; diskVersion = $diskVer
+        stateVersion = $report.fromVersion; backup = [string]$journal.backup
+    }
+    if ($diskVer -and $diskVer -eq $jTo -and $report.fromVersion -eq $jTo) {
+        Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue
+        $report.warnings += ('发现上次更新的残留 journal，但程序与状态都已是 ' + $jTo + '，已清理')
+    } elseif ($diskVer -and $diskVer -eq $jFrom -and $report.fromVersion -eq $jFrom) {
+        Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue
+        $report.warnings += ('发现上次更新的残留 journal，程序与状态都还是 ' + $jFrom + '，已清理')
+    } elseif (-not $Force) {
+        Fail-Update ('上次更新未完成：程序 ' + $diskVer + ' / 状态 ' + $report.fromVersion + ' / 目标 ' + $jTo + '；备份在 ' + [string]$journal.backup + '。请先让程序与状态一致，或加 -Force 继续') 8
+    } else {
+        $report.warnings += ('上次更新未完成（程序 ' + $diskVer + ' / 状态 ' + $report.fromVersion + '），-Force 继续')
+    }
+}
 
 $toVersion = Get-SourceVersion $SourceDir
 if (-not $toVersion) { Fail-Update ('源目录里读不到 DAEMON_VERSION：' + $SourceDir) 1 }
@@ -132,9 +181,12 @@ if (-not $DryRun) {
     }
 }
 
-# ---- 2. 备份当前版本 ----
+# ---- 2. 备份当前版本（程序 + 状态）----
+# 状态文件必须在替换任何程序文件之前先留一份：它是回滚时唯一能证明
+# 「旧版本到底装了什么」的东西，等写新状态时再备份就来不及了。
 $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
 $backupDir = Join-Path $DataDir ('backups\app-' + $report.fromVersion + '-preupdate-' + $stamp)
+$stateBackupPath = Join-Path $DataDir ('backups\install-state-' + $report.fromVersion + '-' + $stamp + '.json')
 $report.backup = $backupDir
 if (-not $DryRun) {
     try {
@@ -142,6 +194,8 @@ if (-not $DryRun) {
         if (Test-Path -LiteralPath (Join-Path $AppDir 'scripts')) {
             Copy-Item -Path (Join-Path $AppDir '*') -Destination $backupDir -Recurse -Force -ErrorAction Stop
         }
+        Copy-Item -LiteralPath $statePath -Destination $stateBackupPath -Force -ErrorAction Stop
+        $report.state.previousSaved = $stateBackupPath
     } catch {
         Fail-Update ('备份当前版本失败，已中止：' + $_.Exception.Message) 4
     }
@@ -193,7 +247,7 @@ if (-not $DryRun) {
     }
 }
 
-# ---- 3. 替换（失败即回滚）----
+# ---- 3. 事务辅助：回滚（程序 + 状态分开报告）----
 function Restore-Backup {
     param([string]$From, [string]$To)
     try {
@@ -208,6 +262,99 @@ function Restore-Backup {
     }
 }
 
+function Remove-Journal {
+    if ($journalPath -and (Test-Path -LiteralPath $journalPath)) {
+        Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 新状态在替换前后各校验一次：版本、appDir、文件清单条数与每条 path/sha256。
+# 只判「JSON 能解析」不够 —— 空清单的合法 JSON 会让卸载删不干净。
+function Test-StatePayload {
+    param([string]$Path, [string]$ExpectVersion, [string]$ExpectAppDir, [int]$MinFiles)
+    $o = Read-JsonFile $Path
+    if (-not $o) { return 'JSON 解析失败' }
+    if ([string]$o.version -ne $ExpectVersion) { return ('版本不符：' + [string]$o.version + ' != ' + $ExpectVersion) }
+    if ([string]$o.appDir -ne $ExpectAppDir) { return ('appDir 不符：' + [string]$o.appDir) }
+    $rows = @($o.files)
+    if ($rows.Count -lt $MinFiles) { return ('文件清单条目不足：' + $rows.Count + ' < ' + $MinFiles) }
+    foreach ($row in $rows) {
+        if (-not ([string]$row.path) -or -not ([string]$row.sha256)) { return '文件清单里有缺 path/sha256 的条目' }
+    }
+    return ''
+}
+
+# 失败即回滚。程序与状态各自恢复、各自记账：只成一个就是半完成状态，
+# 报告里必须能直接看出来是哪一半没回来。
+function Invoke-UpdateRollback {
+    param([string]$Why, [int]$Code)
+    $report.rollback.attempted = $true
+    $report.rollback.backup = $backupDir
+
+    $progOk = [bool](Restore-Backup -From $backupDir -To $AppDir)
+    $report.rollback.programRestored = $progOk
+
+    $stateOk = $false
+    if ($InjectFault -eq 'state-restore') {
+        # 只注入「回滚时状态恢复失败」：程序恢复照常，状态故意不写回
+        $report.rollback.note = '故障注入：状态恢复失败（模拟回滚时状态文件写不回去）'
+    } else {
+        try {
+            $cur = Read-JsonFile $statePath
+            if (-not $cur -or ([string]$cur.version -ne $report.fromVersion)) {
+                if ($stateBackupPath -and (Test-Path -LiteralPath $stateBackupPath)) {
+                    Copy-Item -LiteralPath $stateBackupPath -Destination $statePath -Force -ErrorAction Stop
+                }
+            }
+            $chk = Read-JsonFile $statePath
+            $stateOk = [bool]($chk -and ([string]$chk.version -eq $report.fromVersion))
+        } catch {
+            $stateOk = $false
+            $report.rollback.note = '状态恢复异常：' + $_.Exception.Message
+        }
+    }
+    $report.rollback.stateRestored = $stateOk
+    if ($stateOk) { $report.state.restored = $true }
+    $report.rolledBack = ($progOk -and $stateOk)
+
+    # 两半都回来了才清 journal：否则留着它，下次运行会被 0.5 的残留检查拦住
+    $nowVer = ''
+    $now = Read-JsonFile $statePath
+    if ($now) { $nowVer = [string]$now.version }
+    if ($progOk -and $stateOk) { Remove-Journal }
+
+    $parts = @()
+    if ($progOk) { $parts += ('程序已恢复到 ' + $report.fromVersion) }
+    else { $parts += ('程序恢复失败，需手动从 ' + $backupDir + ' 恢复') }
+    if ($stateOk) { $parts += ('安装记录已恢复到 ' + $report.fromVersion) }
+    else {
+        $parts += ('安装记录未恢复（当前 ' + $nowVer + '，备份在 ' + $stateBackupPath + '）')
+        if ($report.rollback.note) { $parts += $report.rollback.note }
+    }
+    Fail-Update ($Why + '；' + ($parts -join '；')) $Code
+}
+
+# ---- 3.5 替前写 journal ----
+# 崩溃恢复的唯一线索：这条记录在成功提交状态后才删。留在盘上就代表
+# 「可能有过一次未完成的替换」，下次运行会先判定再决定是否继续。
+if (-not $DryRun) {
+    try {
+        Write-JsonFile -Path $journalPath -Value ([ordered]@{
+            schema    = 1
+            action    = 'update'
+            from      = $report.fromVersion
+            to        = $toVersion
+            backup    = $backupDir
+            stage     = $stageDir
+            pid       = $PID
+            startedAt = (Get-Date).ToString('o')
+        })
+    } catch {
+        Fail-Update ('写更新事务 journal 失败，已中止（程序未改动）：' + $_.Exception.Message) 1
+    }
+}
+
+# ---- 4. 替换（失败即回滚）----
 if (-not $DryRun) {
     try {
         Copy-InstallFiles -SourceDir $stageDir -AppDir $AppDir -Files $files
@@ -217,15 +364,11 @@ if (-not $DryRun) {
         }
         if ($bad.Count -gt 0) { throw ('装后校验失败：' + ($bad -join ',')) }
     } catch {
-        $why = $_.Exception.Message
-        $restored = Restore-Backup -From $backupDir -To $AppDir
-        $report.rolledBack = $restored
-        if ($restored) { Fail-Update ('替换失败，已回滚到 ' + $report.fromVersion + '：' + $why) 4 }
-        Fail-Update ('替换失败且回滚未完成，请手动从 ' + $backupDir + ' 恢复：' + $why) 4
+        Invoke-UpdateRollback -Why ('替换失败：' + $_.Exception.Message) -Code 4
     }
 }
 
-# ---- 4. 静态健康检查（不启动守护进程）----
+# ---- 5. 静态健康检查（不启动守护进程）----
 $node = $null
 try {
     $managed = Join-Path $env:USERPROFILE '.workbuddy\binaries\node\versions'
@@ -252,9 +395,7 @@ if ($node -and -not $DryRun) {
         $ErrorActionPreference = $prevEap
         if ($nodeCode -ne 0) {
             $report.health[$c] = 'syntax-error'
-            $restored = Restore-Backup -From $backupDir -To $AppDir
-            $report.rolledBack = $restored
-            Fail-Update ('健康检查失败（' + $c + ' 语法错误），已回滚：' + ($out -join ' ')) 5
+            Invoke-UpdateRollback -Why ('健康检查失败（' + $c + ' 语法错误）：' + ($out -join ' ')) -Code 5
         }
         $report.health[$c] = 'ok'
     }
@@ -262,25 +403,56 @@ if ($node -and -not $DryRun) {
     $report.health.note = '未找到 Node 运行时，跳过语法检查（不影响文件替换结果）'
 }
 
-# ---- 5. 写状态 ----
+# ---- 6. 状态提交（更新事务的最后一环）----
+# 顺序：建 payload → 写临时文件 → 校验临时文件 → 原子替换 → 校验落盘文件。
+# 任何一步失败都走同一套回滚：程序回旧版本、状态回旧版本，不留半完成。
 if (-not $DryRun) {
+    $stateTmp = Join-Path $DataDir ('.install-state.tmp-' + $stamp + '.json')
+    $report.state.tmpPath = $stateTmp
     try {
         $table = Get-InstalledFileTable -AppDir $AppDir -Files $files
-        Write-JsonFile -Path $statePath -Value ([ordered]@{
-            schema      = 1
-            product     = 'WorkDaddy'
-            channel     = 'fork'
-            version     = $toVersion
-            appDir      = $AppDir
-            dataDir     = $DataDir
+        $payload = [ordered]@{
+            schema        = 1
+            product       = 'WorkDaddy'
+            channel       = 'fork'
+            version       = $toVersion
+            appDir        = $AppDir
+            dataDir       = $DataDir
             clientProfile = [string]$state.clientProfile
-            installedAt = (Get-Date).ToString('o')
-            updatedFrom = $report.fromVersion
-            source      = 'installer/update-workdaddy.ps1'
-            files       = $table
-        })
+            installedAt   = (Get-Date).ToString('o')
+            updatedFrom   = $report.fromVersion
+            source        = 'installer/update-workdaddy.ps1'
+            files         = $table
+        }
+
+        if ($InjectFault -eq 'state-write') { throw '故障注入：状态文件无法写入（模拟磁盘/权限问题）' }
+        Write-JsonFile -Path $stateTmp -Value $payload
+
+        $err = Test-StatePayload -Path $stateTmp -ExpectVersion $toVersion -ExpectAppDir $AppDir -MinFiles $files.Count
+        if ($err) { throw ('新状态校验失败：' + $err) }
+        $report.state.validated = $true
+
+        if ($InjectFault -eq 'state-replace') { throw '故障注入：状态文件替换失败（模拟文件被占用）' }
+        if (Test-Path -LiteralPath $statePath) {
+            # 同卷原子替换：旧文件先落到 .bak，再把临时文件就位。
+            # 目标被删掉时 File.Replace 会抛，退回 Move-Item（仍然是同卷 rename）。
+            [IO.File]::Replace($stateTmp, $statePath, ($statePath + '.bak'), $true)
+        } else {
+            Move-Item -LiteralPath $stateTmp -Destination $statePath -Force
+        }
+
+        $err = Test-StatePayload -Path $statePath -ExpectVersion $toVersion -ExpectAppDir $AppDir -MinFiles $files.Count
+        if ($err) { throw ('提交后校验失败：' + $err) }
+        $report.state.committed = $true
+        # 只用于「状态恢复失败」这一种故障注入：提交成功后再抛，
+        # 让回滚必须同时处理「程序已回旧、状态是新」的两侧不一致。
+        if ($InjectFault -eq 'state-restore') { throw '故障注入：状态提交后校验失败' }
     } catch {
-        Fail-Update ('写安装状态失败：' + $_.Exception.Message) 4
+        if (Test-Path -LiteralPath $stateTmp) { Remove-Item -LiteralPath $stateTmp -Force -ErrorAction SilentlyContinue }
+        Invoke-UpdateRollback -Why ($_.Exception.Message) -Code 7
+    }
+    if (Test-Path -LiteralPath ($statePath + '.bak')) {
+        Remove-Item -LiteralPath ($statePath + '.bak') -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -303,7 +475,10 @@ if ($Restart -and -not $DryRun) {
     }
 }
 
-# ---- 6. 清理暂存目录 ----
+# ---- 7. 收尾：事务已提交，清 journal 与暂存 ----
+# journal 必须在状态提交之后才删：删早了就失去崩溃恢复线索，
+# 删晚了下次运行会误判「上次没做完」。
+Remove-Journal
 # 替换与校验都过了，暂存副本没有保留价值；备份目录才是回滚依据。
 if ($script:stageDir -and (Test-Path -LiteralPath $script:stageDir)) {
     Remove-Item -LiteralPath $script:stageDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -313,6 +488,7 @@ if ($script:stageDir -and (Test-Path -LiteralPath $script:stageDir)) {
 $report.fileCount = $files.Count
 $report.ok = $true
 Write-Line ('更新完成：' + $report.fromVersion + ' → ' + $toVersion)
+Write-Line ('安装记录已提交：' + $statePath)
 Write-Line ('回滚备份保留在：' + $backupDir)
 Write-Report -Report $report -JsonPath $Json
 exit 0
