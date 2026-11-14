@@ -187,6 +187,17 @@ function main() {
   // 安装器必须一起进包：解压后要能直接 install 到本机
   assert.ok(names.some((n) => /^installer\/.+\.ps1$/.test(n)), '便携包里没有安装器');
 
+  // 托盘：包里必须是仓库里那一个 EXE（不是临时编译产物、也不是别的机器上编的）
+  const trayEntry = portableZip.entries.find((e) => e.name === 'tray/WorkDaddyTray.exe');
+  assert.ok(trayEntry, '便携包里没有托盘 EXE');
+  const trayBytes = readZipEntry(portableZip, trayEntry);
+  const trayRepo = path.join(repo, 'tray', 'WorkDaddyTray.exe');
+  assert.ok(fs.existsSync(trayRepo), '仓库里的托盘 EXE 被删了（本轮决策：CI 稳定前保留）');
+  assert.equal(crypto.createHash('sha256').update(trayBytes).digest('hex'), sha256(trayRepo),
+    '便携包里的托盘 EXE 与仓库中的不是同一份');
+  assert.ok(names.includes('tray/WorkDaddyTray.cs'), '便携包缺托盘源码（用户要能自己重编）');
+  assert.ok(names.includes('tray/build.cmd'), '便携包缺托盘构建脚本');
+
   checkZipLineEndings(portableZip, '便携包');
 
   // ---- 源码包内容 ----

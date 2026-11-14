@@ -112,6 +112,10 @@ jobs:
         shell: bash
         run: node --test test/installer-lifecycle.test.js
 
+      - name: 安装器事务（故障注入）
+        shell: bash
+        run: node test/installer-transaction.test.js
+
       - name: 安装记录与磁盘一致性（失败时留证据）
         if: failure()
         uses: actions/upload-artifact@v4
@@ -150,6 +154,97 @@ jobs:
           path: |
             tmp/pkg-hygiene-*/dist/*.zip
             tmp/pkg-hygiene-*/dist/SHA256SUMS.txt
+          if-no-files-found: warn
+
+  tray-build:
+    # 托盘 EXE 不能再是「某台机器上手工编的黑盒」：
+    # 现编一份，记录编译器版本与参数，跑 --selftest / --status，
+    # 再和仓库里那份已提交的 EXE 比行为、比源码字面量。
+    name: 托盘编译与运行验证
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 编译（记录 csc 版本 / 参数 / 哈希）
+        shell: pwsh
+        run: |
+          ./installer/build-tray.ps1 `
+            -OutputPath tmp/tray/WorkDaddyTray.exe `
+            -ManifestPath tmp/tray/build.json `
+            -Verify `
+            -Json tmp/tray/report.json
+          Get-Content tmp/tray/build.json -Raw -Encoding UTF8
+
+      - name: 与仓库 EXE 对比（行为 + 字面量）
+        shell: bash
+        run: node --test test/tray-build.test.js
+
+      - name: 留档编译产物与清单
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tray-build
+          path: tmp/tray/
+          if-no-files-found: ignore
+
+  setup:
+    # Setup 只能在一次性机器上验证：它会真的装到 %LOCALAPPDATA%\Programs\WorkDaddy。
+    # workflow 的每一台 runner 都是用完就丢的 Windows VM，正好符合要求。
+    # 开发机没有 Inno Setup，这条是 .iss 唯一的编译与真机证据来源。
+    name: Setup 编译 / 静默安装 / 卸载保留数据
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 安装 Inno Setup 6
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'Inno Setup 装完了却找不到 ISCC.exe' }
+          & $iscc /? | Select-Object -First 3
+          "ISCC=$iscc"
+
+      - name: 打包（含 Setup 编译）
+        shell: pwsh
+        run: |
+          ./installer/build-package.ps1 -OutputDirectory tmp/dist -Setup -Json tmp/dist/report.json
+          Get-Content tmp/dist/report.json -Raw -Encoding UTF8
+
+      - name: 真机安装 / 卸载 / 数据保留
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem tmp/dist -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw '没有产出 setup.exe' }
+          ./installer/setup/verify-setup.ps1 -SetupExe $setup.FullName -IAmOnAThrowawayMachine -Json tmp/setup-verify.json
+          Get-Content tmp/setup-verify.json -Raw -Encoding UTF8
+
+      - name: 留档产物与验证报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-dist
+          path: |
+            tmp/dist/*.exe
+            tmp/dist/*.zip
+            tmp/dist/SHA256SUMS.txt
+            tmp/dist/report.json
+            tmp/setup-verify.json
           if-no-files-found: warn
 
   supply-chain:

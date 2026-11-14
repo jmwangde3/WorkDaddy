@@ -1,4 +1,4 @@
-; WorkDaddy Setup（Inno Setup 6）
+﻿; WorkDaddy Setup（Inno Setup 6）
 ;
 ; 定位：**引导器**，不自带第二套安装逻辑。
 ; 它只做三件事：把便携包解到临时目录 → 调 installer\install-workdaddy.ps1 装到本机 → 登记卸载入口。
