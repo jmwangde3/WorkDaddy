@@ -1,0 +1,22 @@
+{
+  "name": "workdaddy-fork",
+  "version": "1.3.0",
+  "private": true,
+  "description": "WorkDaddy 多账号会话接管改造版（本仓库为个人 fork，非上游发布包）",
+  "license": "AGPL-3.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "test": "node test/run-ci.js",
+    "test:raw": "node --test test/",
+    "test:dedupe": "node test/rehome-dedupe.test.js",
+    "test:permission": "node test/permission-guard.test.js",
+    "test:watcher": "node test/rehome-watcher.test.js && node test/rehome-watcher-retry.test.js",
+    "test:deploy": "node test/deploy-safety.test.js",
+    "test:scope": "node test/session-scope.test.js",
+    "test:pin": "node test/session-pin-sync.test.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

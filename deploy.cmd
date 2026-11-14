@@ -2,7 +2,7 @@
 rem ============================================================
 rem  WorkDaddy patch deployer - double click to run.
 rem
-rem  Copies the 12 patched files into your installed WorkDaddy,
+rem  Copies the 16 patched files into your installed WorkDaddy,
 rem  rebinds the panel button, and restarts the daemon.
 rem
 rem  Safe to run repeatedly. Backs up every file it overwrites.

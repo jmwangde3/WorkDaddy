@@ -283,6 +283,65 @@ UPDATE sessions SET deleted_at = ?, updated_at = ?, unread = 0 WHERE id = ?
 
 **边界**：修复前已打开的会话，运行期配置在内存里，DB 改了不即时生效；切会话或重开窗口才吃到。别拿这个当 bug 改 DB，没用。
 
+### 5.13 1.3.0：默认安全化（去重关、权限关、云端不碰）
+
+1.2.80 的守护逻辑有两个结构性问题，1.3.0 一并改掉：
+
+**A. 去重是猜的（P0）**
+
+旧 `dedupeSessions` 的分组条件是「同标题 + 同目录 + **组内存在一对大小相同**」，然后整组只留 `updated_at` 最新的一条。组里只要混进一条无关会话，就会被一起软删。1.3.0 换成 `session-dedupe.js` 四层证据：
+
+1. 文件层：存在 / 可读 / 非空 / 扫描期间未变；
+2. 字节层：整文件 SHA-256 相同；
+3. 消息层：按 JSONL 的 `id`（消息 UUID）比集合与内容，**只去掉每行最外层的** `sessionId` 再哈希（嵌套层同名字段是内容，删掉会掩盖真实差异）；
+4. 包含层：仅 `--containment` 显式开启，A 的消息全在 B 里且无冲突才删 A，保留更完整的 B（不看时间）。
+
+任何不确定 → 保留。写库前三重复验（文件哈希、DB 行 CAS、事务内 changes 校验），失败补偿回滚。每次执行生成 `VACUUM INTO` 备份 + 操作日志，可按日志回滚。
+
+**去重默认关闭**：`rehome-sessions.json` 里必须显式 `"dedupe": true`；自动接管流程已彻底移除去重调用（`dedupe.skipped = manual-only`）。
+
+**B. 权限守卫替用户做授权（P0）**
+
+旧版默认开四层守卫，会自己拨「允许完全访问」、勾风险复选框、按文案批准执行期请求。1.3.0 拆成三个开关，默认全关：
+
+| 开关 | 行为 | 默认 |
+|---|---|---|
+| `preferenceGuard` | 定时还原账号偏好（只碰文件） | 关 |
+| `configRepair` | 切号后补偏好 + 会话 `permission_mode` | 关 |
+| `autoApprove` | 已移除，永远 false | 关 |
+
+页面探针只读（读 `.cr-permission-setting--danger`），不注入点击。`stopPermissionGuards()` / `--off` 真正清掉：主进程定时器、页面旧守卫定时器、已注册 CDP 新文档脚本，并持久化关闭；daemon 重启 / 页面重载 / 切号都不会复活。
+
+**C. 其余默认值**
+
+- `buildTakeoverScope` 默认只接管 `transport='local'`；云端要 `cloudTakeover + cloudVerified` 双开。
+- watcher 改成状态机 + 退避重试（1/2/4/8…上限 60s），`lastConfirmedUid` 只在成功后推进；启动恢复检查默认只读。
+- `deploy.ps1` 原子化：版本比对 → 备份 → 暂存校验哈希 → 替换 → 失败回滚 → 报告；`workbuddy-exe.json` 永不覆盖（已从 git 移除，改由 example 生成）。
+
+排查顺序：`GET /api/rehome/status`（含 transports）→ `GET /api/permission/config` → `%APPDATA%\WorkDaddy\daemon.log` 里的 `[rehome]` / `[permission]` / `[dedupe]`。
+
+### 5.14 1.3.0 复核轮：四处「凭注释相信」改成「凭实测判定」
+
+复核不是加功能，是把上一条里靠假设成立的地方逐条验证，验不过就收紧。
+
+**1. 规范化不能递归删 `sessionId`。** 复制会话改写的只有每行最外层字段；工具调用参数、工具结果里的同名键是内容。递归删 → 两份不同记录同哈希 → 误删。现在只删 `depth===0`。
+
+**2. 同文件重复消息 UUID 必须判为不可用。** 原来 `ok` 没包含 `parsed`，状态位自相矛盾。现在 `error='duplicate-message-ids'` + `ok=false`；但逐字节相同的判定移到 `ok` 之前 —— 字节相同仍是安全证据。
+
+**3. 包含关系要加顺序证据。** A 的消息 id 序列必须是 B 的子序列，否则跳过。时间戳不能当判据（先创建的那条可能是「聊两句就复制走、原件继续聊」）。
+
+**4. 附件/图片两层保护。** 有附属产物（`<id>/`、`<id>.png`）→ 整组保留；引用是相对路径 → 只认字节相同。
+
+**接管范围改为自证**：`assessDeletedSemantics()` 数出实际 `deleted_at` 分布，local 行出现 `-1` / cloud 行出现 `NULL` / 未知 transport → `verified=false` 并列入 `issues`；local 谓词收紧为 `deleted_at IS NULL AND (transport IS NULL OR transport='local')`，异常行永不接管。
+
+**`--dedupe-background` 语义冲突已消解**：写入需要 `--allow-background`（认目标）+ `--apply`（认写入）双开关，否则只读计划或直接拒绝。
+
+**权限停止的可验证边界**：页面侧扩到 timer / MutationObserver / 已登记 listener / 5 个全局对象；CDP identifier 落盘，daemon 重启仍能删；拆到旧守卫时报 `needsReload`，`--reload` 才发 `Page.reload`。CLI 没有 CDP 会话，页面清理要走 daemon 的 `POST /api/permission/off` —— 这个限制写在输出里，不假装全能。
+
+**上游元数据这次是真查的**：`babygoton/WorkDaddy` main = `9b9bad5f4d8cbba36486bca455db6910a1c7b948`（2026-11-13，1.2.22）。实测发现本 fork 的 `daemon.js` 比上游 1.2.22 **小 12021 字节**、`inject.js` 小 7663 字节 —— 补丁基线不是 1.2.22。所以版本号闸门降级为 advisory（只有 `-StrictVersionGate` 阻断），另立**文件代际闸门**：目标文件字节数 == 上游实测字节数 → 拦（这是可测量事实，不是版本推断）。上游已有同名 `session-pin-sync.js`（5723 字节），本 fork 的实现不进部署清单。
+
+**CI 基线改双匹配**：`node --test` 多文件模式输出的失败行不带文件名，只按用例名匹配会让新文件里的同名失败被误判成历史失败。改成逐文件跑、基线 schema 3 存 `{file, name}`。另加三道闸：解析失败数与 TAP `# fail` 不一致 → 退出码 5；总用例数低于基线 → 退出码 4；文件退出非 0 但无失败行 → 退出码 3。
+
 ### 5.10 章节号是契约
 
 `REHOME-README.md` 的 `§` 编号被各文件引用。**改内容可以，别重排编号、别复用已作废的小节号。**

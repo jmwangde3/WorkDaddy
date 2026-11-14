@@ -1,0 +1,130 @@
+name: Tests
+
+# 普通 CI：只读仓库，不发布、不写 Release。
+# 发布流程仍在 build-win.yml（仅 tag / 手动触发，权限另算）。
+on:
+  push:
+    branches: ['main', 'fix/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-tests:
+    name: Node ${{ matrix.node }} on Windows
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.14.0']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: ''
+
+      - name: 环境信息
+        shell: pwsh
+        run: |
+          node -v
+          npm -v
+          $PSVersionTable.PSVersion.ToString()
+          Write-Host "PowerShell 7: $($PSVersionTable.PSVersion.Major)"
+
+      - name: 完整测试（只对新增失败报错）
+        shell: bash
+        run: node test/run-ci.js
+
+      - name: 上传 TAP（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tap-${{ matrix.node }}
+          path: test/last-run.tap
+          if-no-files-found: ignore
+
+  powershell-check:
+    name: PowerShell ${{ matrix.ps }} 语法 / 编码
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ps: '5.1'
+            shell: powershell
+          - ps: '7'
+            shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析全部 .ps1（${{ matrix.ps }}）
+        shell: ${{ matrix.shell }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bad = 0
+          $files = Get-ChildItem -Path . -Filter *.ps1 -Recurse -File
+          foreach ($f in $files) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            if ($errs -and $errs.Count -gt 0) {
+              $bad++
+              Write-Host ("::error file={0}::{1}" -f $f.FullName, $errs[0].Message)
+            }
+          }
+          Write-Host ("已解析 {0} 个脚本，错误 {1} 个" -f $files.Count, $bad)
+          if ($bad -gt 0) { exit 1 }
+
+      - name: UTF-8 BOM / CRLF 检查
+        shell: ${{ matrix.shell }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $issues = 0
+          foreach ($f in Get-ChildItem -Path . -Filter *.ps1 -Recurse -File) {
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+            # 纯 ASCII 脚本不强制 BOM；含中文/非 ASCII 的必须带 BOM，否则 PS 5.1 按 ANSI 解读会乱码。
+            $hasNonAscii = $false
+            foreach ($b in $bytes) { if ($b -gt 127) { $hasNonAscii = $true; break } }
+            if ($hasNonAscii -and -not $hasBom) {
+              Write-Host ("::error file={0}::缺少 UTF-8 BOM（PowerShell 5.1 下中文会乱码）" -f $f.FullName)
+              $issues++
+            }
+          }
+          foreach ($f in Get-ChildItem -Path scripts -Filter *.cmd -File) {
+            $text = [System.IO.File]::ReadAllText($f.FullName)
+            if ($text -notmatch "`r`n") {
+              Write-Host ("::error file={0}::cmd 必须使用 CRLF" -f $f.FullName)
+              $issues++
+            }
+          }
+          if ($issues -gt 0) { exit 1 }
+          Write-Host '编码检查通过'
+
+  node-version-floor:
+    name: node:sqlite 最低版本检查
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.0'
+          cache: ''
+
+      - name: 验证 node:sqlite 无需实验开关
+        shell: bash
+        run: |
+          node -e "const {DatabaseSync}=require('node:sqlite'); const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE t(a)'); console.log('node:sqlite OK without flags');"
+          node test/rehome-dedupe.test.js
+          node test/session-scope.test.js

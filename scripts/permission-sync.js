@@ -1,27 +1,23 @@
 'use strict';
 /**
- * permission-sync.js — 切号后把「允许完全访问」重新落实到位。
+ * permission-sync.js — 「完全访问」相关的**手动**配置修复与守卫（P0 重构版）。
  *
- * 为什么需要它：WorkBuddy 的完全访问不是单一开关，而是三层状态：
- *
+ * 背景：WorkBuddy 的完全访问不是单一开关，而是三层状态：
  *   1. 账号级偏好  storage/user-<uid>-personal/global/preferences.json
  *                  → { "localTaskPermissionMode": "full-access" }
- *                  决定「新会话默认值」与冷启动后的按钮态。
- *   2. 会话级字段  sessions.permission_mode（'fullAccess' / 'bypassPermissions' / 'plan'）
- *                  → 决定「已有会话被打开/恢复时」的按钮态。
- *                  客户端 app.asar 里 WorkbuddyAdapter.getSessionPermissionState()
- *                  直接读这个字段，读不到就默认 bypassPermissions（= 默认沙箱）。
- *   3. 运行时开关  渲染层 useLocalTaskPermissionPreference()，按 `${enterpriseId}:${userId}`
- *                  作用域 hydrate；切号会重载页面、切换作用域，期间可能被
- *                  config.preference.changed 事件用旧值覆盖，于是界面停在默认沙箱。
+ *   2. 会话级字段  sessions.permission_mode（'fullAccess' / 'plan' / …）
+ *   3. 渲染层开关  .cr-permission-setting（页面里的「允许完全访问」）
  *
- * 因此只写第 1 层不够（实测：三个账号的 preferences.json 都写着 full-access，
- * 界面仍可能回落到默认沙箱）。这里三层一起兜：写偏好 → 刷会话字段 → 页面里把开关拨回去。
+ * 旧版本把「补偏好 / 补会话字段 / 页面自动拨开关 / 执行期自动点允许」混在一起，
+ * 并且默认全开 —— 这等于替用户做授权决定。本版本拆成三个独立开关，**默认全部关闭**，
+ * 且永不自动点击「允许完全访问」、永不自动勾选风险确认、永不按弹窗文案批准执行请求。
  *
- * 页面侧动作完全复刻人工操作：
- *   点 .cr-permission-setting → 面板里 input[role=switch] 未开则点开
- *   → 弹出 .wb-modal--conf「确认允许完全访问？」→ 点「允许完全访问」→ 复验 → 收面板。
- * 未开启时关闭开关是静默的，开启时才有确认弹窗 —— 所以脚本只在「未开」时动作。
+ *   开关 A  preferenceGuard —— 定时把被写回默认值的账号偏好还原（只碰文件，不碰页面）。
+ *   开关 B  configRepair    —— 切号后补齐偏好 + 会话 permission_mode（不碰页面）。
+ *   开关 C  autoApprove     —— 保留字段但**不实现**：执行期权限必须由用户本人确认。
+ *
+ * `stopPermissionGuards()` 会真正停掉：主进程定时器、页面里的守卫定时器、
+ * 已注册的 CDP 新文档脚本，并持久化三个开关为关闭；daemon 重启后仍然是关闭。
  */
 
 const fs = require('fs');
@@ -32,6 +28,9 @@ const FULL_ACCESS = 'full-access';
 const CORE_FULL_ACCESS = 'fullAccess';
 const PREF_KEY = 'localTaskPermissionMode';
 const NOT_DELETED = '(deleted_at IS NULL OR deleted_at = -1)';
+const STATE_VERSION = 2;
+
+const SWITCHES = Object.freeze(['preferenceGuard', 'configRepair', 'autoApprove']);
 
 function userPreferencePath(dataRoot, uid) {
   return path.join(dataRoot, 'storage', `user-${uid}-personal`, 'global', 'preferences.json');
@@ -52,10 +51,118 @@ function writeJsonAtomic(file, value) {
   fs.renameSync(tmp, file);
 }
 
+function guardStatePath() {
+  const base = process.env.APPDATA
+    ? path.join(process.env.APPDATA, 'WorkDaddy')
+    : path.join(require('os').homedir(), '.workdaddy');
+  return path.join(base, 'permission-guard.json');
+}
+
+/** 三个开关全部关闭 —— 也是任何异常状态下的兜底值。 */
+function defaultGuardState() {
+  return {
+    version: STATE_VERSION,
+    preferenceGuard: false,
+    configRepair: false,
+    autoApprove: false,
+    // 已注册的 CDP 新文档脚本（identifier 只在注册它的会话里有效，所以必须落盘，
+    // 否则 daemon 重启后再也列不出来、也删不掉，残留脚本会跟着每个新文档跑）。
+    registeredScripts: [],
+    updatedAt: 0,
+  };
+}
+
+function sanitizeScripts(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((e) => e && typeof e === 'object' && typeof e.identifier === 'string' && e.identifier)
+    .map((e) => ({ target: String(e.target || ''), identifier: String(e.identifier), at: Number(e.at || 0) }))
+    .slice(0, 64);
+}
+
 /**
- * 第 1 层：账号级偏好。
- * 只补 `localTaskPermissionMode` 一个键，其余键原样保留（客户端会重写整个文件，
- * 我们不做全量覆盖，避免把主题、语言等键冲掉）。
+ * 读取开关状态。旧版（v1 `{fullAccess:true}`）一律迁移为全关：
+ * 「升级不该继承一个会自动点授权的旧意图」。
+ */
+function readGuardConfig(file) {
+  const target = file || guardStatePath();
+  const raw = readJsonSafe(target);
+  if (!raw || typeof raw !== 'object') return defaultGuardState();
+  if (raw.version !== STATE_VERSION) {
+    const migrated = { ...defaultGuardState(), migration: 'from-v1', updatedAt: Date.now() };
+    try { writeJsonAtomic(target, migrated); } catch (_) {}
+    return migrated;
+  }
+  return {
+    version: STATE_VERSION,
+    preferenceGuard: raw.preferenceGuard === true,
+    configRepair: raw.configRepair === true,
+    autoApprove: false,           // C 永不生效，读取时也强制 false
+    registeredScripts: sanitizeScripts(raw.registeredScripts),
+    updatedAt: Number(raw.updatedAt || 0),
+  };
+}
+
+function writeGuardConfig(patch, file) {
+  const target = file || guardStatePath();
+  const cur = readGuardConfig(target);
+  const next = { ...cur, ...patch, version: STATE_VERSION, updatedAt: Date.now() };
+  next.autoApprove = false;
+  writeJsonAtomic(target, next);
+  return next;
+}
+
+/* ---------------- 运行时资源登记表 ---------------- */
+/* 只登记本模块创建的资源；stop 时只清这些，绝不清页面里的其它定时器。 */
+const registry = {
+  timers: new Set(),
+  scripts: new Map(),       // targetKey -> Set(identifier)
+  lastSend: null,
+  stopped: false,
+};
+
+function registerTimer(timer) {
+  registry.timers.add(timer);
+  return timer;
+}
+
+function clearTimers() {
+  let cleared = 0;
+  for (const timer of registry.timers) {
+    try { clearInterval(timer); cleared += 1; } catch (_) {}
+    try { clearTimeout(timer); } catch (_) {}
+  }
+  registry.timers.clear();
+  return cleared;
+}
+
+/** 记住可用的 CDP 发送函数，供没有显式传 send 的 stop 调用复用。 */
+function rememberSend(send) {
+  if (typeof send === 'function') registry.lastSend = send;
+  return registry.lastSend;
+}
+
+/** 落盘登记一个待清理的 CDP 脚本 identifier（注册成功后调用）。 */
+function rememberScript(target, identifier) {
+  if (!identifier) return;
+  const key = String(target || '');
+  if (!registry.scripts.has(key)) registry.scripts.set(key, new Set());
+  registry.scripts.get(key).add(String(identifier));
+  const cur = readGuardConfig();
+  const list = cur.registeredScripts.filter((e) => e.identifier !== String(identifier));
+  list.push({ target: key, identifier: String(identifier), at: Date.now() });
+  writeGuardConfig({ registeredScripts: list });
+}
+
+function persistedScripts() {
+  try { return readGuardConfig().registeredScripts || []; } catch (_) { return []; }
+}
+
+/* ---------------- 第 1 层：账号偏好 ---------------- */
+
+/**
+ * 只补 `localTaskPermissionMode` 一个键，其余键原样保留。
+ * 仅在开关 B（configRepair）或手动 --apply 时调用。
  */
 function ensurePreference(options) {
   const { dataRoot, uid, log } = options;
@@ -65,7 +172,6 @@ function ensurePreference(options) {
   result.file = file;
   const current = readJsonSafe(file);
   if (current === null) {
-    // 文件不存在或损坏：新建一份只带该键的偏好，客户端会自动补齐其余默认值。
     writeJsonAtomic(file, { [PREF_KEY]: FULL_ACCESS });
     result.changed = true;
     if (log) log(`[permission] 新建账号偏好 ${file}`);
@@ -80,10 +186,11 @@ function ensurePreference(options) {
   return result;
 }
 
+/* ---------------- 第 2 层：会话字段 ---------------- */
+
 /**
- * 第 2 层：会话字段。
  * 只动当前账号、未删除、非后台任务、且不是 plan 模式的会话。
- * plan 是用户显式选的「先规划后执行」，覆盖它会破坏会话语义。
+ * plan 是用户显式选择的「先规划后执行」，覆盖它会破坏会话语义。
  */
 async function ensureSessionModes(options) {
   const { dbPath, uid, log, dryRun = false } = options;
@@ -121,380 +228,179 @@ async function ensureSessionModes(options) {
   return result;
 }
 
+/* ---------------- 第 3 层：页面（只读探针，永不点击） ---------------- */
+
 /**
- * 第 3 层：页面里的开关。
- * 返回一段可在渲染层求值的表达式（IIFE，返回 Promise）。
+ * 只读探针：返回当前页面开关状态。
+ * **不打开面板、不点开关、不勾选风险确认、不点「允许完全访问」。**
+ * 保留这个函数是为了让状态查询能显示「页面当前是不是完全访问」。
  */
 function buildRendererScript() {
   return `(function(){
-  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
-  var q = function (s) { return document.querySelector(s); };
-  var waitFor = async function (fn, timeout, step) {
-    var t0 = Date.now();
-    while (Date.now() - t0 < (timeout || 15000)) {
-      var v = fn();
-      if (v) return v;
-      await sleep(step || 500);
-    }
-    return null;
-  };
-  var closePanel = function () {
-    var b = q('.cr-permission-setting');
-    if (b && q('.cr-permission-panel')) b.click();
-  };
-  var visibleModal = function () {
-    var list = document.querySelectorAll('.wb-modal');
-    for (var i = 0; i < list.length; i++) if (list[i].offsetParent) return list[i];
-    return null;
-  };
-  var dismissModal = function () {
-    var m = visibleModal();
-    if (!m) return;
-    var cancel = Array.prototype.slice.call(m.querySelectorAll('button'))
-      .find(function (b) { return /取消/.test(b.innerText || ''); });
-    if (cancel) cancel.click();
-  };
-  return (async function () {
-    var btn = await waitFor(function () { return q('.cr-permission-setting'); }, 20000, 500);
+  try {
+    var btn = document.querySelector('.cr-permission-setting');
     if (!btn) return { ok: false, status: 'no-permission-button' };
-    if (visibleModal()) return { ok: false, status: 'foreign-modal-open' };
-    var openPanel = async function () {
-      var panel = q('.cr-permission-panel');
-      if (panel) return panel;
-      // 面板有展开动画，且上一次点击可能还在收尾：给三次机会。
-      for (var i = 0; i < 3; i++) {
-        var b = q('.cr-permission-setting');
-        if (!b) return null;
-        b.click();
-        panel = await waitFor(function () { return q('.cr-permission-panel'); }, 1800, 200);
-        if (panel) return panel;
-        await sleep(400);
-      }
-      return null;
-    };
-    var panel0 = await openPanel();
-    if (!panel0) { closePanel(); return { ok: false, status: 'panel-not-open' }; }
-    if (q('.cr-permission-panel__row--on')) { closePanel(); return { ok: true, status: 'already-full-access' }; }
-    var sw = q('.cr-permission-panel input[role=switch]');
-    if (!sw) { closePanel(); return { ok: false, status: 'switch-missing' }; }
-    sw.click();
-    await sleep(600);
-    var modal = await waitFor(visibleModal, 6000, 250);
-    if (modal) {
-      var okBtn = Array.prototype.slice.call(modal.querySelectorAll('button'))
-        .find(function (b) { return /允许完全访问/.test(b.innerText || ''); });
-      if (!okBtn) { dismissModal(); return { ok: false, status: 'confirm-button-missing' }; }
-      // 确认按钮默认 disabled：必须先勾选「我已了解风险，并对自己的数据安全负责」。
-      if (okBtn.disabled) {
-        var risk = modal.querySelector('input[type=checkbox]');
-        if (!risk) { dismissModal(); return { ok: false, status: 'risk-checkbox-missing' }; }
-        risk.click();
-        await waitFor(function () { return !okBtn.disabled; }, 2000, 100);
-      }
-      if (okBtn.disabled) { dismissModal(); return { ok: false, status: 'confirm-still-disabled' }; }
-      okBtn.click();
-      await sleep(1400);
-    }
-    closePanel();
-    await sleep(400);
-    // 复验：重新开面板读开关态，再收起。开不出来不算失败——确认按钮已经点过了。
-    var panel1 = await openPanel();
-    if (!panel1) return { ok: true, status: modal ? 'enabled-unverified' : 'unknown-unverified' };
-    var on = !!q('.cr-permission-panel__row--on');
-    closePanel();
-    return { ok: on, status: on ? (modal ? 'enabled' : 'enabled-without-modal') : 'still-off' };
-  })();
+    var on = /cr-permission-setting--danger/.test(String(btn.className || ''));
+    return { ok: on, status: on ? 'full-access' : 'sandbox' };
+  } catch (e) {
+    return { ok: false, status: 'probe-error', error: String(e && e.message || e) };
+  }
 })()`;
 }
 
 /**
- * 第 4 层：常驻守卫。
- *
- * 为什么还要它：前三层都是一次性的，而「完全访问」随时会被写回默认值 ——
- * 关闭开关是静默的且会立刻把账号偏好改成 default-sandbox（实测 15:25:06），
- * 页面重载 / 切号 / 新建会话都可能触发。一次性补完，下一秒又掉了。
- *
- * 所以注入一个常驻脚本（Page.addScriptToEvaluateOnNewDocument，重载后自动重跑）：
- *   - 每 2.5s 读一次按钮态（--danger 类名即已开启，不用开面板）；
- *   - 掉了就复刻人工操作拨回去；
- *   - 顺手接管执行期的权限弹窗（勾选 + 允许），这才是「完全访问失效」的直接观感。
+ * 兼容旧调用：以前这里会注入一个会自动拨开关、自动点允许的常驻守卫。
+ * 现在只做清理 —— 把页面里可能残留的旧守卫停掉，然后什么都不装。
  */
-function wdPermGuard(opts) {
-  opts = opts || {};
-  var VERSION = 4;
-  if (window.__wdPermGuard && window.__wdPermGuard.version >= VERSION) return;
-
-  var G = window.__wdPermGuard || {};
-  G.version = VERSION;
-  G.runs = 0;
-  G.enables = 0;
-  G.approvals = 0;
-  G.busy = false;
-  G.lastResult = 'init';
-  G.log = [];
-  G.enabled = true;
-  window.__wdPermGuard = G;
-
-  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
-  var q = function (s) { try { return document.querySelector(s); } catch (e) { return null; } };
-  var say = function (m) {
-    try {
-      G.log.push(new Date().toISOString().slice(11, 19) + ' ' + m);
-      if (G.log.length > 60) G.log.shift();
-    } catch (e) {}
-  };
-  var btnOf = function () { return q('.cr-permission-setting'); };
-  var isOn = function () {
-    var b = btnOf();
-    return !!(b && /cr-permission-setting--danger/.test(String(b.className)));
-  };
-  var visibleModal = function () {
-    var list = document.querySelectorAll('.wb-modal');
-    for (var i = 0; i < list.length; i++) if (list[i].offsetParent) return list[i];
-    return null;
-  };
-  var closePanel = function () {
-    var b = btnOf();
-    if (b && q('.cr-permission-panel')) b.click();
-  };
-  var waitFor = async function (fn, timeout, step) {
-    var t0 = Date.now();
-    while (Date.now() - t0 < (timeout || 8000)) {
-      var v = null;
-      try { v = fn(); } catch (e) {}
-      if (v) return v;
-      await sleep(step || 200);
-    }
-    return null;
-  };
-
-  var enable = async function () {
-    if (G.busy) return 'busy';
-    if (visibleModal()) return 'modal-open';
-    var b = btnOf();
-    if (!b) return 'no-button';
-    G.busy = true;
-    try {
-      var panel = q('.cr-permission-panel');
-      if (!panel) {
-        b.click();
-        panel = await waitFor(function () { return q('.cr-permission-panel'); }, 2200, 150);
-        if (!panel) {
-          b.click();
-          panel = await waitFor(function () { return q('.cr-permission-panel'); }, 2200, 150);
-        }
-      }
-      if (!panel) { closePanel(); return 'panel-not-open'; }
-      if (q('.cr-permission-panel__row--on')) { closePanel(); return 'already'; }
-      var sw = panel.querySelector('input[role=switch]');
-      if (!sw) { closePanel(); return 'switch-missing'; }
-      sw.click();
-      await sleep(500);
-      var modal = visibleModal();
-      if (modal) {
-        var ok = null;
-        var list = modal.querySelectorAll('button');
-        for (var i = 0; i < list.length; i++) {
-          if (/允许完全访问/.test(String(list[i].innerText || ''))) ok = list[i];
-        }
-        if (ok) {
-          if (ok.disabled) {
-            var cb = modal.querySelector('input[type=checkbox]');
-            if (cb) {
-              cb.click();
-              await waitFor(function () { return !ok.disabled; }, 2000, 100);
-            }
-          }
-          if (!ok.disabled) {
-            ok.click();
-            await sleep(1100);
-          }
-        }
-      }
-      var on = await waitFor(function () { return isOn() ? true : null; }, 2500, 150);
-      closePanel();
-      return on ? 'enabled' : 'still-off';
-    } finally {
-      G.busy = false;
-    }
-  };
-
-  // 执行期的权限弹窗（「是否允许执行 …」）。只在文案明确是授权类时点允许，
-  // 删除 / 覆盖 / 重置类一律不代点，避免替用户做破坏性决定。
-  var ALLOW_TEXT = /^(允许|允许一次|本次允许|本会话允许|始终允许|同意|批准|允许执行)$/;
-  var DENY_TEXT = /删除|覆盖|清空|重置|卸载|格式化/;
-  var APPROVE_HINT = /(权限|授权|批准|请求|访问|执行|运行|工具|命令|文件|文件夹|终端)/;
-  var inPermissionPanel = function (el) {
-    var n = el;
-    while (n && n !== document.body) {
-      var c = String(n.className || '');
-      if (/cr-permission-panel|cr-permission-setting|cr-permission-confirm/.test(c)) return true;
-      n = n.parentElement;
-    }
-    return false;
-  };
-  var clickAllowIn = function (root, scopeText) {
-    var list = root.querySelectorAll('button');
-    for (var i = 0; i < list.length; i++) {
-      var b = list[i];
-      if (!b.offsetParent) continue;
-      var t = String(b.innerText || '').trim();
-      if (!t || t.length > 10 || !ALLOW_TEXT.test(t)) continue;
-      if (b.disabled) continue;
-      if (inPermissionPanel(b)) continue;
-      b.click();
-      G.approvals += 1;
-      say('auto-approve: ' + t + ' | ' + String(scopeText || '').slice(0, 60));
-      return true;
-    }
-    return false;
-  };
-  var approve = function () {
-    if (opts.autoApprove === false) return false;
-    // 1) 弹窗形态
-    var m = visibleModal();
-    if (m) {
-      var mtxt = String(m.innerText || '').replace(/\s+/g, ' ');
-      if (!/允许完全访问/.test(mtxt) && !DENY_TEXT.test(mtxt) && APPROVE_HINT.test(mtxt)) {
-        if (clickAllowIn(m, mtxt)) return true;
-      }
-    }
-    // 2) 行内卡片形态（时间线里的审批卡）
-    var cards = document.querySelectorAll('[class*=approval],[class*=permission-request],[class*=tool-approval]');
-    for (var i = 0; i < cards.length; i++) {
-      var c = cards[i];
-      if (!c.offsetParent) continue;
-      var txt = String(c.innerText || '').replace(/\s+/g, ' ');
-      if (!txt || DENY_TEXT.test(txt)) continue;
-      if (/允许完全访问/.test(txt)) continue;
-      if (!APPROVE_HINT.test(txt)) continue;
-      if (clickAllowIn(c, txt)) return true;
-    }
-    return false;
-  };
-
-  var tick = async function () {
-    if (!G.enabled || G.busy) return;
-    G.runs += 1;
-    try { if (approve()) return; } catch (e) {}
-    if (!btnOf()) { G.lastResult = 'no-button'; return; }
-    if (isOn()) { G.lastResult = 'on'; return; }
-    var r = await enable();
-    G.lastResult = r;
-    if (r === 'enabled' || r === 'already') G.enables += 1;
-  };
-
-  G.probe = function () {
-    return {
-      version: VERSION,
-      on: isOn(),
-      runs: G.runs,
-      enables: G.enables,
-      approvals: G.approvals,
-      last: G.lastResult,
-      log: G.log.slice(-8),
-    };
-  };
-  G.stop = function () { G.enabled = false; G.lastResult = 'stopped'; };
-  G.start = function () { G.enabled = true; };
-  G.forceEnable = function () { return enable(); };
-
-  if (G.timer) { try { clearInterval(G.timer); } catch (e) {} }
-  var period = Math.max(1200, Number(opts.intervalMs) || 2500);
-  G.timer = setInterval(function () { tick().catch(function () {}); }, period);
-  setTimeout(function () { tick().catch(function () {}); }, 1200);
-  document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) setTimeout(function () { tick().catch(function () {}); }, 400);
-  });
-  window.addEventListener('focus', function () {
-    setTimeout(function () { tick().catch(function () {}); }, 400);
-  });
-}
-
-/** 常驻守卫源码（字符串），交给 Page.addScriptToEvaluateOnNewDocument / Runtime.evaluate。 */
-function buildGuardSource(options = {}) {
-  return '(' + wdPermGuard.toString() + ')(' + JSON.stringify({
-    intervalMs: options.intervalMs || 2500,
-    autoApprove: options.autoApprove !== false,
-  }) + ');';
+async function installRendererGuard(send, log) {
+  if (typeof send !== 'function') return { ok: false, error: 'no-cdp' };
+  const cleaned = await stopRendererGuard(send);
+  if (log) log(`[permission] 渲染层守卫已停用（策略：不自动点击）cleaned=${cleaned.pageStopped}`);
+  return { ok: true, registered: false, evaluated: false, disabledByPolicy: true, cleaned };
 }
 
 /**
- * 装上常驻守卫：先注册到新文档（页面重载后自动重跑），再对当前文档求值一次。
- * `send` 是 daemon 的 cdpSend。
+ * 拆除页面里的旧守卫。
+ *
+ * CDP 的 `Page.addScriptToEvaluateOnNewDocument` 没有「列出已注册脚本」的接口，
+ * identifier 只有注册方知道 —— 所以这里同时清理**内存登记**与**落盘登记**，
+ * 覆盖「daemon 重启后仍能删掉上次注册的脚本」。
+ *
+ * 页面内清理是尽力而为：旧版守卫的定时器 / MutationObserver / 事件监听器结构
+ * 没有文档，只能按已知字段名逐个拆，拆不掉的用 `needsReload` 明确报出来，
+ * 由调用方决定要不要 `Page.reload`（`reload: true` 会在拆除后真的重载）。
  */
-async function installRendererGuard(send, log, options = {}) {
-  if (typeof send !== 'function') return { ok: false, error: 'no-cdp' };
-  const source = buildGuardSource(options);
-  const out = { ok: true, registered: false, evaluated: false };
-  try {
-    await send('Page.addScriptToEvaluateOnNewDocument', { source });
-    out.registered = true;
-  } catch (error) {
-    out.registered = false;
-    out.registerError = error.message;
+async function stopRendererGuard(send, options = {}) {
+  const out = {
+    removed: 0, persistedRemoved: 0, pageStopped: false,
+    globalsRemoved: 0, observersDisconnected: 0, listenersRemoved: 0,
+    needsReload: false, reloaded: false, errors: [],
+  };
+  const target = typeof send === 'function' ? send : registry.lastSend;
+  if (typeof target !== 'function') { out.errors.push('no-cdp-sender'); return out; }
+
+  // 1) 内存里登记的 identifier
+  for (const [targetKey, ids] of registry.scripts) {
+    for (const identifier of ids) {
+      try {
+        await target('Page.removeScriptToEvaluateOnNewDocument', { identifier });
+        out.removed += 1;
+      } catch (error) {
+        out.errors.push(`${targetKey}:${error.message}`);
+      }
+    }
   }
-  try {
-    const r = await send('Runtime.evaluate', { expression: source, returnByValue: true });
-    const value = r && r.result && r.result.value;
-    out.evaluated = !(r && r.exceptionDetails);
-    out.value = value || null;
-  } catch (error) {
-    out.evaluated = false;
-    out.evalError = error.message;
+  registry.scripts.clear();
+
+  // 2) 落盘的 identifier（上次 daemon 进程注册的）
+  const persisted = persistedScripts();
+  for (const entry of persisted) {
+    try {
+      await target('Page.removeScriptToEvaluateOnNewDocument', { identifier: entry.identifier });
+      out.persistedRemoved += 1;
+    } catch (error) {
+      out.errors.push(`persisted:${entry.identifier}:${error.message}`);
+    }
   }
-  if (log) log(`[permission] 守卫注入 registered=${out.registered} evaluated=${out.evaluated}` +
-    (out.registerError || out.evalError ? ` err=${out.registerError || out.evalError}` : ''));
+  if (persisted.length) writeGuardConfig({ registeredScripts: [] });
+
+  // 3) 页面内残留
+  try {
+    const r = await target('Runtime.evaluate', {
+      expression: `(function(){
+  var out = { found:false, timer:false, observers:0, listeners:0, globals:0 };
+  var g = window.__wdPermGuard;
+  if (g && typeof g === 'object') {
+    out.found = true;
+    try { if (g.timer) { clearInterval(g.timer); clearTimeout(g.timer); out.timer = true; } } catch (e) {}
+    var obs = [g.observer, g.mutationObserver, g.mo];
+    for (var i = 0; i < obs.length; i++) {
+      try { if (obs[i] && typeof obs[i].disconnect === 'function') { obs[i].disconnect(); out.observers++; } } catch (e) {}
+    }
+    try {
+      var hs = g.handlers || g.listeners || {};
+      for (var k in hs) {
+        var fn = hs[k];
+        if (typeof fn !== 'function') continue;
+        var parts = String(k).split('|');
+        var el = parts[0] === 'document' ? document : (parts[0] === 'window' ? window : (parts[0] === 'body' ? document.body : null));
+        if (!el || !parts[1]) continue;
+        try { el.removeEventListener(parts[1], fn, true); } catch (e) {}
+        try { el.removeEventListener(parts[1], fn, false); } catch (e) {}
+        out.listeners++;
+      }
+    } catch (e) {}
+    try {
+      var one = g.listener;
+      if (one && one.el && one.type && one.fn) { one.el.removeEventListener(one.type, one.fn); out.listeners++; }
+    } catch (e) {}
+    try { g.enabled = false; g.lastResult = 'stopped'; } catch (e) {}
+  }
+  var names = ['__wdPermGuard','__wdPermGuardInstalled','__wdPermGuardVersion','__wdPermAutoApprove','__wdPermTimer'];
+  for (var n = 0; n < names.length; n++) {
+    try { if (names[n] in window) { delete window[names[n]]; out.globals++; } } catch (e) {}
+  }
+  return out;
+})()`,
+      returnByValue: true,
+    });
+    const v = (r && r.result && r.result.value) || null;
+    if (v) {
+      out.pageStopped = !!v.found;
+      out.globalsRemoved = Number(v.globals || 0);
+      out.observersDisconnected = Number(v.observers || 0);
+      out.listenersRemoved = Number(v.listeners || 0);
+      // 旧守卫存在过 = 结构未知的监听器可能还在；只有重载能给出确定答案。
+      out.needsReload = !!v.found;
+    }
+  } catch (error) {
+    out.errors.push(`eval:${error.message}`);
+  }
+
+  if (out.needsReload && options.reload === true) {
+    try { await target('Page.reload', { ignoreCache: false }); out.reloaded = true; } catch (error) {
+      out.errors.push(`reload:${error.message}`);
+    }
+  }
   return out;
 }
 
-/** 读取守卫运行状态（页面里没有守卫返回 null）。 */
+/** 读取页面状态（只读）。顺带记住可用的 CDP 发送函数。 */
 async function readGuardState(send) {
   if (typeof send !== 'function') return null;
+  rememberSend(send);
   try {
-    const r = await send('Runtime.evaluate', {
-      expression: '(window.__wdPermGuard && window.__wdPermGuard.probe) ? window.__wdPermGuard.probe() : null',
-      returnByValue: true,
-    });
+    const r = await send('Runtime.evaluate', { expression: buildRendererScript(), returnByValue: true });
     return (r && r.result && r.result.value) || null;
   } catch (_) {
     return null;
   }
 }
 
-/* ---- 偏好文件守卫：账号偏好在任何时刻被写回默认值都还原 ---- */
-
-function guardIntentPath() {
-  const base = process.env.APPDATA
-    ? path.join(process.env.APPDATA, 'WorkDaddy')
-    : path.join(require('os').homedir(), '.workdaddy');
-  return path.join(base, 'permission-guard.json');
-}
-
-function readGuardIntent() {
-  const v = readJsonSafe(guardIntentPath());
-  if (!v || typeof v !== 'object') return { fullAccess: true };
-  return { fullAccess: v.fullAccess !== false };
-}
-
-function setGuardIntent(fullAccess) {
-  writeJsonAtomic(guardIntentPath(), { fullAccess: !!fullAccess, updatedAt: Date.now() });
-  return readGuardIntent();
-}
+/* ---------------- 第 4 层：偏好守卫（开关 A） ---------------- */
 
 /**
  * 每 intervalMs 扫一遍所有账号偏好；发现不是 full-access 就写回。
- * 只碰 `localTaskPermissionMode` 一个键。意图文件里 fullAccess=false 时完全不动作。
+ * 仅当开关 A 打开时启动；stop() 只清本模块登记的定时器。
  */
 function startPreferenceGuard(options = {}) {
   const { dataRoot, log, intervalMs = 3000 } = options;
   if (!dataRoot) return { stop() {}, stats: () => ({ ok: false, error: 'no-dataRoot' }) };
-  const stats = { checks: 0, restores: 0, lastRestore: null, lastError: null };
+  const cfg = readGuardConfig();
+  const stats = { checks: 0, restores: 0, lastRestore: null, lastError: null, enabled: cfg.preferenceGuard };
+  if (!cfg.preferenceGuard) {
+    return {
+      stop() {},
+      check() {},
+      stats: () => ({ ...stats, running: false, intent: cfg }),
+    };
+  }
+  registry.stopped = false;
   let stopped = false;
 
   const run = () => {
-    if (stopped) return;
-    if (!readGuardIntent().fullAccess) return;
+    if (stopped || registry.stopped) return;
+    if (!readGuardConfig().preferenceGuard) return;
     stats.checks += 1;
     let uids = [];
     try { uids = listAccountUids(dataRoot); } catch (error) { stats.lastError = error.message; return; }
@@ -516,20 +422,100 @@ function startPreferenceGuard(options = {}) {
     }
   };
 
-  const timer = setInterval(run, Math.max(800, intervalMs));
-  setTimeout(run, 500);
+  const timer = registerTimer(setInterval(run, Math.max(800, intervalMs)));
+  const kick = setTimeout(run, 500);
+  if (kick.unref) kick.unref();
   return {
-    stop() { stopped = true; clearInterval(timer); },
+    stop() {
+      stopped = true;
+      try { clearInterval(timer); } catch (_) {}
+      registry.timers.delete(timer);
+    },
     check: run,
-    stats: () => ({ ...stats, running: !stopped, intent: readGuardIntent() }),
+    stats: () => ({ ...stats, running: !stopped && !registry.stopped, intent: readGuardConfig() }),
   };
 }
 
+/* ---------------- 统一停止 ---------------- */
+
 /**
- * 三层一起跑。`send` 是 daemon 的 cdpSend；不给就只做前两层（离线/命令行模式）。
+ * 真正停掉全部守卫：
+ *   1. 主进程定时器（只清本模块登记的，不动别的模块）
+ *   2. 页面里的旧守卫：定时器、MutationObserver、已登记的事件监听器、全局对象
+ *   3. 已注册的 CDP 新文档脚本（内存登记 + 落盘登记，覆盖重启后残留）
+ *   4. 持久化三个开关为关闭
+ * `reload: true` 会在发现旧守卫后重载页面，保证未知结构的监听器彻底消失。
+ * 重复调用安全（幂等）。
+ */
+async function stopPermissionGuards(options = {}) {
+  const { send, log, persist = true, reload = false } = options;
+  registry.stopped = true;
+  const timers = clearTimers();
+  const page = await stopRendererGuard(send || registry.lastSend, { reload });
+  if (persist) writeGuardConfig({ preferenceGuard: false, configRepair: false, autoApprove: false, registeredScripts: [] });
+  if (log) {
+    log(`[permission] 已停止全部守卫 timers=${timers} scripts=${page.removed}+${page.persistedRemoved} ` +
+      `globals=${page.globalsRemoved} observers=${page.observersDisconnected} listeners=${page.listenersRemoved} ` +
+      `reload=${page.reloaded}`);
+  }
+  return {
+    ok: page.errors.length === 0,
+    timersStopped: timers,
+    scriptsRemoved: page.removed + page.persistedRemoved,
+    pageStopped: page.pageStopped,
+    globalsRemoved: page.globalsRemoved,
+    observersDisconnected: page.observersDisconnected,
+    listenersRemoved: page.listenersRemoved,
+    needsReload: page.needsReload,
+    reloaded: page.reloaded,
+    errors: page.errors,
+    state: readGuardConfig(),
+  };
+}
+
+/** 切换单个开关。开启时解除 stopped 标记；C 永远拒绝开启。 */
+function setGuardSwitch(name, enabled, options = {}) {
+  if (!SWITCHES.includes(name)) throw new Error(`未知开关: ${name}`);
+  if (name === 'autoApprove' && enabled) {
+    throw new Error('autoApprove 已按策略移除：执行期权限必须由用户本人确认');
+  }
+  const next = writeGuardConfig({ [name]: !!enabled }, options.file);
+  if (enabled) registry.stopped = false;
+  return next;
+}
+
+/** 完整状态：三个开关 + 运行中的定时器数 + 已注册脚本 id（内存 + 落盘）。 */
+async function getPermissionStatus(options = {}) {
+  const cfg = readGuardConfig(options.file);
+  const page = options.send ? await readGuardState(options.send) : null;
+  const registeredScriptIds = [];
+  for (const ids of registry.scripts.values()) registeredScriptIds.push(...ids);
+  for (const entry of cfg.registeredScripts) {
+    if (!registeredScriptIds.includes(entry.identifier)) registeredScriptIds.push(entry.identifier);
+  }
+  return {
+    preferenceGuardEnabled: cfg.preferenceGuard,
+    rendererGuardEnabled: false,        // 渲染层自动动作已移除
+    autoApproveEnabled: false,          // C 永不生效
+    configRepairEnabled: cfg.configRepair,
+    activeTimerCount: registry.timers.size,
+    registeredScriptIds,
+    persistedScriptCount: cfg.registeredScripts.length,
+    pageGuard: page,
+    pageGuardPresent: !!(page && page.status && page.status !== 'no-permission-button'),
+    stopped: registry.stopped,
+    statePath: options.file || guardStatePath(),
+  };
+}
+
+/* ---------------- 组合入口 ---------------- */
+
+/**
+ * 补齐偏好 + 会话字段（开关 B 的动作）。**不碰页面。**
+ * 手动 `--apply` 也走这里。
  */
 async function applyFullAccess(options) {
-  const { dataRoot, dbPath, uid, send, log, renderer = true, delayMs = 0 } = options || {};
+  const { dataRoot, dbPath, uid, log, delayMs = 0 } = options || {};
   const report = { ok: true, uid: uid || '', preference: null, sessions: null, renderer: null };
   if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
   try {
@@ -545,25 +531,10 @@ async function applyFullAccess(options) {
     report.sessions = { ok: false, error: error.message };
     report.ok = false;
   }
-  if (renderer && typeof send === 'function') {
-    try {
-      const r = await send('Runtime.evaluate', {
-        expression: buildRendererScript(),
-        returnByValue: true,
-        awaitPromise: true,
-      });
-      const value = r && r.result && r.result.value;
-      report.renderer = value || { ok: false, status: 'no-result', raw: r && r.exceptionDetails ? String(r.exceptionDetails.text || '') : '' };
-      if (!report.renderer.ok) report.ok = false;
-    } catch (error) {
-      report.renderer = { ok: false, status: 'cdp-error', error: error.message };
-      report.ok = false;
-    }
-  }
+  report.renderer = { ok: false, status: 'disabled-by-policy' };
   if (log) {
-    const r = report.renderer ? `ui=${report.renderer.status}` : 'ui=skipped';
     log(`[permission] uid=${uid || '-'} pref=${report.preference && report.preference.changed ? 'fixed' : 'ok'} ` +
-      `db=${report.sessions && typeof report.sessions.changes === 'number' ? report.sessions.changes : '-'} ${r}`);
+      `db=${report.sessions && typeof report.sessions.changes === 'number' ? report.sessions.changes : '-'} ui=untouched`);
   }
   return report;
 }
@@ -600,21 +571,53 @@ async function cli(argv) {
   const all = argv.includes('--all');
   const uidArg = (argv.find((a) => /^--uid=/.test(a)) || '').replace('--uid=', '');
 
-  if (argv.includes('--on') || argv.includes('--off')) {
-    const on = argv.includes('--on');
-    setGuardIntent(on);
-    if (on) {
-      for (const uid of listAccountUids(dataRoot)) {
-        ensurePreference({ dataRoot, uid, log: (m) => process.stdout.write(m + '\n') });
-      }
+  if (argv.includes('--off')) {
+    const out = await stopPermissionGuards({
+      log: json ? null : (m) => process.stdout.write(m + '\n'),
+      reload: argv.includes('--reload'),
+    });
+    if (json) {
+      process.stdout.write(JSON.stringify(out, null, 2) + '\n');
+      return 0;
     }
-    process.stdout.write(`守卫意图已设为 ${on ? 'full-access（持续还原）' : 'default（不再还原）'} → ${guardIntentPath()}\n`);
+    process.stdout.write(
+      `持久化开关已关闭：preferenceGuard=false configRepair=false autoApprove=false\n` +
+      `主进程定时器清理: ${out.timersStopped}   CDP 脚本清理: ${out.scriptsRemoved}   ` +
+      `页面全局对象: ${out.globalsRemoved}   observer: ${out.observersDisconnected}   listener: ${out.listenersRemoved}\n`
+    );
+    if (!out.pageStopped) {
+      process.stdout.write(
+        '提示：CLI 进程没有 CDP 会话，页面内的旧守卫无法在这里拆除。\n' +
+        '      要清页面请走 daemon 的 POST /api/permission/off（带 CDP），或重启客户端。\n'
+      );
+    } else if (out.needsReload && !out.reloaded) {
+      process.stdout.write('提示：检测到旧守卫残留，加 --reload 可强制重载页面彻底清掉监听器。\n');
+    }
+    return 0;
+  }
+
+  if (argv.includes('--on')) {
+    const name = argv.includes('--preference-guard') ? 'preferenceGuard'
+      : (argv.includes('--config-repair') ? 'configRepair' : null);
+    if (!name) {
+      process.stdout.write('开启需要指定开关：--preference-guard 或 --config-repair\n');
+      return 1;
+    }
+    setGuardSwitch(name, true);
+    process.stdout.write(`已开启 ${name}\n`);
+    return 0;
+  }
+
+  if (argv.includes('--status')) {
+    const status = await getPermissionStatus();
+    process.stdout.write(JSON.stringify(status, null, 2) + '\n');
     return 0;
   }
 
   if (!apply) {
     const uids = listAccountUids(dataRoot);
     const rows = [];
+    const cfg = readGuardConfig();
     for (const uid of uids) {
       const file = userPreferencePath(dataRoot, uid);
       const pref = readJsonSafe(file);
@@ -630,8 +633,10 @@ async function cli(argv) {
       } catch (_) {}
       rows.push({ uid, preference: pref ? (pref[PREF_KEY] ?? null) : '(无文件)', sessionsNeedFix: sessions });
     }
-    if (json) process.stdout.write(JSON.stringify({ dataRoot, dbPath, accounts: rows }, null, 2) + '\n');
-    else {
+    if (json) {
+      process.stdout.write(JSON.stringify({ dataRoot, dbPath, switches: cfg, accounts: rows }, null, 2) + '\n');
+    } else {
+      process.stdout.write(`开关: preferenceGuard=${cfg.preferenceGuard} configRepair=${cfg.configRepair} autoApprove=false\n`);
       process.stdout.write(`会话库: ${dbPath}\n`);
       for (const r of rows) {
         process.stdout.write(`  ${r.uid}  偏好=${r.preference}  待修会话=${r.sessionsNeedFix}\n`);
@@ -640,11 +645,12 @@ async function cli(argv) {
     return 0;
   }
 
+  // --apply 属于开关 B 的手动动作；不会碰页面。
   const uids = all ? listAccountUids(dataRoot) : (uidArg ? [uidArg] : listAccountUids(dataRoot));
   let failed = 0;
   for (const uid of uids) {
     const report = await applyFullAccess({
-      dataRoot, dbPath, uid, renderer: false,
+      dataRoot, dbPath, uid,
       log: json ? null : (m) => process.stdout.write(m + '\n'),
     });
     if (!report.ok) failed++;
@@ -656,18 +662,26 @@ async function cli(argv) {
 module.exports = {
   applyFullAccess,
   buildRendererScript,
-  buildGuardSource,
   installRendererGuard,
+  stopRendererGuard,
   readGuardState,
+  rememberSend,
+  rememberScript,
+  persistedScripts,
   startPreferenceGuard,
-  readGuardIntent,
-  setGuardIntent,
-  guardIntentPath,
+  stopPermissionGuards,
+  setGuardSwitch,
+  getPermissionStatus,
+  readGuardConfig,
+  writeGuardConfig,
+  guardStatePath,
+  defaultGuardState,
   ensurePreference,
   ensureSessionModes,
   listAccountUids,
   userPreferencePath,
   readJsonSafe,
+  SWITCHES,
   FULL_ACCESS,
   CORE_FULL_ACCESS,
   PREF_KEY,

@@ -1,0 +1,431 @@
+{
+  "schema": 3,
+  "note": "CI 基线：按「文件 + 用例名」双匹配。这些失败在本次改造前就存在（环境/平台相关），不阻塞 CI；新增失败仍会报错。",
+  "generatedAt": "2026-11-14T08:56:10.726Z",
+  "node": "v22.14.0",
+  "platform": "win32",
+  "counts": {
+    "tests": 1611,
+    "pass": 1547,
+    "fail": 57,
+    "skipped": 7,
+    "scenarios": 14,
+    "files": 184
+  },
+  "fileTests": {
+    "account-credit-cache.test.js": 2,
+    "account-identity.test.js": 6,
+    "account-import-clipboard.test.js": 7,
+    "account-list-stability.test.js": 16,
+    "account-order.test.js": 4,
+    "account-snapshot-reload.test.js": 14,
+    "account-sort.test.js": 1,
+    "account-switch-session-rules.test.js": 12,
+    "activity-refresh.test.js": 7,
+    "agent-create-dialog.test.js": 2,
+    "agent-new-task-draft.test.js": 13,
+    "app-icon.test.js": 6,
+    "atomic-file-write.test.js": 2,
+    "auth-discovery.test.js": 27,
+    "auto-continue.test.js": 1,
+    "auto-copy-rules.test.js": 27,
+    "automation-account-sync.test.js": 3,
+    "automation-calendar.test.js": 9,
+    "automation-cards-streak.test.js": 8,
+    "automation-checkin.test.js": 15,
+    "automation-contract.test.js": 9,
+    "automation-discovery.test.js": 10,
+    "automation-likes.test.js": 2,
+    "automation-model.test.js": 9,
+    "automation-new-task-readiness.test.js": 6,
+    "automation-packages.test.js": 17,
+    "automation-panel-input.test.js": 4,
+    "automation-popup-dismiss.test.js": 17,
+    "automation-preset-distribution.test.js": 1,
+    "automation-runtime.test.js": 8,
+    "automation-safety-review.test.js": 3,
+    "automation-switch-sync.test.js": 12,
+    "automation-transfer.test.js": 10,
+    "automation-ui-copy.test.js": 2,
+    "automation-v2.test.js": 3,
+    "automation-v3.test.js": 3,
+    "automation-workspace-binding.test.js": 13,
+    "automation.test.js": 21,
+    "avatar-automation-stop.test.js": 3,
+    "avatar-library-credit-opacity.test.js": 4,
+    "builtin-wallpaper.test.js": 6,
+    "cdp-click-api.test.js": 2,
+    "cdp-custom-target.test.js": 4,
+    "cdp-focus-diagnostics.test.js": 2,
+    "cdp-targets.test.js": 15,
+    "checkin-result.test.js": 3,
+    "checkin-schedule.test.js": 2,
+    "client-debug-relaunch.test.js": 10,
+    "client-launch-settings.test.js": 5,
+    "codebuddy-badge-contrast.test.js": 2,
+    "codebuddy-compat.test.js": 17,
+    "codebuddy-files.test.js": 13,
+    "codebuddy-ide-credits.test.js": 7,
+    "codebuddy-ide-recovery.test.js": 7,
+    "codebuddy-native-recovery.test.js": 5,
+    "codebuddy-native.test.js": 7,
+    "codebuddy-session-store.test.js": 4,
+    "completion-report.test.js": 6,
+    "composer-button-visibility.test.js": 12,
+    "conversation-usage.test.js": 7,
+    "credit-history-sync.test.js": 14,
+    "credit-request-usage.test.js": 6,
+    "credit-rotation.test.js": 7,
+    "credit-segments.test.js": 14,
+    "credit-summary.test.js": 3,
+    "credit-usage-store.test.js": 7,
+    "credits-401.test.js": 2,
+    "daemon-status-nonblocking.test.js": 11,
+    "deploy-safety.test.js": 1,
+    "element-inspector.test.js": 13,
+    "enterprise-target.test.js": 15,
+    "fab-quiet-mode.test.js": 5,
+    "growth-active.test.js": 10,
+    "growth-credit-refresh.test.js": 4,
+    "growth-daily.test.js": 17,
+    "growth-rings-ui.test.js": 23,
+    "i18n-coverage.test.js": 11,
+    "i18n.test.js": 4,
+    "linux-daemon-process.test.js": 2,
+    "linux-paths.test.js": 9,
+    "linux-release-script.test.js": 6,
+    "logout-route.test.js": 2,
+    "macos-dmg-layout.test.js": 7,
+    "macos-dock-identity.test.js": 1,
+    "macos-launch-services.test.js": 4,
+    "macos-launcher-nounset.test.js": 1,
+    "macos-runtime-dependencies.test.js": 1,
+    "message-navigation-removal.test.js": 3,
+    "message-navigation.test.js": 16,
+    "model-rate-limit.test.js": 12,
+    "no-disturb-match.test.js": 1,
+    "no-disturb.test.js": 1,
+    "oauth-platform.test.js": 4,
+    "official-automation-sync.test.js": 11,
+    "open-url.test.js": 3,
+    "panel-brand-robot.test.js": 7,
+    "panel-outside-dismiss.test.js": 3,
+    "panel-theme-controls.test.js": 30,
+    "panel-version.test.js": 2,
+    "permission-guard.test.js": 1,
+    "persona-api.test.js": 13,
+    "persona-migration.test.js": 15,
+    "persona-sharing.test.js": 12,
+    "persona-switch-preflight.test.js": 2,
+    "primary-account.test.js": 2,
+    "profiles.test.js": 5,
+    "quick-phrase-composer.test.js": 18,
+    "quick-phrase-diagnostics.test.js": 1,
+    "quick-phrase-drag.test.js": 12,
+    "quick-phrase-order.test.js": 3,
+    "quick-phrase-popover.test.js": 6,
+    "rehome-dedupe.test.js": 1,
+    "rehome-sessions.test.js": 1,
+    "rehome-watcher-retry.test.js": 1,
+    "rehome-watcher.test.js": 1,
+    "renderer-api-bridge.test.js": 5,
+    "renderer-escaping.test.js": 8,
+    "runtime-dependencies.test.js": 4,
+    "secure-transfer.test.js": 6,
+    "selection-quote.test.js": 2,
+    "sentry.test.js": 9,
+    "session-artifact-copy.test.js": 6,
+    "session-conflict-reset.test.js": 2,
+    "session-copy-job-error.test.js": 2,
+    "session-copy-list-refresh.test.js": 15,
+    "session-copy-rate.test.js": 6,
+    "session-cwd-repair.test.js": 10,
+    "session-db.test.js": 6,
+    "session-delete-confinement.test.js": 18,
+    "session-delete-ui.test.js": 4,
+    "session-deletion-sync.test.js": 5,
+    "session-export-jobs.test.js": 4,
+    "session-export-ui.test.js": 5,
+    "session-filter-layout.test.js": 1,
+    "session-filter.test.js": 2,
+    "session-fork-integration.test.js": 8,
+    "session-fork.test.js": 15,
+    "session-health.test.js": 12,
+    "session-monitor.test.js": 24,
+    "session-pin-sync.test.js": 1,
+    "session-refresh-ui.test.js": 7,
+    "session-scope.test.js": 1,
+    "session-send.test.js": 1,
+    "session-size-filter.test.js": 6,
+    "session-size-summary.test.js": 3,
+    "session-sizes.test.js": 3,
+    "session-sync-daemon.test.js": 50,
+    "session-sync.test.js": 35,
+    "session-transfer.test.js": 9,
+    "session-usage-copy.test.js": 3,
+    "sleep-mode.test.js": 7,
+    "stash-queue.test.js": 17,
+    "system-theme.test.js": 22,
+    "theme-account-switch.test.js": 6,
+    "theme-blur.test.js": 5,
+    "theme-patches.test.js": 12,
+    "theme-restore-stability.test.js": 41,
+    "theme-text-shadow.test.js": 2,
+    "third-party-model-ui.test.js": 3,
+    "third-party-models.test.js": 15,
+    "toast-runtime.test.js": 6,
+    "token-refresh-panel.test.js": 2,
+    "token-refresh-persistence.test.js": 12,
+    "token-refresh.test.js": 4,
+    "token-stats-import.test.js": 10,
+    "token-stats-modal.test.js": 2,
+    "token-stats.test.js": 16,
+    "ui-port.test.js": 2,
+    "update-layout.test.js": 104,
+    "usage-activity.test.js": 3,
+    "usage-pie.test.js": 4,
+    "usage-report.test.js": 7,
+    "verify-win-exit.test.js": 4,
+    "wallpaper-rotation.test.js": 12,
+    "win-launcher-process.test.js": 4,
+    "windows-elevated-consent.test.js": 7,
+    "windows-launcher-boundary-repair.test.js": 26,
+    "windows-native-flow.test.js": 32,
+    "windows-powershell-boundary.test.js": 4,
+    "windows-privilege-boundary.test.js": 18,
+    "windows-release-script.test.js": 6,
+    "windows-startup-recovery.test.js": 9,
+    "workbuddy-compat.test.js": 16,
+    "workbuddy-launch-env.test.js": 11
+  },
+  "baseline": [
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "codebuddy-cn: switch captures the live conversation without composer enhancement initialization"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "codebuddy-intl: switch captures the live conversation without composer enhancement initialization"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "switch route never adds an unselected open conversation to another rule’s job: {\"allSessions\":false,\"sessionIds\":[\"another-session\"],\"workspaces\":[]}"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "switch route never adds an unselected open conversation to another rule’s job: {\"allSessions\":false,\"sessionIds\":[],\"workspaces\":[\"/unrelated-workspace\"]}"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "switch route never carries a missing or foreign conversation:"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "switch route never carries a missing or foreign conversation: other-account"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "switch route preserves restoration for a selected open conversation: {\"allSessions\":false,\"sessionIds\":[\"open\"],\"workspaces\":[]}"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "switch route preserves restoration for a selected open conversation: {\"allSessions\":false,\"sessionIds\":[],\"workspaces\":[\"/current-workspace/\"]}"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "switch route preserves restoration for a selected open conversation: {\"allSessions\":true,\"sessionIds\":[],\"workspaces\":[]}"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "switch route reloads without syncing when no rule is enabled"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "workbuddy-ai: SDK, hydration fallback and legacy cache keep their switch behavior"
+    },
+    {
+      "file": "account-switch-session-rules.test.js",
+      "name": "workbuddy-cn: SDK, hydration fallback and legacy cache keep their switch behavior"
+    },
+    {
+      "file": "automation-packages.test.js",
+      "name": "example index pins the exact package bytes"
+    },
+    {
+      "file": "automation-safety-review.test.js",
+      "name": "safety review creates only a model-selected V2 conversation about one stored task"
+    },
+    {
+      "file": "automation-switch-sync.test.js",
+      "name": "cancellation drains writing before releasing the switch lock; restore is still safe"
+    },
+    {
+      "file": "automation-switch-sync.test.js",
+      "name": "empty sessions do not block automation account switching: 会话消息文件没有消息，未同步"
+    },
+    {
+      "file": "automation-switch-sync.test.js",
+      "name": "empty sessions do not block automation account switching: 会话消息文件为空，未同步"
+    },
+    {
+      "file": "automation-switch-sync.test.js",
+      "name": "failed sync blocks following switch and restoration: conflict"
+    },
+    {
+      "file": "automation-switch-sync.test.js",
+      "name": "failed sync blocks following switch and restoration: error"
+    },
+    {
+      "file": "automation-switch-sync.test.js",
+      "name": "failed sync blocks following switch and restoration: partial"
+    },
+    {
+      "file": "automation-switch-sync.test.js",
+      "name": "pruning public job history cannot erase failed synchronization; successful retry clears it"
+    },
+    {
+      "file": "automation-switch-sync.test.js",
+      "name": "queued automation switches wait for preceding sync before switching"
+    },
+    {
+      "file": "automation-switch-sync.test.js",
+      "name": "switch waits for its exact sync job and releases reload priority before waiting"
+    },
+    {
+      "file": "cdp-targets.test.js",
+      "name": "isTargetForProfile 企业配置只接受自身域名或路径提示"
+    },
+    {
+      "file": "cdp-targets.test.js",
+      "name": "isTargetForProfile Linux 双实例：CN 与 AI 互不认领（两端可执行文件同名 workbuddy）"
+    },
+    {
+      "file": "enterprise-target.test.js",
+      "name": "macOS enterprise auth discovery matches the app suffix when multiple files exist"
+    },
+    {
+      "file": "enterprise-target.test.js",
+      "name": "macOS enterprise targets discover the client-specific auth file and API host"
+    },
+    {
+      "file": "enterprise-target.test.js",
+      "name": "macOS official app keeps the canonical auth filename"
+    },
+    {
+      "file": "enterprise-target.test.js",
+      "name": "macOS target configuration accepts non-exe process names"
+    },
+    {
+      "file": "i18n-coverage.test.js",
+      "name": "every Chinese UI literal in injected UI modules translates at runtime with zero Chinese residue"
+    },
+    {
+      "file": "i18n-coverage.test.js",
+      "name": "every user-facing Chinese literal in daemon.js (non-log) is covered"
+    },
+    {
+      "file": "i18n.test.js",
+      "name": "README language switch links are reciprocal"
+    },
+    {
+      "file": "linux-release-script.test.js",
+      "name": "cross-packager writes tar headers supported by older dpkg with fractional file timestamps"
+    },
+    {
+      "file": "macos-dock-identity.test.js",
+      "name": "packaged macOS launcher starts the app through LaunchServices, not its Electron child"
+    },
+    {
+      "file": "macos-runtime-dependencies.test.js",
+      "name": "macOS staging copies every top-level daemon module dependency"
+    },
+    {
+      "file": "runtime-dependencies.test.js",
+      "name": "macOS release stages every daemon startup dependency"
+    },
+    {
+      "file": "sentry.test.js",
+      "name": "privacy documentation distinguishes local data from required remote services"
+    },
+    {
+      "file": "session-filter.test.js",
+      "name": "batch mode keeps the header visible and disables controls until cancelled"
+    },
+    {
+      "file": "session-refresh-ui.test.js",
+      "name": "a dialog or selection opened during a background request prevents replacement"
+    },
+    {
+      "file": "session-refresh-ui.test.js",
+      "name": "hidden panels, inactive tabs, selections, batch operations and visible dialogs suspend silent refresh"
+    },
+    {
+      "file": "session-refresh-ui.test.js",
+      "name": "unchanged background snapshots do not replace the session DOM"
+    },
+    {
+      "file": "session-size-filter.test.js",
+      "name": "expanded session groups can collapse back to the default row count"
+    },
+    {
+      "file": "session-size-filter.test.js",
+      "name": "session summary formats large counts and emphasizes numeric values"
+    },
+    {
+      "file": "session-size-filter.test.js",
+      "name": "size filter excludes exact thresholds and unknown sizes; select-all operates only on matches"
+    },
+    {
+      "file": "session-size-filter.test.js",
+      "name": "task session group expands all rows before showing collapse"
+    },
+    {
+      "file": "session-size-summary.test.js",
+      "name": "account total includes all sessions even when the time filter hides old sessions"
+    },
+    {
+      "file": "session-size-summary.test.js",
+      "name": "an unreadable session cannot silently understate the account total"
+    },
+    {
+      "file": "session-size-summary.test.js",
+      "name": "session listing excludes WorkBuddy background automation records"
+    },
+    {
+      "file": "session-sync-daemon.test.js",
+      "name": "native automatic first copy registers destination ownership before selecting its snapshot"
+    },
+    {
+      "file": "session-sync.test.js",
+      "name": "backup pruning removes completed and stale crash journals but keeps recovery-needed data"
+    },
+    {
+      "file": "token-refresh-persistence.test.js",
+      "name": "codebuddy-cn encrypted refresh survives cache loss and reaches native switch storage"
+    },
+    {
+      "file": "token-refresh-persistence.test.js",
+      "name": "codebuddy-cn plaintext refresh survives cache loss and reaches native switch storage"
+    },
+    {
+      "file": "token-refresh-persistence.test.js",
+      "name": "codebuddy-intl encrypted refresh survives cache loss and reaches native switch storage"
+    },
+    {
+      "file": "token-refresh-persistence.test.js",
+      "name": "codebuddy-intl plaintext refresh survives cache loss and reaches native switch storage"
+    },
+    {
+      "file": "update-layout.test.js",
+      "name": "session copy-all is a separate override with a distinct toggle and hidden row controls"
+    },
+    {
+      "file": "verify-win-exit.test.js",
+      "name": "Windows verifier returns success for a complete source package"
+    },
+    {
+      "file": "workbuddy-compat.test.js",
+      "name": "Windows encrypted-field key lookup honors the configured WorkBuddy target path"
+    }
+  ]
+}

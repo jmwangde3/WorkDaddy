@@ -82,7 +82,7 @@ WorkBuddy 的会话是**按账号隔离**的。你登在账号 A，侧栏就只�
 去 [babygoton/workdaddy/releases](https://github.com/babygoton/workdaddy/releases) 下载 `WorkDaddy-Setup-x.y.z.exe`，双击装完。
 
 > 为什么不能直接用本仓库？
-> 本仓库只存了**改动的 14 个文件**，没有上游那几百个文件。它是一个「补丁包」，不是完整程序。
+> 本仓库只存了**改动的 17 个文件**，没有上游那几百个文件。它是一个「补丁包」，不是完整程序。
 
 装完确认一下这个目录存在：
 
@@ -96,18 +96,23 @@ C:\Users\<你的用户名>\AppData\Local\Programs\WorkDaddy\scripts
 
 把本仓库下载下来（`git clone` 或右上角 Download ZIP 都行），然后**双击根目录的 `deploy.cmd`**。
 
-它会自动做六件事，每一步都打印出来：
+它会自动做七件事，每一步都打印出来：
 
-1. 找到你的 WorkDaddy 装在哪儿
-2. 检查 12 个补丁文件齐不齐
-3. 备份会被覆盖的文件（存到 `%APPDATA%\WorkDaddy\script-backups\deploy-<时间戳>\`）
-4. 复制 14 个文件过去
-5. 重新绑定面板上的按钮（有 Python 才会跑，没有也不影响功能）
-6. 重启后台服务
+1. 找到你的 WorkDaddy 装在哪儿，并确认目录可写
+2. 校验 16 个补丁文件齐不齐，计算源文件哈希
+3. 读 `scripts\upstream.json` 做两道检查：
+   - **文件代际（硬拦）**：目标文件的字节数等于上游 1.2.22 实测字节数 → 说明装的是没打过我们补丁的原版，覆盖会丢掉上游修复 → 中止（`-Force` 可越过）
+   - **版本号（默认只提示）**：上游版本号只来自提交信息，且本 fork 与上游没有祖先关系，不足以下判断；加 `-StrictVersionGate` 才升级为阻断
+4. 备份会被覆盖的文件（存到 `%APPDATA%\WorkDaddy\script-backups\deploy-<时间戳>\`）
+5. 先复制到临时目录并逐个校验 SHA-256，全部一致才替换
+6. 替换失败自动回滚，并生成 `deploy-report-<时间戳>.json`
+7. 重新绑定面板按钮、重启后台服务
 
 看到 `完成` 就好了。这个脚本可以反复跑，不会出问题。
 
-> 想先看看它会干什么、不实际改动？用 PowerShell 跑 `.\deploy.ps1 -NoRestart`，它只铺文件不动服务。
+> 想先看看它会干什么、不实际改动？用 PowerShell 跑 `.\deploy.ps1 -DryRun`：只预检并打印报告，零写入。
+>
+> `scripts\workbuddy-exe.json` 是你这台机器的客户端路径，**部署时永不覆盖**：已存在就保持原样，只有缺失时才从 `workbuddy-exe.example.json` 生成一份，需要你自己改成实际路径。
 
 ### 第 3 步：起服务
 
@@ -115,7 +120,7 @@ C:\Users\<你的用户名>\AppData\Local\Programs\WorkDaddy\scripts
 
 **右键它 → 点「启动 WorkDaddy」**。圆点从灰色变绿，服务就起来了。
 
-这时候切号接管、归档同步、副本去重全部生效，不需要再做任何事。
+这时候切号接管与归档同步生效，不需要再做任何事。去重与权限修复默认关闭，需要时按下面「常见问题」里的命令手动执行。
 
 ---
 
@@ -127,7 +132,7 @@ C:\Users\<你的用户名>\AppData\Local\Programs\WorkDaddy\scripts
 
 - 在面板上切换账号 → 2 秒内自动接管会话归属
 - 新账号登录 → 同样自动接管
-- 侧栏出现重复会话 → 下一个切号周期自动去重
+- 侧栏出现重复会话 → 手动跑 `node scripts\rehome-sessions.js --dedupe --dry-run` 看判定，确认后再执行
 
 ### 托盘图标是什么意思
 
@@ -225,21 +230,61 @@ UPDATE sessions SET user_id = '当前账号' WHERE ...;
 
 ### 重复会话怎么去重
 
-历史上游的「复制」功能会留下副本。去重的判定标准：
+去重是**手动功能，默认关闭**。自动接管只改归属，不会顺带删任何会话。
 
-1. 同一个工作目录 + 同一个标题
-2. 消息文件**字节数完全一致**（是真的复制品，不是各自演化）
-3. 保留的那份，消息 UUID 必须**完全覆盖**被删的那些（保证不丢内容）
+判定分四层，任何一层证明不了「是副本」，该组一律保留：
 
-三条都满足才软删（写 `deleted_at` 时间戳），不做物理删除。删错了还能恢复。
+1. **文件层** —— 消息文件存在、可读、非空，且扫描期间大小与内容哈希没变；
+2. **字节层** —— 整文件 SHA-256 相同 = 逐字节相同的副本；
+3. **消息层** —— 解析 JSONL，按消息 `id` 比对：id 集合完全一致且同 id 内容一致，才算内容相同的副本。只有**记录最外层**的 `sessionId` 不参与比较（复制时会被改写）；嵌套在消息内容里的 `sessionId`（工具调用参数、工具结果里携带的会话引用）是真实内容，必须参与比对 —— 否则两份不同的记录会被算成同一个哈希。
+4. **包含层** —— 只有显式加 `--containment` 才启用：A 的全部消息都在 B 里、同 id 内容无冲突、**且 A 的消息 id 序列是 B 的子序列**（截断型旧副本一定满足），才认定 A 是 B 的旧副本，并保留内容更完整的 B（不看 `updated_at`）。
 
-**后台任务的运行记录不参与去重** —— 那是真实的执行历史，不是复制品，误删就真丢了。
+以下情况一律跳过、绝不删：文件缺失/损坏、同 UUID 内容冲突、同文件里重复的消息 UUID、两边互不包含、消息顺序对不上、候选保留者不唯一、扫描后文件又发生变化。
+
+**附件与图片**：JSONL 里只存引用。如果会话旁边有附属产物（`<会话id>/`、`<会话id>.png` 等），整组保留 —— 判错会让人以为会话连附件一起丢了。如果引用写的是相对路径（`images/a.png`），同名文件在不同会话目录下可能是不同内容，此时只认逐字节相同，消息层不作证。
+
+执行前后：
+
+- 自动 `VACUUM INTO` 备份到 `%APPDATA%\WorkDaddy\rehome-backups\`
+- 写一份操作日志（每个会话的原 `deleted_at`、新值、判定理由）
+- 只写 `deleted_at` 软删，**从不物理删除 JSONL**
+- 可按日志回滚；回滚只恢复「仍等于本次写入值」的行，不覆盖之后的新修改
+
+```bash
+# 先看要处理哪些（零写入）
+node scripts\rehome-sessions.js --dedupe --dry-run
+
+# 确认后执行（需要配置里 "dedupe": true，或 --force 仅本次）
+node scripts\rehome-sessions.js --dedupe
+
+# 消息包含关系（更激进，必须显式指定）
+node scripts\rehome-sessions.js --dedupe --containment
+
+# 按操作日志回滚
+node scripts\rehome-sessions.js --dedupe-rollback %APPDATA%\WorkDaddy\rehome-backups\dedupe-<时间戳>.json
+```
+
+**后台任务的运行记录不参与接管与人工去重** —— 那是真实的执行历史，不是复制品。它们有一个独立入口，但它要求**双重显式**：
+
+```bash
+# 只读计划：打印会动哪几条，不写库
+node scripts\rehome-sessions.js --dedupe-background --allow-background --dry-run
+
+# 真的要写，必须再加 --apply
+node scripts\rehome-sessions.js --dedupe-background --allow-background --apply
+```
+
+只给 `--dedupe-background` 而不给 `--allow-background` 会被直接拒绝（返回 `skipped: background-dedupe-requires-allow-background`）；给了 `--allow-background` 但没给 `--apply`，一律按只读计划处理。
+
+**接管范围**：默认只接管 `transport = 'local'`（或历史库里 `transport` 为 NULL）且 `deleted_at IS NULL` 的会话。云端会话要同时 `cloudTakeover` 且 `cloudVerified` 双开才参与；`deleted_at` 取值与 transport 编码不一致的行（例如 local 行上出现 `-1`）、以及来源不明的 transport 值，一律不碰，并在 `--status` 里报出来。
 
 ### 安全措施
 
+- 默认**不自动去重**、**不自动改权限**、**不自动点任何授权按钮**
 - 每次改数据库前自动 `VACUUM INTO` 一份完整备份
 - 所有写入在一个事务里，要么全成要么全不成
-- 去重只做软删，随时可恢复
+- 文件在扫描后变化、数据库行被并发修改 → 中止并补偿回滚
+- 去重只做软删，可审计、可回滚
 
 ---
 
@@ -257,43 +302,69 @@ UPDATE sessions SET user_id = '当前账号' WHERE ...;
 
 ### 切完号，「允许完全访问」又变回默认权限了
 
-v1.2.80 起改成**常驻守卫**，不再靠"切号后补一次"。四层一起兜：
+v1.3.0 起改成**三个独立开关，默认全关**，工具不再替你做授权决定：
 
-1. **账号偏好** —— `localTaskPermissionMode` 写回 `full-access`；
-2. **会话字段** —— `sessions.permission_mode` 补齐成 `fullAccess`；
-3. **页面开关** —— 掉了就自动拨回（含勾选风险声明、点「允许完全访问」）；
-4. **守卫** —— 页面里每 2.5 秒查一次开关，偏好文件每 3 秒查一次，谁被写回默认值就立刻还原；页面重载后守卫自动重跑。执行期弹出的授权框也会自动点「允许」（删除/覆盖/重置类不代点）。
+| 开关 | 作用 | 默认 |
+|---|---|---|
+| A `preferenceGuard` | 定时把被写回默认值的账号偏好还原（只碰文件） | **关** |
+| B `configRepair` | 切号后补齐偏好 + `sessions.permission_mode`（不碰页面） | **关** |
+| C `autoApprove` | 执行期自动批准 | **已移除，永远关** |
 
-日志里能看到：
-
-```
-[permission] 守卫注入 registered=true evaluated=true
-[permission] 页面守卫已就位 (connect)
-[permission] 偏好被改写 default-sandbox → full-access uid=…（守卫已还原）
-```
-
-手动查状态、手动补一次：
+页面里的「允许完全访问」开关、风险确认复选框、执行期权限弹窗，**一律由你本人点击**。工具不注入自动点击脚本，也不注册页面重载后自动执行的守卫。
 
 ```bash
-# 三个账号的偏好 + 页面开关 + 守卫运行情况（只读）
+# 看状态：三个开关、活动定时器数、已注册脚本 id、页面当前状态
+node scripts\permission-sync.js --status
+
+# 单独开启 A（配置里也支持 "preferenceGuard": true）
+node scripts\permission-sync.js --on --preference-guard
+
+# 单独开启 B（切号时补配置）
+node scripts\permission-sync.js --on --config-repair
+
+# 一键全停：主进程定时器 + 页面定时器/observer/监听器 + 已注册脚本 + 持久化关闭
+node scripts\permission-sync.js --off
+
+# 若检测到旧版守卫残留（结构未知的监听器），加 --reload 强制重载页面彻底清干净
+node scripts\permission-sync.js --off --reload
+```
+
+接口侧同样分开了：
+
+```bash
 curl -s -H "x-workdaddy-token: $(cat %APPDATA%\WorkDaddy\.api-token)" ^
   http://127.0.0.1:47832/api/permission/status
 
-# 看三个账号现在各自是什么状态
-node scripts\permission-sync.js
+# 改开关（autoApprove=true 会被拒绝）
+curl -s -X POST -H "x-workdaddy-token: ..." -H "Content-Type: application/json" ^
+  -d "{\"preferenceGuard\":true}" http://127.0.0.1:47832/api/permission/config
 
-# 立刻补齐（不开页面，只写偏好和会话字段）
-node scripts\permission-sync.js --apply
-
-# 真不想用它了：停掉还原，守卫不再插手
-node scripts\permission-sync.js --off
+# 全停
+curl -s -X POST -H "x-workdaddy-token: ..." http://127.0.0.1:47832/api/permission/off
 ```
 
-> 为什么以前会掉：拨动那个开关是**静默写盘**的 —— 关掉的瞬间 `preferences.json` 就变成 `default-sandbox`，页面卸载、切号、换账号作用域都会触发。一次性补完，下一次写盘又回来了。
+> 关闭是**真的关闭**，逐层都有对应动作：
+>
+> - **主进程定时器**：只清本模块登记的（不碰别的模块的 timer）
+> - **页面定时器**：`clearInterval(window.__wdPermGuard.timer)`
+> - **页面 observer / 监听器**：`disconnect()` 已登记的 MutationObserver、`removeEventListener` 已登记的 handler
+> - **残留全局对象**：`delete window.__wdPermGuard` 等
+> - **CDP 新文档脚本**：内存登记 + 落盘登记的 identifier 都删（daemon 重启后仍能删掉上次注册的）
+> - **持久化**：三个开关写盘为 false
+>
+> daemon 重启、页面重载、切号都不会把它们装回来。
+>
+> 诚实边界：旧版守卫的监听器结构没有文档，只能按已知字段名拆。如果拆到了旧守卫对象（`pageStopped: true`），返回里会带 `needsReload: true` —— 只有 `Page.reload` 才能保证未知结构的监听器彻底消失，所以想彻底清就加 `--reload`。CLI 进程没有 CDP 会话，页面侧清理要走 daemon 的 `POST /api/permission/off`。
 
 ### 侧栏出现两条一模一样的会话
 
-去重在下一次切号时自动跑。想立刻处理，打开管理页用接口触发，或者直接切一次账号。
+去重默认关闭，不会再自动跑。先干跑看看：
+
+```bash
+node scripts\rehome-sessions.js --dedupe --dry-run
+```
+
+确认判定合理再执行 `--dedupe`。判定标准见上文「重复会话怎么去重」。
 
 ### 删掉的会话，会被另一个账号顶回来吗
 
@@ -309,11 +380,11 @@ node scripts\rehome-audit.js
 
 只读，不改任何东西。看到「字节相同的双活副本 0 组」就安全。
 
-后台自动化任务的副本要单独清（它们每次运行都是新会话，不能按标题整组只留一条）：
+后台自动化任务的副本要单独清（它们每次运行都是新会话，不能按标题整组只留一条）。这条路径必须双重显式，少一个都不会写库：
 
 ```
-node scripts\rehome-sessions.js --dedupe-background --dry-run   # 先看要删哪几条
-node scripts\rehome-sessions.js --dedupe-background             # 真删，自动备份
+node scripts\rehome-sessions.js --dedupe-background --allow-background --dry-run   # 只读计划
+node scripts\rehome-sessions.js --dedupe-background --allow-background --apply     # 真删，自动备份
 ```
 
 ### A 删了，B 又接着聊，A 还能拿到后面的进度吗
@@ -374,30 +445,35 @@ grep 关键字：`[cdp]`、`[rehome]`、`error`。
 
 ## 和上游的区别
 
-**代码层面**：14 个文件。9 个新增，5 个是上游文件的改造版。
+**代码层面**：17 个文件。13 个新增（其中 `workbuddy-exe.example.json` 只作模板，不参与部署），4 个是上游文件的改造版。
 
 | 类型 | 文件 | 作用 |
 | --- | --- | --- |
-| 新增 | `rehome-sessions.js` | 接管 + 去重的核心逻辑 |
-| 新增 | `rehome-watcher.js` | 盯账号变化，2 秒内触发接管 |
+| 新增 | `rehome-sessions.js` | 接管核心（去重已拆到独立模块） |
+| 新增 | `rehome-watcher.js` | 盯账号变化，带状态机与失败退避重试 |
+| 新增 | `session-dedupe.js` | 副本判定内核：文件 / 字节 / 消息 UUID / 包含关系，四层证据 + 竞态防护 + 回滚 |
+| 新增 | `session-scope.js` | local / cloud 接管边界 + `deleted_at` 语义体检（默认只接管 local 且 `IS NULL`） |
+| 新增 | `session-pin-sync.js` | 会话 pin 跨账号同步队列（默认未接线；上游 1.2.22 已有同名实现，部署清单不含它） |
 | 新增 | `rehome-sessions.py` | 独立的命令行版，可手动跑 |
 | 新增 | `bind-rehome-ui.py` | 把面板按钮绑到接管模式 |
 | 新增 | `setup-rehome.ps1` | 初始化工作区落点 |
 | 新增 | `stop-workdaddy.ps1` | 强制停止（压住 watchdog） |
 | 新增 | `fix-cdp.cmd` | 手工修复 CDP 的入口 |
 | 新增 | `rehome-audit.js` | 只读体检：查复活风险、双活副本、删除后写入 |
-| 新增 | `permission-sync.js` | 切号后把「允许完全访问」三层状态补齐（偏好 / 会话字段 / 窗口开关） |
-| 改造 | `daemon.js` | 接入 rehome 逻辑 + `/api/rehome/*` 路由 |
+| 新增 | `permission-sync.js` | 三开关（偏好守卫 / 配置修复 / 自动批准），默认全关 |
+| 新增 | `upstream.json` | 上游版本 / commit / 每个补丁文件的上游字节数 / 版本闸门模式（全部带来源标注） |
+| 新增 | `workbuddy-exe.example.json` | 本机路径模板（真实配置不入库） |
+| 改造 | `daemon.js` | 接入 rehome / 去重 / 权限三开关 + `/api/rehome/*`、`/api/permission/*` 路由 |
 | 改造 | `inject.js` | 面板文案与复选框绑定 |
 | 改造 | `lib.js` | 非 C 盘路径解析 + CDP 明文兜底 |
 | 改造 | `win-launcher.js` | 修 taskkill 返回非零导致启动中断 |
-| 改造 | `workbuddy-exe.json` | 本机客户端路径（换机器必改） |
 
 **另外还有**：
 
 - `tray\WorkDaddyTray.exe` —— C# 写的托盘控制器，20 KB，用 Windows 自带的 `csc.exe` 编译，不需要 .NET SDK
 - `tray\WorkDaddyTray.cs` —— 源码。改完跑 `tray\build.cmd` 重新编译
-- `deploy.cmd` / `deploy.ps1` —— 一键部署
+- `deploy.cmd` / `deploy.ps1` —— 一键部署（原子替换 + 文件代际闸门 + 失败回滚）
+- `package.json` / `test/run-ci.js` —— 完整测试入口：逐文件跑，按「文件 + 用例名」双匹配基线，只对新增失败报错
 - `HANDOFF.md` —— 给接手的人（或 AI）看的完整交接文档
 - `REHOME-README.md` —— 实现文档，所有踩过的坑和实测数据
 
@@ -416,7 +492,7 @@ WorkDaddy/
 ├── HANDOFF.md                    交接文档：硬知识、SOP、已知缺口
 ├── REHOME-README.md              实现文档：踩坑记录、实测数据
 │
-├── scripts/                      14 个补丁文件都在这
+├── scripts/                      17 个补丁文件都在这
 │   ├── rehome-sessions.js        ← 接管核心
 │   ├── rehome-watcher.js
 │   ├── daemon.js                 上游改版
@@ -427,7 +503,7 @@ WorkDaddy/
 │   ├── WorkDaddyTray.cs          源码
 │   └── build.cmd                 重新编译
 │
-├── test/                         三组回归测试
+├── test/                         回归测试（去重 / 权限 / watcher / 边界 / 部署 / pin）
 └── docs/images/                  截图素材
 ```
 

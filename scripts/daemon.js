@@ -178,7 +178,10 @@ const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile, selectPageT
 const { createSessionDb, normalizeSessionIdBatch, parameterCount } = require('./session-db.js');
 const { createRehomeRunner, alignStartupRoutes } = require('./rehome-sessions.js');
 const { createAccountWatcher } = require('./rehome-watcher.js');
-const { applyFullAccess, installRendererGuard, readGuardState, startPreferenceGuard } = require('./permission-sync.js');
+const {
+  applyFullAccess, readGuardState, startPreferenceGuard, stopRendererGuard,
+  stopPermissionGuards, getPermissionStatus, readGuardConfig, setGuardSwitch,
+} = require('./permission-sync.js');
 
 // 切号后原地接管会话归属（不复制会话、不改会话 ID）。懒初始化：
 // PROFILE / DATA_DIR / log 在下方定义，函数体到调用时才求值。
@@ -195,27 +198,21 @@ function getRehomeRunner() {
   return rehomeRunner;
 }
 
-// ---- 「允许完全访问」保活 ----
-// 客户端把完全访问拆成三层：账号偏好（localTaskPermissionMode）、会话字段
-// （sessions.permission_mode）、渲染层开关。切号会换账号作用域并重载页面，
-// 只要有一层掉队，界面就退回默认沙箱，用户看到的就是「每次切号都要重新点一遍」。
-// 这里在切号后把三层一起补齐，幂等；失败只记日志，不阻断切号。
-const PERMISSION_OK_STATUS = new Set(['already-full-access', 'enabled', 'enabled-unverified', 'unknown-unverified']);
+// ---- 「允许完全访问」配置修复（默认关闭）----
+// 客户端把完全访问拆成三层：账号偏好、会话字段、渲染层开关。
+// 本模块只负责前两层的**手动**修复：开关 B（configRepair）默认关闭，
+// 页面里的开关与执行期授权一律由用户本人操作，daemon 不代点。
+const PERMISSION_OK_STATUS = new Set(['fixed', 'ok']);
 function cdpReadyForPermission() {
   return !!(cdp && cdp.connected && cdp.ws && cdp.ws.readyState === 1);
 }
-async function applyPermissionLayers(uid, options = {}) {
+async function applyPermissionLayers(uid) {
   const targetUid = String(uid || '').trim();
   if (!targetUid) return null;
-  const wantRenderer = options.renderer !== false;
-  const send = wantRenderer && cdpReadyForPermission() ? (method, params) => cdpSend(method, params) : null;
-  if (!send && options.requireRenderer) return null;
   const report = await applyFullAccess({
     dataRoot: PROFILE.dataRoot,
     dbPath: PROFILE.sessionDb,
     uid: targetUid,
-    send,
-    renderer: !!send,
     log: (msg) => { try { log(msg); } catch (_) {} },
   });
   return report;
@@ -224,42 +221,32 @@ let permissionSyncTimer = null;
 function schedulePermissionSync(uid, options = {}) {
   const targetUid = String(uid || '').trim();
   if (!targetUid) return Promise.resolve(null);
-  const attempts = Number.isFinite(options.attempts) ? options.attempts : 6;
+  // 开关 B 关闭时什么都不做：切号不再自动改任何权限配置。
+  if (!readGuardConfig().configRepair && options.force !== true) {
+    return Promise.resolve({ skipped: 'config-repair-disabled' });
+  }
+  const attempts = Number.isFinite(options.attempts) ? options.attempts : 3;
   const gapMs = Number.isFinite(options.gapMs) ? options.gapMs : 2500;
   const firstDelay = Number.isFinite(options.delayMs) ? options.delayMs : 2500;
   if (permissionSyncTimer) { clearTimeout(permissionSyncTimer); permissionSyncTimer = null; }
   const run = async () => {
     permissionSyncTimer = null;
     let last = null;
-    // 先补不依赖页面的两层：CDP 正在重连时也要保证偏好与会话字段落盘。
-    try {
-      await applyPermissionLayers(targetUid, { renderer: false });
-    } catch (error) {
-      log(`[permission] 偏好/会话字段补齐失败: ${error.message}`);
-    }
     for (let i = 0; i < attempts; i++) {
+      if (!readGuardConfig().configRepair) return last;
       try {
-        const report = await applyPermissionLayers(targetUid, { requireRenderer: true });
-        last = report;
-        const status = report && report.renderer && report.renderer.status;
-        if (report && report.preference && report.preference.ok === false) {
-          log(`[permission] 账号偏好写入失败: ${report.preference.error || ''}`);
-        }
-        if (status && PERMISSION_OK_STATUS.has(status)) {
-          log(`[permission] 完全访问已落实 uid=${targetUid} status=${status}`);
-          return report;
-        }
-        if (report && report.renderer && report.renderer.status === 'foreign-modal-open') {
-          log('[permission] 页面有其它弹窗，稍后重试');
+        last = await applyPermissionLayers(targetUid);
+        if (last && last.ok) {
+          log(`[permission] 配置已补齐 uid=${targetUid}（开关 B）`);
+          return last;
         }
       } catch (error) {
         last = { ok: false, error: error.message };
-        log(`[permission] 同步异常: ${error.message}`);
+        log(`[permission] 配置补齐异常: ${error.message}`);
       }
       if (i + 1 < attempts) await new Promise((r) => setTimeout(r, gapMs));
     }
-    const status = last && last.renderer ? last.renderer.status : (last && last.error) || 'unknown';
-    log(`[permission] 未能确认完全访问 uid=${targetUid} status=${status}（下次切号再试）`);
+    log(`[permission] 配置补齐未成功 uid=${targetUid}（下次切号再试）`);
     return last;
   };
   if (!firstDelay) return run();
@@ -273,11 +260,15 @@ function schedulePermissionSync(uid, options = {}) {
 let rehomeWatcher = null;
 let preferenceGuard = null;
 
-// 第四层：偏好文件守卫。切号 / 页面卸载 / 关会话都可能把 localTaskPermissionMode
-// 写回 default-sandbox，而这一步是静默的（实测拨一下就立刻落盘）。这里每 3s 扫一遍，
-// 发现被改写就还原，只碰这一个键。
+// 开关 A：偏好文件守卫（默认关闭）。
+// 只有用户在配置里显式打开 preferenceGuard 才会启动；stopPermissionGuards() 会真正停掉。
 function startPermissionPreferenceGuard() {
   if (preferenceGuard) return preferenceGuard;
+  const cfg = readGuardConfig();
+  if (!cfg.preferenceGuard) {
+    log('[permission] 偏好守卫未启用（默认关闭，需要显式开启 preferenceGuard）');
+    return null;
+  }
   try {
     preferenceGuard = startPreferenceGuard({
       dataRoot: PROFILE.dataRoot,
@@ -290,19 +281,20 @@ function startPermissionPreferenceGuard() {
   return preferenceGuard;
 }
 
-// 第四层之二：页面里的常驻守卫（掉了自动拨回 + 接管执行期授权弹窗）。
-// 注册到 addScriptToEvaluateOnNewDocument，页面重载后自动重跑。
-async function installPermissionGuard(reason) {
-  if (!cdpReadyForPermission()) return null;
+// 页面守卫已按策略移除：不再注册 addScriptToEvaluateOnNewDocument，
+// 也不再自动拨「允许完全访问」或批准执行期请求。这里只清理页面里旧版的定时器
+// ——**不动**开关 A 的主进程定时器。
+async function clearLegacyPermissionGuard(reason) {
+  const send = cdpReadyForPermission() ? (method, params) => cdpSend(method, params) : null;
+  if (!send) return null;
   try {
-    const out = await installRendererGuard(
-      (method, params) => cdpSend(method, params),
-      (msg) => { try { log(msg); } catch (_) {} },
-    );
-    if (out && out.evaluated) log(`[permission] 页面守卫已就位 (${reason})`);
+    const out = await stopRendererGuard(send);
+    if (out.pageStopped || out.removed) {
+      log(`[permission] 已清理旧版页面守卫 (${reason}) scripts=${out.removed}`);
+    }
     return out;
   } catch (error) {
-    log(`[permission] 页面守卫注入失败 (${reason}): ${error.message}`);
+    log(`[permission] 清理旧版页面守卫失败 (${reason}): ${error.message}`);
     return null;
   }
 }
@@ -319,6 +311,7 @@ function startRehomeWatcher() {
     cdpPort: Number(process.env.WORKDADDY_CDP_PORT || (PROFILE.cdp && PROFILE.cdp.port) || 9222),
     intervalMs: Number(process.env.WORKDADDY_REHOME_POLL_MS || 2000),
     log: (msg) => { try { if (typeof log === 'function') log(msg); } catch (_) {} },
+    inspectAccounts: () => getRehomeRunner().distribution(),
     onSwitch: async (newUid, prevUid) => {
       const result = await getRehomeRunner().run(newUid);
       if (result && result.ok !== false) {
@@ -691,8 +684,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.65：兼容空会话同步、自定义模型和重定向备份目录，工作目录恢复退避重试。
 // 1.2.66：刷新凭据按原信封加密保存，同账号刷新去重，过期账号保留手动切换。
 // 1.2.67：Windows 重启 GUI 客户端时不再请求隐藏主窗口，与冷启动保持一致。
-const DAEMON_VERSION = '1.2.80';
-const DAEMON_BUILD_ID = 'release-1.2.80-full-access-guard';
+const DAEMON_VERSION = '1.3.0';
+const DAEMON_BUILD_ID = 'release-1.3.0-safe-defaults';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -2497,8 +2490,8 @@ async function connectCdp() {
         restoreSavedTheme().catch((e) => log(`[theme] 恢复主题失败: ${e.message}`));
         // 连接可能发生在 loadEventFired 之后，也可能正好处于页面加载中。
         waitForPageReadyThenDispatch(cdpPageSessionId);
-        // 页面守卫：先注册到新文档（重载后自动重跑），再对当前文档装一次。
-        installPermissionGuard('connect').catch(() => {});
+        // 页面守卫已按策略移除：这里只清理旧版本可能残留的自动点击逻辑。
+        clearLegacyPermissionGuard('connect').catch(() => {});
       }, 1200);
       resolve(true);
     };
@@ -10459,12 +10452,22 @@ function handleApi(req, res) {
 
   // 会话归属接管（rehome）：状态 / 开关 / 手动触发（支持干跑）
   if (req.method === 'GET' && p === '/api/rehome/status') {
-    return json(res, 200, { ok: true, ...getRehomeRunner().status() });
+    return Promise.resolve(getRehomeRunner().inspectTransports())
+      .catch(() => null)
+      .then((transports) => json(res, 200, { ok: true, ...getRehomeRunner().status(), transports }));
   }
   if (req.method === 'POST' && p === '/api/rehome/config') {
     return readBody(req).then((body) => {
       if (!body || typeof body.enabled !== 'boolean') return json(res, 400, { ok: false, error: '缺少 enabled 布尔值' });
       return json(res, 200, { ok: true, ...getRehomeRunner().setEnabled(body.enabled) });
+    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
+  }
+  // 去重开关：默认关闭，必须显式打开；mode 只能是 exact / containment。
+  if (req.method === 'POST' && p === '/api/rehome/dedupe/config') {
+    return readBody(req).then((body) => {
+      if (!body || typeof body.dedupe !== 'boolean') return json(res, 400, { ok: false, error: '缺少 dedupe 布尔值' });
+      const mode = body.mode === 'containment' ? 'containment' : 'exact';
+      return json(res, 200, { ok: true, ...getRehomeRunner().setDedupe(body.dedupe, mode) });
     }).catch((error) => json(res, 400, { ok: false, error: error.message }));
   }
   if (req.method === 'POST' && p === '/api/rehome/run') {
@@ -10477,11 +10480,35 @@ function handleApi(req, res) {
   }
   if (req.method === 'POST' && p === '/api/rehome/dedupe') {
     return readBody(req).then(async (body) => {
+      const payload = body || {};
       const result = await getRehomeRunner().runDedupe({
-        dryRun: !!(body && body.dryRun),
-        aggressive: !!(body && body.aggressive),
+        dryRun: !!payload.dryRun,
+        mode: payload.mode === 'containment' || payload.aggressive === true ? 'containment' : 'exact',
+        force: payload.force === true,
       });
+      return json(res, result.ok === false ? 409 : 200, { ok: result.ok !== false, ...result });
+    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
+  }
+  if (req.method === 'POST' && p === '/api/rehome/dedupe/rollback') {
+    return readBody(req).then(async (body) => {
+      const journal = String((body && body.journal) || '').trim();
+      if (!journal) return json(res, 400, { ok: false, error: '缺少操作日志路径' });
+      const result = await getRehomeRunner().runRollback(journal, { dryRun: !!(body && body.dryRun) });
       return json(res, 200, { ok: true, ...result });
+    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
+  }
+  if (req.method === 'POST' && p === '/api/rehome/dedupe/background') {
+    return readBody(req).then(async (body) => {
+      const payload = body || {};
+      // 后台任务隔离：默认只读；写入必须同时给 allowBackground 与 apply。
+      const result = await getRehomeRunner().runBackgroundDedupe({
+        dryRun: payload.dryRun !== false,
+        allowBackground: payload.allowBackground === true,
+        apply: payload.apply === true,
+        mode: payload.mode === 'containment' || payload.aggressive === true ? 'containment' : 'exact',
+        force: payload.force === true,
+      });
+      return json(res, result.ok === false ? 409 : 200, { ok: result.ok !== false, ...result });
     }).catch((error) => json(res, 400, { ok: false, error: error.message }));
   }
 
@@ -13039,7 +13066,7 @@ function handleApi(req, res) {
     }
   }
 
-  // 手动补齐「允许完全访问」三层状态（偏好 / 会话字段 / 页面开关）。
+  // 手动补齐偏好 + 会话字段（开关 B 的手动动作）。不碰页面。
   if (req.method === 'POST' && p === '/api/permission/ensure') {
     return readBody(req).then(async (body) => {
       const acct = currentAccount() || {};
@@ -13047,7 +13074,6 @@ function handleApi(req, res) {
       if (!uid) return json(res, 400, { ok: false, error: '缺少 uid' });
       try {
         const report = await applyPermissionLayers(uid);
-        await installPermissionGuard('ensure');
         return json(res, 200, {
           ok: !!(report && report.ok),
           uid,
@@ -13060,13 +13086,57 @@ function handleApi(req, res) {
     });
   }
 
-  // 只看状态，不动任何东西：偏好文件 + 页面开关 + 守卫运行情况。
+  // 三个开关的读写。默认全关；autoApprove 拒绝开启。
+  if (req.method === 'GET' && p === '/api/permission/config') {
+    return getPermissionStatus({ send: cdpReadyForPermission() ? (m, p2) => cdpSend(m, p2) : null })
+      .then((status) => json(res, 200, { ok: true, ...status }))
+      .catch((e) => json(res, 500, { ok: false, error: e.message }));
+  }
+  if (req.method === 'POST' && p === '/api/permission/config') {
+    return readBody(req).then(async (body) => {
+      const payload = body || {};
+      const applied = [];
+      try {
+        for (const name of ['preferenceGuard', 'configRepair']) {
+          if (typeof payload[name] !== 'boolean') continue;
+          setGuardSwitch(name, payload[name]);
+          applied.push(`${name}=${payload[name]}`);
+        }
+        if (payload.autoApprove === true) {
+          return json(res, 400, { ok: false, error: '执行期自动批准已按策略移除，不能开启' });
+        }
+        // 开关 A 打开后立刻生效，关闭后彻底停止。
+        if (payload.preferenceGuard === true) {
+          if (preferenceGuard) { try { preferenceGuard.stop(); } catch (_) {} preferenceGuard = null; }
+          startPermissionPreferenceGuard();
+        } else if (payload.preferenceGuard === false) {
+          if (preferenceGuard) { try { preferenceGuard.stop(); } catch (_) {} preferenceGuard = null; }
+        }
+        const status = await getPermissionStatus({ send: cdpReadyForPermission() ? (m, p2) => cdpSend(m, p2) : null });
+        log(`[permission] 开关更新 ${applied.join(' ') || '(无变化)'}`);
+        return json(res, 200, { ok: true, ...status });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    }).catch((e) => json(res, 400, { ok: false, error: e.message }));
+  }
+
+  // 一键全停：定时器 + 页面守卫 + 已注册脚本 + 持久化关闭。
+  if (req.method === 'POST' && p === '/api/permission/off') {
+    return stopPermissionGuards({
+      send: cdpReadyForPermission() ? (m, p2) => cdpSend(m, p2) : null,
+      log: (msg) => { try { log(msg); } catch (_) {} },
+    })
+      .then((out) => { if (preferenceGuard) { try { preferenceGuard.stop(); } catch (_) {} preferenceGuard = null; } return json(res, 200, { ok: true, ...out }); })
+      .catch((e) => json(res, 500, { ok: false, error: e.message }));
+  }
+
+  // 只看状态，不动任何东西：开关、定时器、注册脚本、页面探针、各账号偏好。
   if (req.method === 'GET' && p === '/api/permission/status') {
     const acct = currentAccount() || {};
-    return Promise.resolve()
-      .then(() => readGuardState((m, p2) => cdpSend(m, p2)))
+    return getPermissionStatus({ send: cdpReadyForPermission() ? (m, p2) => cdpSend(m, p2) : null })
       .catch(() => null)
-      .then((guardPage) => {
+      .then((status) => {
         const prefs = {};
         try {
           const mod = require('./permission-sync.js');
@@ -13081,7 +13151,7 @@ function handleApi(req, res) {
           ok: true,
           uid: acct.uid || '',
           preferenceGuard: preferenceGuard ? preferenceGuard.stats() : null,
-          pageGuard: guardPage,
+          ...(status || {}),
           preferences: prefs,
         });
       });
@@ -13531,13 +13601,27 @@ function startServer() {
       writeUiPortFile(port);
       log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
       startRehomeWatcher();
-      // 偏好文件守卫（第 4 层）：任何时刻被写回默认值都还原，不依赖切号事件。
+      // 启动恢复检查：默认只读报告，不改数据库；startupReconcile=true 才自动接管。
+      setTimeout(() => {
+        const cfg = getRehomeRunner().readConfig();
+        rehomeWatcher.reconcile({ autoRun: cfg.startupReconcile === true })
+          .then((r) => {
+            if (!r || r.ok === false) {
+              log(`[rehome] 启动检查失败: ${(r && r.error) || 'unknown'}`);
+              return;
+            }
+            log(`[rehome] 启动检查 当前=${r.currentUid} 待接管=${r.wouldAffect} ` +
+              `autoRun=${r.applied ? 'yes' : 'no'}`);
+          })
+          .catch((e) => log(`[rehome] 启动检查异常: ${e.message}`));
+      }, 6000);
+      // 偏好文件守卫（开关 A）：默认关闭，只有显式开启才启动。
       startPermissionPreferenceGuard();
-      // 启动时只补偏好与会话字段，不动页面（避免每次开机弹一下权限面板）。
+      // 启动时补齐配置只在开关 B 打开时执行（默认不动用户的权限设置）。
       const bootAcct = currentAccount() || {};
-      if (bootAcct.uid) {
+      if (bootAcct.uid && readGuardConfig().configRepair) {
         setTimeout(() => {
-          applyPermissionLayers(bootAcct.uid, { renderer: false })
+          applyPermissionLayers(bootAcct.uid)
             .catch((error) => log(`[permission] 启动补齐失败: ${error.message}`));
         }, 4000);
       }

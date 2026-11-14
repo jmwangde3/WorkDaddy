@@ -34,3 +34,9 @@ release/.cache/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 本机 WorkBuddy 客户端路径（部署时生成，不入库）
+scripts/workbuddy-exe.json
+
+# 测试跑测产物（每次都变，不入库）
+test/last-run.tap

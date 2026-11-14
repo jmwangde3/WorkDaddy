@@ -20,7 +20,7 @@ set "FAIL=0"
 rem ---- 1) 关键文件齐全 ----
 echo.
 echo [1/6] 检查关键文件...
-for %%F in (daemon.js session-db.js secure-transfer.js lib.js session-transfer.js watchdog.js win-launcher.js windows-process-boundary.js windows-process-boundary.ps1 windows-relaunch-standard.ps1 prepare-win-install.ps1 workbuddy-compat.js inject.js theme-patches.js launcher.cmd launcher-hidden.vbs install-win.cmd install-win.ps1 uninstall-win.cmd uninstall-win.ps1 apply-update.ps1 win\setup.sed) do (
+for %%F in (daemon.js session-db.js rehome-sessions.js rehome-watcher.js session-dedupe.js session-scope.js permission-sync.js upstream.json secure-transfer.js lib.js session-transfer.js watchdog.js win-launcher.js windows-process-boundary.js windows-process-boundary.ps1 windows-relaunch-standard.ps1 prepare-win-install.ps1 workbuddy-compat.js inject.js theme-patches.js launcher.cmd launcher-hidden.vbs install-win.cmd install-win.ps1 uninstall-win.cmd uninstall-win.ps1 apply-update.ps1 win\setup.sed) do (
   if not exist "%SCRIPT_DIR%%%F" (
     echo   缺失: %%~F
     set /a FAIL+=1

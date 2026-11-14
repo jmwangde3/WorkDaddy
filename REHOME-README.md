@@ -616,6 +616,93 @@ POST /api/permission/ensure → pref=fixed db=0 ui=enabled
 
 **已知边界**：修复之前就已经开着的会话，运行期配置在内存里，DB 改了也不会即时生效 —— 切一次会话或重开窗口后才吃到 `fullAccess`。切号本身会重载页面，所以正常使用路径不受影响。
 
+### 11.12 去重算法重写：从「按大小猜」到「按证据判」（1.3.0）
+
+§11.7 / §11.8 的实跑数据证明旧算法能清掉副本，但也暴露了它的判定基础是错的：`dedupeSessions` 只要求**组内存在一对大小相同**，然后整组只留最新一条。组里混入一条无关会话就会被连带软删；文件大小相同但内容不同也会被当成副本。
+
+1.3.0 把判定拆到 `scripts/session-dedupe.js`，四层证据链：
+
+```
+文件层  存在 / 可读 / 非空 / size+mtime+sha256 扫描前后一致
+字节层  raw SHA-256 相同 → 逐字节副本
+消息层  JSONL 每行 JSON，按 id（消息 UUID）建 id→规范化哈希
+        规范化 = 递归删 sessionId + 键排序
+        id 集合相等且同 id 内容相等 → 内容副本
+包含层  仅 --containment：A 的消息（含无 id 记录多重集）⊆ B，且同 id 无冲突
+        → A 是旧副本，保留 B；候选保留者不唯一则跳过
+```
+
+**保留对象的确定**：完全相同 → `updated_at` 新者；包含关系 → 消息更完整者。**任何一层给不出结论 → 整组保留。**
+
+**竞态防护**：
+1. 计划阶段记录每个文件的 size + sha256；
+2. 写入前复验一次，间隔 250ms 再验一次（挡住「边写边删」）；
+3. DB 更新带 `deleted_at IS ?` CAS 条件；
+4. 事务返回的 `changes` 与预期不符 → 立即补偿回滚，返回 `aborted`。
+
+**默认关闭**：`rehome-sessions.json` 需要显式 `"dedupe": true`；`run()` 不再调用去重（返回 `dedupe.skipped=manual-only`）。手动入口 `--dedupe` / `--dedupe-background`，`--force` 可单次绕过配置。
+
+**备份与回滚**：每次执行 `VACUUM INTO rehome-backups/workbuddy-dedupe-<stamp>.db`，并写 `dedupe-<stamp>.json`：
+
+```json
+{ "version":1, "opId":"dedupe-...", "rows":[
+  { "id":"...", "before":null, "after":1763..., "reason":"exact-duplicate", "keepId":"..." } ] }
+```
+
+`--dedupe-rollback <json>` 只恢复 `deleted_at` 仍等于 `after` 的行；之后被别处改过的行记 `changed-since-operation` 并跳过。
+
+**测试**：`test/rehome-dedupe.test.js` 覆盖 16 类场景（同大小不同内容、混入独立会话、UUID 冲突、多候选保留者、扫描后变化、缺文件、坏 JSONL、后台隔离、归档口径、dry-run、幂等、备份回滚、containment 显式开启…）。
+
+### 11.13 权限三开关：不再替用户点授权（1.3.0）
+
+§11.10 / §11.11 的四层守卫解决了「切号后掉权限」，但代价是工具替用户做了授权决定：自动勾风险声明、自动点「允许完全访问」、按文案自动批准执行期请求。1.3.0 全部撤回，拆成三个独立开关，默认全关：
+
+| 开关 | 实现 | 默认 |
+|---|---|---|
+| A `preferenceGuard` | `startPreferenceGuard()` 3s 轮询偏好文件，只改 `localTaskPermissionMode` | 关 |
+| B `configRepair` | 切号后 `ensurePreference` + `ensureSessionModes`，不碰页面 | 关 |
+| C `autoApprove` | **已删除实现**，`setGuardSwitch` 直接抛错 | 关 |
+
+渲染层只剩只读探针（`buildRendererScript()` 读 `--danger` 类名），`installRendererGuard()` 的语义改成「清理旧版残留」，不再注册 `Page.addScriptToEvaluateOnNewDocument`，也不注入任何 `.click(`。
+
+**统一停止** `stopPermissionGuards({send, persist})`：
+
+1. `clearTimers()` 只清本模块登记过的 interval；
+2. `stopRendererGuard(send)` 对每个已注册 identifier 发 `Page.removeScriptToEvaluateOnNewDocument`，并对页面求值 `clearInterval(window.__wdPermGuard.timer); enabled=false`；
+3. 三个开关写盘为 false（`permission-guard.json` v2）；
+4. 置 `registry.stopped=true`，之后 `startPreferenceGuard()` 直接返回惰性句柄。
+
+旧版 v1 状态文件 `{fullAccess:true}` 读到时**迁移为全关**并落盘 —— 升级不继承「自动点授权」的旧意图。
+
+**状态字段**：`preferenceGuardEnabled` / `rendererGuardEnabled`（恒 false）/ `autoApproveEnabled`（恒 false）/ `configRepairEnabled` / `activeTimerCount` / `registeredScriptIds` / `pageGuard` / `stopped` / `statePath`。
+
+**测试**：`test/permission-guard.test.js` 覆盖默认全关、A/B 互不隐式启用、C 拒绝开启、`--off` 全停、重连不复活、重复 stop 幂等、旧状态迁移、`--apply` 不动页面。
+
+### 11.14 发布前复核：把「凭注释相信」改成「凭实测判定」（1.3.0 复核轮）
+
+复核发现的问题按「会不会误删 / 误授权」排序处理。
+
+**去重内核的四处误判来源**
+
+1. `canonicalize()` 原来**递归**删同名 `sessionId`。但复制会话时被改写的只有每行**最外层**字段；嵌套在消息内容里的同名键（工具调用参数、工具结果携带的会话引用）是真实内容。递归删会让两份不同的记录算出同一个哈希 → 误判为副本。改成只去掉 `depth === 0` 的 `sessionId`。
+2. `inspectSessionFile` 里 `ok` 没有包含 `parsed`。同文件重复 UUID 会让 `parsed=false` 但 `ok=true`，虽然当时靠下游 unknown 兜住了，状态位本身是错的。现在显式 `error='duplicate-message-ids'` 且 `ok=false`；同时把 `compareFingerprints` 的字节相同判定提到 `ok` 检查**之前**（有重复 UUID 的文件只要逐字节相同仍然安全，不该被一刀切拒绝）。
+3. 只比消息集合，没看**顺序**。包含关系里 A 的消息 id 序列必须是 B 的子序列才认定是截断副本 —— 两条独立会话撞了相同消息时通常顺序不同。时间戳不能用来判（先创建的那条完全可能是「聊两句就复制走、原件继续聊」）。
+4. 附件/图片只存引用。现在两层处理：会话旁边有附属产物（`<id>/`、`<id>.png`）→ 整组保留；引用是相对路径（`images/a.png`）→ 只认逐字节相同，消息层不作证。
+
+**接管范围的判定改为自证**
+
+`session-scope.js` 新增 `assessDeletedSemantics(db)`：把表里实际出现的 `deleted_at` 取值按 transport 分组数出来，编码一致的才算 `verified`。local 行上出现 `-1`、cloud 行上出现 `NULL`、`transport` 是未知值 —— 全部计入 `issues`，并且 `buildTakeoverScope` 的 local 谓词收紧成 `deleted_at IS NULL AND (transport IS NULL OR transport = 'local')`，异常行与来源不明的行**永不接管**（`local-only(strict)`）。`--status` / `inspectTransports()` 会把体检结果报出来。
+
+**`--dedupe-background` 与后台隔离的语义冲突**
+
+原实现里 `--dedupe-background --force` 直接就写库，与「后台任务不参与去重」的规则在读文档时互相矛盾。现在改成双重显式：`allowBackground: true`（承认目标是后台任务）+ `apply: true`（真的要写）；只给 `allowBackground` 一律按只读计划处理，缺 `allowBackground` 直接返回 `skipped: background-dedupe-requires-allow-background`。daemon 的 `POST /api/rehome/dedupe/background` 同步改成默认 `dryRun`。
+
+**权限停止的可验证边界**
+
+`stopRendererGuard` 从「清一个 timer」扩到：`clearInterval/clearTimeout` → 已登记 MutationObserver 的 `disconnect()` → 已登记 handler 的 `removeEventListener`（capture 与 bubble 各一次）→ `delete window.__wdPermGuard` 等 5 个已知全局。CDP 脚本 identifier 现在**落盘**（`permission-guard.json` v2 的 `registeredScripts`），daemon 重启后仍能删掉上次注册的脚本。旧守卫拆到就报 `needsReload: true`，`reload: true` / `--reload` 会发 `Page.reload` 彻底清监听器 —— 未知结构的监听器只有重载能保证消失，这一点不藏。
+
+**测试**：去重 21 类场景（新增嵌套 sessionId、重复 UUID、附属产物、包含顺序不符），范围 6 组（新增语义体检、异常行与未知 transport 不接管），权限新增页面残留与落盘脚本两组断言，部署 8 组（新增 advisory 版本闸门、原版上游代际拦截、`-Force` 越过）。
+
 ## 12. 系统托盘控制器（WorkDaddyTray.exe）
 
 WorkDaddy 上游是纯后台双进程，没有托盘图标。本节补一个独立托盘程序，把「启动 / 关闭 / 开机自启」收进右键菜单。
