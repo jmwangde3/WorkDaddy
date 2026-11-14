@@ -257,23 +257,39 @@ UPDATE sessions SET user_id = '当前账号' WHERE ...;
 
 ### 切完号，「允许完全访问」又变回默认权限了
 
-已经自动修好了（v1.2.79 起）。切号完成后，WorkDaddy 会把三层状态一起补回去：
+v1.2.80 起改成**常驻守卫**，不再靠"切号后补一次"。四层一起兜：
 
-1. **账号偏好** —— `localTaskPermissionMode` 写回 `full-access`，新会话默认就是完全访问；
-2. **会话字段** —— 把 `sessions.permission_mode` 补齐成 `fullAccess`，老会话打开时不会退回默认；
-3. **窗口开关** —— 页面重载完成后，如果输入框那儿的开关是关的，自动帮你打开，并点过「确认允许完全访问」。
+1. **账号偏好** —— `localTaskPermissionMode` 写回 `full-access`；
+2. **会话字段** —— `sessions.permission_mode` 补齐成 `fullAccess`；
+3. **页面开关** —— 掉了就自动拨回（含勾选风险声明、点「允许完全访问」）；
+4. **守卫** —— 页面里每 2.5 秒查一次开关，偏好文件每 3 秒查一次，谁被写回默认值就立刻还原；页面重载后守卫自动重跑。执行期弹出的授权框也会自动点「允许」（删除/覆盖/重置类不代点）。
 
-日志里能看到 `[permission] 完全访问已落实 uid=… status=…`。想手动补一次：
+日志里能看到：
+
+```
+[permission] 守卫注入 registered=true evaluated=true
+[permission] 页面守卫已就位 (connect)
+[permission] 偏好被改写 default-sandbox → full-access uid=…（守卫已还原）
+```
+
+手动查状态、手动补一次：
 
 ```bash
+# 三个账号的偏好 + 页面开关 + 守卫运行情况（只读）
+curl -s -H "x-workdaddy-token: $(cat %APPDATA%\WorkDaddy\.api-token)" ^
+  http://127.0.0.1:47832/api/permission/status
+
 # 看三个账号现在各自是什么状态
 node scripts\permission-sync.js
 
 # 立刻补齐（不开页面，只写偏好和会话字段）
 node scripts\permission-sync.js --apply
+
+# 真不想用它了：停掉还原，守卫不再插手
+node scripts\permission-sync.js --off
 ```
 
-> 为什么以前会掉：完全访问是「账号偏好 + 会话字段」两层存的，切号会换账号作用域并重载页面，客户端有时会用旧值把开关写回默认；三层里缺哪一层，界面都会显示成没开。
+> 为什么以前会掉：拨动那个开关是**静默写盘**的 —— 关掉的瞬间 `preferences.json` 就变成 `default-sandbox`，页面卸载、切号、换账号作用域都会触发。一次性补完，下一次写盘又回来了。
 
 ### 侧栏出现两条一模一样的会话
 

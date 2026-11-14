@@ -584,6 +584,38 @@ POST /api/permission/ensure → pref=fixed db=0 ui=enabled
 
 **副作用**：切号后约 3.5 秒，权限面板会被程序开一下再收起（约 1.5 秒），这是为了读开关态并拨回；不想让它动页面就只跑 CLI `node scripts/permission-sync.js --apply`。
 
+### 11.11 三层不够：改成四层常驻守卫（1.2.80）
+
+§11.10 的三层是**一次性**的补法，实测不够 —— 用户反馈「还是失效」。原因不是补错了，是补完还会被再次写回：
+
+```
+15:25:06  手动关掉开关 → user-721d1e45.../global/preferences.json 立刻变成 default-sandbox
+15:27:40  守卫还原     → 偏好被改写 default-sandbox → full-access（守卫已还原）
+```
+
+拨开关是**静默写盘**：关掉的瞬间就落盘，不需要确认。页面卸载 / 切号换作用域 / 关会话都可能触发一次写盘，一次性的 `applyFullAccess` 永远追不上。
+
+**第 4 层 = 两处常驻守卫**
+
+1. `startPreferenceGuard()`（主进程）：每 3 秒扫 `storage/user-*/global/preferences.json`，只检查 `localTaskPermissionMode` 一个键，不是 `full-access` 就原子写回并记日志。意图开关落盘在 `%APPDATA%\WorkDaddy\permission-guard.json`，`--off` 后完全不插手。
+2. `wdPermGuard()`（渲染层）：通过 `Page.addScriptToEvaluateOnNewDocument` 注册，页面重载自动重跑；`Runtime.evaluate` 对当前文档装一次。每 2.5 秒读一次 `.cr-permission-setting` 的 `--danger` 类名（不用开面板），掉了就复刻人工操作拨回（开面板 → 点 `input[role=switch]` → 勾风险复选框 → 点「允许完全访问」），完成后用类名复验。
+
+**顺带接管执行期授权框**：`approve()` 同时扫弹窗和行内审批卡，只点文案严格匹配 `允许|允许一次|本会话允许|始终允许|同意|批准` 的按钮，且排除「允许完全访问」设置弹窗、`.cr-permission-panel` 容器、以及含 `删除|覆盖|清空|重置|卸载|格式化` 的卡片 —— 破坏性操作不代点。
+
+**实测（15:27 / 15:29）**
+
+```
+手动关开关           → row--on=false，偏好落盘 default-sandbox
+等 7 秒（不调任何接口）→ pageGuard on=true enables=1 last=enabled
+                        prefs 三个账号全 full-access，restores=1
+人为把 106cbbda 偏好写回 default-sandbox → 5 秒后自动还原，日志有「守卫已还原」
+守卫 v4 装载          → pageGuard.version=4 runs=5 last=on
+```
+
+**观察入口**：`GET /api/permission/status`（需 `x-workdaddy-token`）返回 `preferenceGuard`（checks/restores/intent）、`pageGuard`（version/on/runs/enables/approvals/last/log 尾 8 条）、`preferences`（三账号当前值）。
+
+**已知边界**：修复之前就已经开着的会话，运行期配置在内存里，DB 改了也不会即时生效 —— 切一次会话或重开窗口后才吃到 `fullAccess`。切号本身会重载页面，所以正常使用路径不受影响。
+
 ## 12. 系统托盘控制器（WorkDaddyTray.exe）
 
 WorkDaddy 上游是纯后台双进程，没有托盘图标。本节补一个独立托盘程序，把「启动 / 关闭 / 开机自启」收进右键菜单。

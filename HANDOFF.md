@@ -265,6 +265,24 @@ UPDATE sessions SET deleted_at = ?, updated_at = ?, unread = 0 WHERE id = ?
 
 自动保活：`scripts/permission-sync.js`（三层一起补，幂等），daemon 在 `/api/switch` 成功后 3.5s 调一次、账号监听触发时也调、启动只补前两层。手动：`POST /api/permission/ensure`（需 `x-workdaddy-token`）或 `node scripts/permission-sync.js --apply`。
 
+### 5.12 权限「补一次」没用，必须常驻（1.2.80 教训）
+
+§5.11 记的三层是对的，但**一次性补齐本身就是错的解法**。实测证据：
+
+- 拨开关是静默写盘：关掉的瞬间 `preferences.json` 就变 `default-sandbox`，不弹任何确认（15:25:06 抓到）。
+- 页面卸载 / 切号换账号作用域 / 换会话都可能触发写盘。一次性 `applyFullAccess` 补完，下一次写盘又回去了，所以用户体感是「还是失效」。
+
+正确解法是两处常驻守卫，别再加第三处一次性逻辑：
+
+1. `startPreferenceGuard()` — 3s 轮询所有账号偏好，只认 `localTaskPermissionMode` 一个键，不符就原子写回。`%APPDATA%\WorkDaddy\permission-guard.json` 里 `fullAccess:false` 时完全不动作（`permission-sync.js --off`），避免和用户手动关闭打架。
+2. `wdPermGuard()` — 用 `Page.addScriptToEvaluateOnNewDocument` 注册到渲染层，重载自动重跑；2.5s 读 `.cr-permission-setting--danger` 判开关态（比开面板便宜且无副作用），掉了就复刻人工操作拨回。改这个守卫代码必须**同时把 VERSION 加一**，否则页面里旧版本会直接 return、改了不生效。
+
+执行期授权框也归守卫管（`approve()`）：只点`允许|允许一次|本会话允许|始终允许|同意|批准`，排除设置弹窗与含`删除|覆盖|清空|重置|卸载|格式化`的卡片。破坏性操作永远不代点。
+
+排查入口：`GET /api/permission/status`（`x-workdaddy-token`）。看到 `pageGuard.on=false` 就是没开、`preferenceGuard.restores` 一直涨就是有人在反复写回（正常，说明守卫在工作）。
+
+**边界**：修复前已打开的会话，运行期配置在内存里，DB 改了不即时生效；切会话或重开窗口才吃到。别拿这个当 bug 改 DB，没用。
+
 ### 5.10 章节号是契约
 
 `REHOME-README.md` 的 `§` 编号被各文件引用。**改内容可以，别重排编号、别复用已作废的小节号。**
