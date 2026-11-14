@@ -39,8 +39,11 @@ function sha256(file) {
 }
 
 function runDeploy(args, env) {
+  // -DataDir 必须指到临时目录：deploy.ps1 会把部署报告和脚本备份写到那里，
+  // 不给就会落在用户真实的 %APPDATA%\WorkDaddy 里，每跑一次留两份垃圾。
+  const dataDir = path.join(tmpRoot('data'), 'WorkDaddy');
   const r = spawnSync('powershell.exe', [
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', deploy, ...args,
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', deploy, ...args, '-DataDir', dataDir,
   ], { encoding: 'utf8', timeout: 120000, env: env ? { ...process.env, ...env } : process.env });
   return { code: r.status, out: `${r.stdout || ''}${r.stderr || ''}` };
 }
@@ -229,6 +232,7 @@ function main() {
     const r = spawnSync('powershell.exe', [
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', deploy,
       '-TargetDir', scripts, '-NoRestart',
+      '-DataDir', path.join(tmpRoot('data-rollback'), 'WorkDaddy'),
     ], {
       encoding: 'utf8', timeout: 120000,
       env: { ...process.env, WORKDADDY_DEPLOY_TESTING: '1', WORKDADDY_DEPLOY_FAIL_AFTER: '3' },

@@ -298,6 +298,11 @@ CommandNotFoundException: The term 'Get-FileHash' is not recognized …
 - 保留能力：`-TargetDir`、`-DryRun`、代际闸门、备份回滚、`workbuddy-exe.json` 永不覆盖。
 - 用途只剩两个：老用户迁出配置；上游大版本升级后临时救急。
 - 新安装器的旧补丁版识别**不执行** `deploy.ps1`，只按文件名复制配置（只读，不动原目录）。
+- 新增 `-DataDir`：部署报告与脚本备份原来硬编码到 `%APPDATA%\WorkDaddy`，
+  于是**每跑一次测试就在用户真实数据目录里留一份** `deploy-report-*.json` 和
+  `script-backups\deploy-*`（本机实测攒了 55 份报告、104 个备份目录）。
+  现在默认值不变，测试用 `-DataDir` 指到临时目录。`test/deploy-safety.test.js`
+  的两处调用都已改。
 
 ### 5.3 tray/WorkDaddyTray.exe：暂时保留
 

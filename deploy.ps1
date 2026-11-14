@@ -50,12 +50,18 @@ param(
     [switch]$ForceVersion,
     [switch]$DryRun,
     [string]$TargetDir,
+    # 部署报告与脚本备份落在哪。默认 %APPDATA%\WorkDaddy；
+    # 测试必须指到临时目录 —— 否则每跑一次就在用户真实数据目录里留一份
+    # deploy-report-*.json 和 script-backups\deploy-*。
+    [string]$DataDir = '',
     [switch]$StrictVersionGate,
     [switch]$StrictFileGate
 )
 
 $OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $ErrorActionPreference = 'Stop'
+if (-not $DataDir) { $DataDir = Join-Path $env:APPDATA 'WorkDaddy' }
+$DataDir = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
 
 $script:FailStage = ''
 $script:Report = [ordered]@{
@@ -375,7 +381,7 @@ if ($clientVersion) {
 Head '4/7 备份将被修改的文件'
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$bak = Join-Path $env:APPDATA "WorkDaddy\script-backups\deploy-$stamp"
+$bak = Join-Path $DataDir "script-backups\deploy-$stamp"
 $script:Report.backupDir = $bak
 
 $existing = @()
@@ -555,7 +561,7 @@ $script:Report.stage = 'done'
 $script:Report.finishedAt = (Get-Date).ToString('o')
 
 if (-not $DryRun) {
-    $reportPath = Join-Path $env:APPDATA "WorkDaddy\deploy-report-$stamp.json"
+    $reportPath = Join-Path $DataDir "deploy-report-$stamp.json"
     try {
         New-Item -ItemType Directory -Path (Split-Path $reportPath -Parent) -Force | Out-Null
         $script:Report | ConvertTo-Json -Depth 6 | Set-Content -Path $reportPath -Encoding UTF8
