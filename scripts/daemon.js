@@ -51,6 +51,7 @@ const {
   detectWindowsPrivilege,
   detectNativeWindowsPrivilege,
   buildNativeProcessQuery,
+  enumerateCimProcesses,
   filterVerifiedWindowsProcesses,
   filterVerifiedNodeProcesses,
   parseCimProcessResult,
@@ -812,12 +813,20 @@ function diagnosticsEnabled() {
 function redactDiagnosticText(value, maxLength = 2500) {
   const limit = Number.isInteger(maxLength) && maxLength > 0 ? maxLength : 2500;
   return String(value == null ? '' : value)
+    // 与 sentry-report.js 的 redactText 保持同一套规则（改一处要同步另一处）
     .replace(/(authorization\s*[:=]\s*)(?:[A-Za-z][A-Za-z0-9_-]*\s+)?[^\s,"']+/ig, '$1[redacted]')
+    // 裸写的 scheme + 凭证：没有 authorization: 前缀时（tags/note/异常消息里很常见）也要认
+    .replace(/\b(Bearer|Basic|Token|Digest)\s+[A-Za-z0-9\-._~+/=]{8,}/g, '$1 [redacted]')
     .replace(/((?:set-)?cookie\s*[:=]\s*)[^\r\n]+/ig, '$1[redacted]')
-    .replace(/(["']?(?:access.?token|refresh.?token|token|cookie|password|api.?key|secret)["']?\s*[:=]\s*)"[^"\r\n]*"/ig, '$1"[redacted]"')
-    .replace(/(["']?(?:access.?token|refresh.?token|token|cookie|password|api.?key|secret)["']?\s*[:=]\s*)'[^'\r\n]*'/ig, "$1'[redacted]'")
-    .replace(/(["']?(?:access.?token|refresh.?token|token|cookie|password|api.?key|secret)["']?\s*[:=]\s*["']?)[^"'\s,}\]]+/ig, '$1[redacted]')
-    .replace(/\b(?:sk|key)-[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+    .replace(/(["']?x-api-key["']?\s*[:=]\s*["']?)[^"'\s,}]+/ig, '$1[redacted]')
+    .replace(/(["']?(?:access.?token|refresh.?token|id.?token|token|cookie|password|passwd|secret|api.?key|api-key|apikey|private.?key)["']?\s*[:=]\s*)"[^"\r\n]*"/ig, '$1"[redacted]"')
+    .replace(/(["']?(?:access.?token|refresh.?token|id.?token|token|cookie|password|passwd|secret|api.?key|api-key|apikey|private.?key)["']?\s*[:=]\s*)'[^'\r\n]*'/ig, "$1'[redacted]'")
+    .replace(/(["']?(?:access.?token|refresh.?token|id.?token|token|cookie|password|passwd|secret|api.?key|api-key|apikey|private.?key)["']?\s*[:=]\s*["']?)[^"'\s,}\]]+/ig, '$1[redacted]')
+    // 命令行凭证
+    .replace(/((?:--?)(?:token|password|passwd|secret|api-?key)\s*[= ]\s*)("[^"]*"|'[^']*'|\S+)/ig, '$1[redacted]')
+    // URL 查询参数
+    .replace(/(https?:\/\/[^\s"'?]+)[?&](?:token|access_token|refresh_token|id_token|api_key|api-key|apikey|key|secret|sig|signature|password|code)=[^&\s"']+/ig, '$1?[redacted-query]')
+    .replace(/\b(?:sk|key|pk)-[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
     .replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g, '[redacted]')
     .slice(0, limit);
 }
@@ -3197,18 +3206,30 @@ const PROFILE_BINARY_NAMES = new Set((
     PROFILE.id === 'workbuddy-cn' ? ['workbuddy.exe'] : ['codebuddy.exe'])
 ).map((name) => String(name).toLowerCase()));
 
-function queryWindowsWorkBuddyProcesses() {
+function runWindowsWorkBuddyProcessQuery() {
   const names = [...PROFILE_BINARY_NAMES].map((name) => `\"${name}\"`).join(',');
   const helper = path.join(__dirname, 'windows-process-boundary.ps1');
   const command = buildNativeProcessQuery(helper,
     `$names=@(${names}); Get-CimInstance Win32_Process -Filter (($names | ForEach-Object { "Name='$_'" }) -join ' OR ') -ErrorAction Stop | Where-Object { $names -contains $_.Name }`);
-  const result = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+  return spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
     encoding: 'utf8', timeout: 10000, windowsHide: true,
   });
-  return parseCimProcessResult(result, {
-    requireCommandLine: true, requireCurrentOwner: true, requireNativeArguments: true,
-    allowTransientNotFound: true,
-  });
+}
+
+const PROCESS_QUERY_OPTIONS = {
+  requireCommandLine: true, requireCurrentOwner: true, requireNativeArguments: true,
+  allowTransientNotFound: true,
+};
+
+// 只取进程列表：用于「发现客户端装在哪」这类无副作用判断。
+function queryWindowsWorkBuddyProcesses() {
+  return parseCimProcessResult(runWindowsWorkBuddyProcessQuery(), PROCESS_QUERY_OPTIONS);
+}
+
+// 结构化枚举：用于「要不要结束进程」「能不能替换程序文件」这类决定的输入。
+// processes 为空且 complete=false 时绝不能当成「没有进程」。
+function queryWindowsWorkBuddyProcessEnumeration() {
+  return enumerateCimProcesses(runWindowsWorkBuddyProcessQuery(), PROCESS_QUERY_OPTIONS);
 }
 
 function resolveWorkBuddyBinary() {
@@ -3378,7 +3399,17 @@ async function restoreWorkBuddyWindow(pid) {
 
 function verifiedWindowsWorkBuddyProcesses(binary) {
   if (!binary) throw new Error('未找到 WorkBuddy 可执行文件，无法验证运行中的进程');
-  const processes = queryWindowsWorkBuddyProcesses();
+  const enumeration = queryWindowsWorkBuddyProcessEnumeration();
+  // 部分枚举不能当作「目标进程就这些」。结束进程这类操作一旦漏掉一个，
+  // 新实例会被单实例锁挡住，最后表现成「重启了但没生效」，比直接失败更难查。
+  // 注意：这里区分的是「枚举不完整」和「确实没有进程」——只有后者才允许继续。
+  if (!enumeration.complete) {
+    const kinds = [...new Set(enumeration.skipped.map((item) => item.kind))].join(',') || 'UNKNOWN';
+    const pids = enumeration.skipped.map((item) => item.pid).join(',');
+    throw new Error(`进程枚举不完整（${kinds}；PID=${pids}），无法确认所有目标进程；` +
+      '为避免影响未验证的进程，本次操作已中止；登录信息未修改');
+  }
+  const processes = enumeration.processes;
   const verified = filterVerifiedWindowsProcesses(
     binary, processes, fs.realpathSync.native, PROFILE.customTarget ? PROFILE_BINARY_NAMES : null
   );
@@ -7228,8 +7259,10 @@ const PUBLIC_API_PATHS = new Set([
   '/api/about/',
   '/api/update-check',
   '/api/update-status',
-  // 一键恢复重启：仅 loopback 可达，权限等同于本地 launcher；由用户在状态页确认触发，不静默执行。
-  '/api/client/relaunch',
+  // /api/client/relaunch 不在这里：它会重启客户端，属于有副作用的操作。
+  // 免认证时任何本机网页（Origin: null 也在 isAllowedApiOrigin 里放行）都能触发，
+  // 等于把「重启应用」暴露给任意页面。现在它要求 x-workdaddy-token，
+  // 状态页在渲染时把同一枚 token 嵌进 HTML，fix-cdp.cmd 从 .api-token 读取。
 ]);
 
 function isAllowedApiOrigin(origin) {
@@ -11401,8 +11434,9 @@ function handleApi(req, res) {
 
   // 一键恢复：客户端在运行但调试端口丢失时（通常是官方自动更新后重启），
   // 用带 --remote-debugging-port 的方式重启客户端以恢复注入。
-  // 放在 PUBLIC_API_PATHS：仅 loopback 可达，与 launcher 同等权限；
   // 不做静默自动重启，由用户在状态页确认后触发。
+  // 认证：本路径不在 PUBLIC_API_PATHS 里，必须带 x-workdaddy-token。
+  // 状态页渲染时把 token 嵌进 HTML，fix-cdp.cmd 从 %APPDATA%\WorkDaddy\.api-token 读取。
   if (req.method === 'POST' && p === '/api/client/relaunch') {
     // The flag is deliberately sticky until CDP recovers, so re-check the
     // process immediately before acting. A stale flag or an unknown probe
@@ -13980,7 +14014,7 @@ function startServer() {
           '<p id="wbs-relaunch-msg" style="margin:8px 0 0;color:#9a9aa0;font-size:12px"></p></div>' +
           '<script>(function(){var b=document.getElementById("wbs-relaunch"),m=document.getElementById("wbs-relaunch-msg");' +
           'b.onclick=function(){b.disabled=true;m.textContent="正在重启客户端…";' +
-          'fetch("/api/client/relaunch",{method:"POST"}).then(function(r){return r.json();}).then(function(j){' +
+          'fetch("/api/client/relaunch",{method:"POST",headers:{"x-workdaddy-token":"' + API_TOKEN + '"}}).then(function(r){return r.json();}).then(function(j){' +
           'm.textContent=j.ok?"已发送重启指令，请等待客户端重新出现":"恢复失败："+(j.error||"未知错误");b.disabled=false;}).catch(function(e){' +
           'm.textContent="请求失败："+e.message;b.disabled=false;});};})();</script>'
         : '';

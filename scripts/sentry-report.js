@@ -155,12 +155,32 @@ function readVersion() {
   }
 }
 
+// 脱敏规则集中在这里，daemon.js 的 redactDiagnosticText 用同一套（改一处要同步另一处）。
+// 顺序有讲究：先处理带引号的值（可能内含空格），再处理裸值；
+// 证书类前缀（sk-/key-）和 JWT 单独识别，因为它们未必出现在 key=value 形式里。
 function redactText(value) {
   return String(value == null ? '' : value)
     .replaceAll(HOME, '<HOME>')
-    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s"']+/ig, '$1<redacted>')
-    .replace(/(["']?(?:accessToken|refreshToken|idToken|token|cookie|password|secret|apiKey|authorization)["']?\s*[:=]\s*["']?)[^"'\s,}]+/ig, '$1<redacted>')
-    .replace(/(https?:\/\/[^\s"']+)[?&](?:token|access_token|refresh_token)=[^&\s"']+/ig, '$1<redacted>')
+    // Authorization 任意 scheme：Bearer / Basic / Token / Digest
+    .replace(/(authorization\s*[:=]\s*)(?:[A-Za-z][A-Za-z0-9_-]*\s+)?[^\s,"']+/ig, '$1<redacted>')
+    // 裸写的 scheme + 凭证：日志里经常只有 "Bearer xxx" 而没有 authorization: 前缀，
+    // 或者被拼进 tags/note 这类字段里。这类必须单独认，否则换个位置就漏。
+    .replace(/\b(Bearer|Basic|Token|Digest)\s+[A-Za-z0-9\-._~+/=]{8,}/g, '$1 <redacted>')
+    // x-api-key 这类带前缀的头，以及裸写 Set-Cookie / Cookie
+    .replace(/((?:set-)?cookie\s*[:=]\s*)[^\r\n]+/ig, '$1<redacted>')
+    .replace(/(["']?x-api-key["']?\s*[:=]\s*["']?)[^"'\s,}]+/ig, '$1<redacted>')
+    // key=value 形式的凭证，带引号的先处理
+    .replace(/(["']?(?:access.?token|refresh.?token|id.?token|token|cookie|password|passwd|secret|api.?key|api-key|apikey|private.?key|authorization)["']?\s*[:=]\s*)"[^"\r\n]*"/ig, '$1"<redacted>"')
+    .replace(/(["']?(?:access.?token|refresh.?token|id.?token|token|cookie|password|passwd|secret|api.?key|api-key|apikey|private.?key|authorization)["']?\s*[:=]\s*)'[^'\r\n]*'/ig, "$1'<redacted>'")
+    .replace(/(["']?(?:access.?token|refresh.?token|id.?token|token|cookie|password|passwd|secret|api.?key|api-key|apikey|private.?key|authorization)["']?\s*[:=]\s*["']?)[^"'\s,}\]]+/ig, '$1<redacted>')
+    // 命令行凭证：--token xxx / --password=xxx / -p=xxx
+    .replace(/((?:--?)(?:token|password|passwd|secret|api-?key)\s*[= ]\s*)("[^"]*"|'[^']*'|\S+)/ig, '$1<redacted>')
+    // URL 查询参数（含 sentry 自己的 dsn key 形态）
+    .replace(/(https?:\/\/[^\s"'?]+)[?&](?:token|access_token|refresh_token|id_token|api_key|api-key|apikey|key|secret|sig|signature|password|code)=[^&\s"']+/ig, '$1?<redacted-query>')
+    // sk-/key- 前缀的密钥
+    .replace(/\b(?:sk|key|pk)-[A-Za-z0-9_-]{8,}\b/g, '<redacted>')
+    // JWT：三段式 base64url，header 恒以 eyJ 开头
+    .replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g, '<redacted>')
     .slice(0, MAX_TEXT);
 }
 
@@ -172,7 +192,9 @@ function sanitize(value, depth = 0) {
   if (typeof value === 'object') {
     const result = {};
     for (const [key, item] of Object.entries(value)) {
-      if (/token|secret|password|cookie|authorization|credential|private.?key/i.test(key)) {
+      // key 名带这些字样的一律不看值直接抹：值长什么样都有可能，
+      // 而且 x-api-key / apiKey / access-key 这类命名不统一，只能靠关键词兜住。
+      if (/token|secret|password|passwd|cookie|authorization|credential|private.?key|api.?key|x-api-key|access.?key|session/i.test(key)) {
         result[key] = '<redacted>';
       } else {
         result[key] = sanitize(item, depth + 1);
@@ -196,10 +218,19 @@ function parseDsn(dsn) {
   return endpoint;
 }
 
+// 最终出口的兜底：makeEvent 里各字段都走过 redactText，但只要将来加一个新字段时忘了，
+// 凭证就会原样发出去，而且是发到外部服务 —— 这种错误不可撤销。
+// 所以序列化之前对完整事件再过一遍，不依赖调用方记得脱敏。
+// 放在这里而不是 makeEvent 里，是因为 outbox 队列、强制上报、失败重试都汇流到这两个出口。
+function sanitizeEvent(event) {
+  return sanitize(event);
+}
+
 function eventEnvelope(event) {
-  const header = JSON.stringify({ event_id: event.event_id, sent_at: new Date().toISOString() });
+  const safe = sanitizeEvent(event);
+  const header = JSON.stringify({ event_id: safe.event_id, sent_at: new Date().toISOString() });
   const itemHeader = JSON.stringify({ type: 'event', content_type: 'application/json' });
-  return `${header}\n${itemHeader}\n${JSON.stringify(event)}\n`;
+  return `${header}\n${itemHeader}\n${JSON.stringify(safe)}\n`;
 }
 
 function sendEvent(event) {
@@ -234,7 +265,9 @@ function queueEvent(event) {
   try {
     fs.mkdirSync(OUTBOX_DIR, { recursive: true, mode: 0o700 });
     const file = path.join(OUTBOX_DIR, `${event.event_id}.json`);
-    fs.writeFileSync(file, JSON.stringify(event), { mode: 0o600 });
+    // 落盘也要脱敏：outbox 里的东西迟早会被 flushOutbox 发出去，
+    // 而且它会躺在用户数据目录里，比网络请求更持久。
+    fs.writeFileSync(file, JSON.stringify(sanitizeEvent(event)), { mode: 0o600 });
     const files = fs.readdirSync(OUTBOX_DIR).filter((name) => name.endsWith('.json')).sort();
     for (const old of files.slice(0, Math.max(0, files.length - MAX_OUTBOX_FILES))) {
       try { fs.unlinkSync(path.join(OUTBOX_DIR, old)); } catch (_) {}

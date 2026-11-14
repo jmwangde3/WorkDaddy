@@ -32,7 +32,18 @@ if not errorlevel 1 (
 echo   CDP down - will relaunch client.
 
 echo [3/4] POST /api/client/relaunch ...
-curl.exe -s -X POST %DAEMON%/api/client/relaunch
+rem 重启客户端有副作用，现在要求本地 API token（原来免认证，任何本机网页都能触发）
+set "TOKEN_FILE=%APPDATA%\WorkDaddy\.api-token"
+set "WD_TOKEN="
+if exist "%TOKEN_FILE%" set /p WD_TOKEN=<"%TOKEN_FILE%"
+if not defined WD_TOKEN (
+  echo   ERROR: cannot read local API token from %TOKEN_FILE%
+  echo   Start WorkDaddy once so the token file is created, then retry.
+  echo.
+  pause
+  exit /b 1
+)
+curl.exe -s -X POST -H "x-workdaddy-token: %WD_TOKEN%" %DAEMON%/api/client/relaunch
 echo.
 echo   WorkBuddy is restarting. Please wait up to 40s ...
 
