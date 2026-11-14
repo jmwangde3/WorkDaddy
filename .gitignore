@@ -43,3 +43,6 @@ scripts/workbuddy-exe.json
 
 # 测试跑测产物（每次都变，不入库）
 test/last-run.tap
+
+# 打包输出（installer/build-package.ps1 默认写到这里；SHA256SUMS.txt 不在上面的通配里）
+/release/dist/
