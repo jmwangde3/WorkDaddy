@@ -17,33 +17,29 @@ function navigationFunction(name, context) {
   return context[name];
 }
 
-test('resizing a narrow window hides navigation, closes previews and cancels dragging; widening restores it', () => {
+test('chat width controls navigation and fullscreen previews cancel dragging and hide flyouts', () => {
   const style = { setProperty() {} };
   let previewOpen = true, cancelled = false;
+  const area = { rect: { left:240, right:1240, top:40, bottom:840, width:1000, height:800 } };
   const context = {
-    root: { style }, surface: { viewportElement: { getBoundingClientRect: () => ({ left: 240, top: 40, width: 1000, height: 800 }) } },
-    hidden: false, window: { innerWidth: 1440 }, turns: [{ id: 'a' }, { id: 'b' }],
-    dragPointerId: 7, positionFlyouts() {},
-    hideTooltip(immediate) { assert.equal(immediate, true); previewOpen = false; },
-    finishNavDrag(event, cancel) { assert.equal(event.pointerId, 7); cancelled = cancel; context.dragPointerId = null; },
+    root: { style }, surface: { viewportElement: { getBoundingClientRect: () => ({ left:240, top:40, right:1240, bottom:840, width:1000, height:800 }) } },
+    WBS_COMPAT: { findConversationArea: () => area }, document: {},
+    hidden: false, window: { innerWidth:1440 }, turns: [{id:'a'},{id:'b'}],
+    dragPointerId:7, positionFlyouts() {},
+    hideTooltip(immediate) { assert.equal(immediate,true); previewOpen=false; },
+    finishNavDrag(event,cancel) { assert.equal(event.pointerId,7);cancelled=cancel;context.dragPointerId=null; },
   };
-  const position = navigationFunction('position', context);
-  position();
-  assert.equal(style.display, 'block');
-  context.window.innerWidth = 1280;
-  position();
-  assert.equal(style.display, 'none');
-  assert.equal(previewOpen, false);
-  assert.equal(cancelled, true);
-  assert.equal(context.hidden, false, 'responsive hiding must not disable the feature or lose its loaded turns');
-  context.window.innerWidth = 1281;
-  position();
-  assert.equal(style.display, 'block');
-  assert.equal(previewOpen, false, 'expanding the window must not reopen an old preview');
-  context.hidden = true;
-  style.display = 'none';
-  position();
-  assert.equal(style.display, 'none', 'resizing must not enable disabled or empty navigation');
+  const position=navigationFunction('position',context);
+  position(); assert.equal(style.display,'block');
+  area.rect.width=799; area.rect.right=1039;
+  position(); assert.equal(style.display,'none');assert.equal(previewOpen,false);assert.equal(cancelled,true);
+  assert.equal(context.hidden,false,'layout changes preserve the user setting and loaded turns');
+  area.rect.width=900;area.rect.right=1140;context.window.innerWidth=1200;
+  position();assert.equal(style.display,'block','a narrow window can still have a wide enough chat');
+  area.rect=null;position();assert.equal(style.display,'none','fullscreen preview occlusion hides the index');
+  area.rect={left:240,right:1140,top:40,bottom:840,width:900,height:800};
+  position();assert.equal(style.display,'block');assert.equal(previewOpen,false);
+  context.hidden=true;style.display='none';position();assert.equal(style.display,'none');
 });
 
 test('navigation displays at most 20 evenly spaced markers while retaining both conversation ends', () => {
@@ -75,6 +71,30 @@ test('moving between a marker, prompt list and detail keeps the hover surface op
   assert.equal(closes, 1);
   pointerOut({ relatedTarget: null });
   assert.equal(closes, 2);
+});
+
+test('window-level scroll and resize targets bypass Node.contains and still refresh navigation', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../scripts/inject.js'), 'utf8');
+  const start = source.indexOf('      function onWindowChange(event) {');
+  const end = source.indexOf('\n      }', start) + 8;
+  assert.ok(start >= 0 && end > start);
+  let positions = 0, scheduled = 0, flyouts = 0;
+  class NodeLike {}
+  const root = { contains(target) {
+    assert.ok(target instanceof NodeLike, 'contains only receives a DOM Node');
+    return true;
+  } };
+  const context = { Node: NodeLike, root, position: () => { positions++; },
+    scheduleActive: () => { scheduled++; }, positionFlyouts: () => { flyouts++; } };
+  vm.runInNewContext(source.slice(start, end), context);
+
+  context.onWindowChange({ target: {} });
+  context.onWindowChange({ target: null });
+  assert.deepEqual([positions, scheduled, flyouts], [2, 2, 0]);
+
+  const node = new NodeLike();
+  context.onWindowChange({ target: node });
+  assert.deepEqual([positions, scheduled, flyouts], [2, 2, 1]);
 });
 
 test('every prompt remains reachable when the rail is capped, including unsampled turns', () => {

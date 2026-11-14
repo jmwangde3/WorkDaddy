@@ -54,6 +54,12 @@ function harness(t, withPlanner = false) {
       const row = rows.get(params[0]); return row && (!params[1] || params[1] === row.user_id) && (!_.includes('deleted_at IS NULL') || row.deleted_at == null) ? [{ ...row }] : [];
     },
     sqliteRun: async (_, params) => {
+      if (_.startsWith('UPDATE sessions SET title = ?, custom_title = ?, updated_at = ?')) {
+        const row = rows.get(params[3]);
+        assert.ok(row); Object.assign(row, { title: params[0], custom_title: params[1], updated_at: params[2] });
+        return { changes: 1 };
+      }
+
       if (_.startsWith('UPDATE sessions SET deleted_at = ?')) {
         let changes = 0;
         for (let i = 2; i < params.length; i += 2) {
@@ -661,7 +667,7 @@ test('manual and automatic switching bypass session activity while retaining ope
 test('mixed sync jobs continue after divergence and report every result', async () => {
   const results = ['conflict', 'copied', 'skipped', 'error'];
   let sizeReads = 0;
-  const ctx = { codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError, crypto, PROFILE: { dataRoot: 'fixture-root' }, autoCopyJobs: new Map(), autoCopyQueue: [], Date,
+  const ctx = { syncSessionPins: async () => {}, codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError, crypto, PROFILE: { dataRoot: 'fixture-root' }, autoCopyJobs: new Map(), autoCopyQueue: [], Date,
     yieldAutoCopyToRenderer: async () => {}, buildAutoCopyPlan: async () => results.map((_, i) => ({ id: String(i) })),
     copySessionRecord: async row => { const status = results[Number(row.id)]; if (status === 'error') throw Error('fixture failure'); return { status, branched: status === 'copied', copiedBytes: status === 'copied' ? 123456 : 0, totalBytes: 123456, warning: status === 'copied' ? 'large session advisory' : '' }; },
     sessionSync: { readSessionSizes: async () => { sizeReads++; return new Map(); } },
@@ -693,7 +699,7 @@ test('mixed sync jobs continue after divergence and report every result', async 
 
 test('active session copy retries transient file races and preserves its target id', async () => {
   let attempts = 0;
-  const ctx = { codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError,
+  const ctx = { syncSessionPins: async () => {}, codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError,
     crypto,
     DATA_DIR: 'fixture-data',
     PROFILE: { dataRoot: 'fixture-root' },
@@ -720,7 +726,7 @@ test('active session copy retries transient file races and preserves its target 
 
 test('active session copy keeps waiting through a longer renderer flush', async () => {
   let attempts = 0;
-  const ctx = { codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError,
+  const ctx = { syncSessionPins: async () => {}, codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError,
     crypto,
     PROFILE: { dataRoot: 'fixture-root' },
     autoCopyJobs: new Map(), autoCopyQueue: [], Date,
@@ -747,7 +753,7 @@ test('active session copy keeps waiting through a longer renderer flush', async 
 
 test('unchanged requested session resolves its target without entering the copy worker', async () => {
   let copies = 0;
-  const ctx = { codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError,
+  const ctx = { syncSessionPins: async () => {}, codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError,
     crypto,
     PROFILE: { dataRoot: 'fixture-root' },
     autoCopyJobs: new Map(), autoCopyQueue: [], Date,
@@ -768,7 +774,7 @@ test('unchanged requested session resolves its target without entering the copy 
 
 for (const error of ['会话消息文件没有消息，未同步', '会话消息文件为空，未同步']) test('empty message sessions are skipped instead of shown as sync failures: ' + error, async () => {
   let cleared = 0;
-  const ctx = { codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError,
+  const ctx = { syncSessionPins: async () => {}, codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError,
     crypto,
     PROFILE: { dataRoot: 'fixture-root' },
     autoCopyJobs: new Map(), autoCopyQueue: [], Date,
@@ -793,7 +799,7 @@ for (const error of ['会话消息文件没有消息，未同步', '会话消息
 test('an empty automatic copy plan does not wait for renderer injection', async () => {
   const planningYields = [];
   let rendererWaits = 0;
-  const ctx = { codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError, crypto, PROFILE: { dataRoot: 'fixture-root' }, autoCopyJobs: new Map(), autoCopyQueue: [], Date,
+  const ctx = { syncSessionPins: async () => {}, codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError, crypto, PROFILE: { dataRoot: 'fixture-root' }, autoCopyJobs: new Map(), autoCopyQueue: [], Date,
     yieldAutoCopyToRenderer: async options => {
       planningYields.push(options);
       if (!options || options.waitForInjection !== false) rendererWaits++;
@@ -814,7 +820,7 @@ test('an empty automatic copy plan does not wait for renderer injection', async 
 test('automatic session sync uses a bounded worker pool', async () => {
   let running = 0;
   let peak = 0;
-  const ctx = { codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError, crypto, PROFILE: { dataRoot: 'fixture-root' }, autoCopyJobs: new Map(), autoCopyQueue: [], Date,
+  const ctx = { syncSessionPins: async () => {}, codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError, crypto, PROFILE: { dataRoot: 'fixture-root' }, autoCopyJobs: new Map(), autoCopyQueue: [], Date,
     yieldAutoCopyToRenderer: async () => {}, buildAutoCopyPlan: async () => Array.from({ length: 8 }, (_, id) => ({ id: String(id) })),
     copySessionRecord: async row => {
       running++;
@@ -836,7 +842,7 @@ test('automatic session sync uses a bounded worker pool', async () => {
 });
 
 test('automatic session sync aggregates copied bytes independently across workers', async () => {
-  const ctx = { codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError, crypto, PROFILE: { dataRoot: 'fixture-root' }, autoCopyJobs: new Map(), autoCopyQueue: [], Date,
+  const ctx = { syncSessionPins: async () => {}, codeBuddyFiles: null, assertSessionAccountIdentity, sanitizeSessionCopyError, crypto, PROFILE: { dataRoot: 'fixture-root' }, autoCopyJobs: new Map(), autoCopyQueue: [], Date,
     yieldAutoCopyToRenderer: async () => {}, buildAutoCopyPlan: async () => Array.from({ length: 8 }, (_, id) => ({ id: String(id) })),
     copySessionRecord: async () => {
       await new Promise(resolve => setTimeout(resolve, 2));
@@ -1104,4 +1110,144 @@ test('copy completion preserves timestamps of concurrent source and target dirty
   assert.equal(h.ctx.getSessionDirtyIndex().get('one', 'a').at, at);
   assert.equal(h.ctx.getSessionDirtyIndex().get('two', 'b').at, at + 1);
   assert.equal((await h.switchTo('two', 'three')).length, 1);
+});
+
+for (const field of ['title', 'custom_title']) test('#511 title-only edit syncs without rewriting messages: ' + field, async t => {
+  const h = harness(t, true);
+  await h.copy();
+  const before = fs.readFileSync(h.file('b'));
+  h.rows.get('a')[field] = 'renamed';
+  h.rows.get('a').updated_at = 200;
+  assert.equal((await h.ctx.buildAutoCopyPlan('one', 'two')).length, 1, 'a clean renderer baseline must not hide renames');
+  const result = await h.copy();
+  assert.equal(result.status, 'copied');
+  assert.equal(h.rows.get('b')[field], 'renamed');
+  assert.deepEqual(fs.readFileSync(h.file('b')), before);
+  assert.equal(h.rows.get('c')[field] || '', field === 'title' ? 'fixture' : '');
+  assert.equal((await h.copy()).status, 'skipped');
+});
+
+test('#511 independent title edits are preserved as a conflict', async t => {
+  const h = harness(t);
+  await h.copy();
+  h.rows.get('a').custom_title = 'source edit';
+  h.rows.get('b').custom_title = 'target edit';
+  const result = await h.copy();
+  assert.equal(result.status, 'conflict');
+  assert.equal(h.rows.get('a').custom_title, 'source edit');
+  assert.equal(h.rows.get('b').custom_title, 'target edit');
+});
+
+test('#511 deleting a local copy preserves siblings and stops automatic recreation across restart', async t => {
+  const h = harness(t);
+  await h.copy();
+  lib.recordSessionDeletion(h.root, [{ id: 'b', user_id: 'two' }]);
+  h.rows.delete('b'); fs.unlinkSync(h.file('b'));
+  for (let i = 0; i < 2; i++) assert.equal((await h.copy()).status, 'skipped');
+  assert.deepEqual([...h.rows.keys()], ['a', 'c']);
+  assert.equal(lib.isAutoCopyTargetExcluded(h.root, h.lineage, 'two'), true);
+  const manual = await h.ctx.copySessionRecord(h.rows.get('a'), 'two');
+  assert.equal(manual.status, 'copied', 'explicit manual sync can restore a copy');
+});
+
+for (const direction of ['target', 'reverse']) test('#511 rename sync resolves direction: ' + direction, async t => {
+  const h = harness(t, true);
+  await h.copy();
+  h.rows.get('b').custom_title = 'renamed on account two';
+  const from = direction === 'reverse' ? 'b' : 'a';
+  const to = direction === 'reverse' ? 'one' : 'two';
+  const result = await h.ctx.copySessionRecord(h.rows.get(from), to, { auto: true, lineageId: h.lineage });
+  assert.equal(result.status, 'copied');
+  assert.equal(h.rows.get('a').custom_title, 'renamed on account two');
+});
+
+test('#511 clearing a custom title propagates even with a clean lifecycle baseline', async t => {
+  const h = harness(t, true);
+  h.rows.get('a').custom_title = h.rows.get('b').custom_title = 'previous name';
+  await h.copy();
+  const dirty = h.ctx.getSessionDirtyIndex();
+  dirty.markBaseline('one'); dirty.clear('one', 'a');
+  h.rows.get('a').custom_title = '';
+  assert.equal((await h.ctx.buildAutoCopyPlan('one', 'two')).length, 1);
+  assert.equal((await h.copy()).status, 'copied');
+  assert.equal(h.rows.get('b').custom_title, '');
+});
+
+test('#511 successive renames propagate through account switches and back', async t => {
+  const h = harness(t, true);
+  const copy = (id, uid) => h.ctx.copySessionRecord(h.rows.get(id), uid, { auto: true, lineageId: h.lineage });
+  await copy('a', 'two'); await copy('b', 'one');
+  await copy('c', 'two'); await copy('a', 'three');
+  h.rows.get('a').custom_title = 'first name';
+  await copy('a', 'two');
+  assert.equal((await copy('c', 'two')).status, 'copied');
+  assert.equal(h.rows.get('c').custom_title, 'first name');
+  h.rows.get('b').custom_title = 'second name';
+  assert.equal((await copy('b', 'one')).status, 'copied');
+  assert.equal(h.rows.get('a').custom_title, 'second name');
+});
+
+test('#511 historical unequal titles surface a conflict instead of a permanent fast-path skip', async t => {
+  const h = harness(t, true);
+  h.rows.get('b').custom_title = 'old local name';
+  const sourceRow = h.rows.get('a'), target = h.rows.get('b');
+  lib.setAutoCopyMapping(h.root, h.lineage, 'two', {
+    targetId: 'b', fingerprintVersion: 3,
+    ...h.ctx.mappingWithSourceRevision(null, 'one', sourceRow),
+    targetRevision: h.ctx.sessionCopyRowRevision(target),
+  });
+  h.ctx.getSessionDirtyIndex().markBaseline('one');
+  assert.equal((await h.ctx.buildAutoCopyPlan('one', 'two')).length, 1);
+  assert.equal((await h.copy()).status, 'conflict');
+  assert.equal(h.rows.get('b').custom_title, 'old local name');
+});
+
+for (const changed of ['a', 'b']) test('#511 atomic title update preserves a concurrent edit on ' + changed, async t => {
+  const h = harness(t);
+  await h.copy();
+  h.rows.get('a').custom_title = 'rename';
+  const before = fs.readFileSync(h.file('b'));
+  const { createSessionDb } = require('../scripts/session-db');
+  const db = createSessionDb({ dbPath: path.join(h.root, 'cas.db') });
+  await db.run('CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id TEXT, title TEXT, custom_title TEXT, updated_at INTEGER, deleted_at INTEGER)');
+  for (const row of h.rows.values()) await db.run('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, NULL)', [row.id, row.user_id, row.title, row.custom_title || '', row.updated_at]);
+  h.ctx.sqliteRun = async (sql, params) => {
+    await db.run('UPDATE sessions SET custom_title = ? WHERE id = ?', ['concurrent rename', changed]);
+    return db.run(sql, Array.from(params));
+  };
+  await assert.rejects(h.copy(), /会话记录正在变化/);
+  const row = (await db.all('SELECT custom_title FROM sessions WHERE id = ?', [changed]))[0];
+  assert.equal(row.custom_title, 'concurrent rename');
+  assert.deepEqual(fs.readFileSync(h.file('b')), before);
+});
+
+test('#511 deleting an extra same-account copy preserves the original and suppresses branch recreation', async t => {
+  const h = harness(t, true);
+  const extra = { ...h.rows.get('b'), id: 'extra' };
+  h.rows.set(extra.id, extra); h.write(extra.id, base);
+  lib.addAutoCopySessionMember(h.root, h.lineage, 'two', extra.id);
+  lib.recordSessionDeletion(h.root, [{ id: extra.id, user_id: 'two' }]);
+  h.rows.delete(extra.id); fs.unlinkSync(h.file(extra.id));
+  assert.equal((await h.copy()).status, 'skipped');
+  h.write('a', [...base, { type: 'message', role: 'user', content: [{ text: 'source branch' }] }]);
+  h.write('b', [...base, { type: 'message', role: 'user', content: [{ text: 'target branch' }] }]);
+  h.rows.get('a').updated_at++; h.rows.get('b').updated_at++;
+  const original = fs.readFileSync(h.file('b'));
+  for (let i = 0; i < 2; i++) assert.equal((await h.copy()).status, 'skipped');
+  assert.deepEqual([...h.rows.keys()], ['a', 'b', 'c']);
+  assert.deepEqual(fs.readFileSync(h.file('b')), original);
+});
+
+test('#511 a title update reaches a clean third account through the planner', async t => {
+  const h = harness(t, true);
+  await h.copy();
+  await h.ctx.copySessionRecord(h.rows.get('c'), 'two', { auto: true, lineageId: h.lineage });
+  h.rows.get('a').custom_title = 'new name';
+  await h.copy();
+  const dirty = h.ctx.getSessionDirtyIndex();
+  dirty.markBaseline('three'); dirty.clear('three', 'c');
+  const plan = await h.ctx.buildAutoCopyPlan('three', 'two');
+  assert.equal(plan.length, 1);
+  await h.ctx.copySessionRecord(plan[0], 'two', { auto: true, lineageId: h.lineage });
+  assert.equal(h.rows.get('c').custom_title, 'new name');
 });
