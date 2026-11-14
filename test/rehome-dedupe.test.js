@@ -50,6 +50,13 @@ function writeSession(root, id, messages, sessionId) {
   return p;
 }
 
+/** 直接写原始记录（可以是无 id 记录），用于顺序类用例。 */
+function writeRaw(root, id, records) {
+  const p = path.join(root, 'projects', 'ws', id + '.jsonl');
+  fs.writeFileSync(p, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  return p;
+}
+
 async function makeDb(root) {
   const db = createSessionDb({ dbPath: path.join(root, 'workbuddy.db') });
   await db.run(CREATE);
@@ -510,6 +517,67 @@ async function caseDuplicatePlusContainment() {
   assert.equal(d['id-big'], null, '保留内容最完整的');
 }
 
+async function caseSameIdReordered() {
+  const root = tempDir('reorder-id');
+  const db = await makeDb(root);
+  const m = msgs(3, 'ord');
+  writeSession(root, 'id-a', m, 'id-a');
+  // 同一批消息、同样的 id 与内容，只有先后顺序不同 —— 这是两份被重排过的记录。
+  writeSession(root, 'id-b', [m[1], m[0], m[2]], 'id-b');
+  await insert(db, { id: 'id-a', title: '同 ID 乱序', updated: 2000 });
+  await insert(db, { id: 'id-b', title: '同 ID 乱序', updated: 1000 });
+
+  const out = await dedupeSessions(db, root, { dryRun: false });
+  assert.equal(out.dropped, 0, '同 ID 消息顺序不同不得判为副本');
+  const d = await deletedMap(db);
+  assert.equal(d['id-a'], null);
+  assert.equal(d['id-b'], null, '乱序的那份必须保留');
+
+  // 显式开 containment 也不能删：乱序不是子序列。
+  const cont = await dedupeSessions(db, root, { dryRun: true, mode: MODE_CONTAINMENT });
+  assert.equal(cont.dropped, 0, '包含关系要求保持相对顺序');
+}
+
+async function caseUnkeyedReordered() {
+  const root = tempDir('reorder-unkeyed');
+  const db = await makeDb(root);
+  // 无 id 记录（摘要 / 状态行之类）：多重集完全一致，顺序不同。
+  const u = [
+    { type: 'summary', sessionId: 'ua', text: 'AAA' },
+    { type: 'summary', sessionId: 'ua', text: 'BBB' },
+    { type: 'summary', sessionId: 'ua', text: 'CCC' },
+  ];
+  writeRaw(root, 'id-a', u);
+  writeRaw(root, 'id-b', [u[2], u[1], u[0]]);
+  await insert(db, { id: 'id-a', title: '无 ID 乱序', updated: 2000 });
+  await insert(db, { id: 'id-b', title: '无 ID 乱序', updated: 1000 });
+
+  const out = await dedupeSessions(db, root, { dryRun: false });
+  assert.equal(out.dropped, 0, '无 ID 记录不能只用多重集判定');
+  const d = await deletedMap(db);
+  assert.equal(d['id-b'], null, '无 ID 记录乱序时同样保留');
+}
+
+async function caseMixedReordered() {
+  const root = tempDir('reorder-mixed');
+  const db = await makeDb(root);
+  const base = [
+    { type: 'message', id: 'mix-1', sessionId: 'ma', role: 'user', content: 'u1' },
+    { type: 'summary', sessionId: 'ma', text: 'sum' },
+    { type: 'message', id: 'mix-2', sessionId: 'ma', role: 'assistant', content: 'a1' },
+  ];
+  writeRaw(root, 'id-a', base);
+  // 交换「有 id 消息」与「无 id 记录」的位置：集合相同、顺序不同。
+  writeRaw(root, 'id-b', [base[1], base[0], base[2]]);
+  await insert(db, { id: 'id-a', title: '混合乱序', updated: 2000 });
+  await insert(db, { id: 'id-b', title: '混合乱序', updated: 1000 });
+
+  const out = await dedupeSessions(db, root, { dryRun: false });
+  assert.equal(out.dropped, 0, '混合消息乱序不得判为副本');
+  const cont = await dedupeSessions(db, root, { dryRun: true, mode: MODE_CONTAINMENT });
+  assert.equal(cont.dropped, 0, '混合消息乱序也不满足子序列条件');
+}
+
 async function main() {
   try {
     await caseByteIdentical();
@@ -533,7 +601,10 @@ async function main() {
     await caseDuplicateMessageIds();
     await caseSidecarArtifacts();
     await caseContainmentOrderMismatch();
-    console.log('PASS rehome-dedupe.test.js — 21 类去重安全场景');
+    await caseSameIdReordered();
+    await caseUnkeyedReordered();
+    await caseMixedReordered();
+    console.log('PASS rehome-dedupe.test.js — 24 类去重安全场景');
   } finally {
     for (const d of dirs) {
       try { fs.rmSync(d, { recursive: true, force: true }); } catch (_) {}

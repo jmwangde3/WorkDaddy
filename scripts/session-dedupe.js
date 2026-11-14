@@ -8,14 +8,16 @@
  *
  *   1. 文件层  —— 文件存在、可读、非空、扫描期间大小/mtime/内容哈希未变。
  *   2. 字节层  —— 整文件 SHA-256 相同 = 逐字节相同的副本（最强证据）。
- *   3. 消息层  —— 解析 JSONL，按消息 id（WorkBuddy 写的是 `id` 字段）建 UUID → 规范化内容哈希。
+ *   3. 消息层  —— 解析 JSONL，把**每一条记录**（含无 `id` 的记录）按文件顺序算成
+ *                规范化内容哈希，得到一个完整的记录序列 `seq`。
  *                规范化 = **只去掉记录顶层**的 `sessionId` 并按字典序排序键（旧「自动同步」
  *                复制会话时会把每行顶层的 sessionId 改写成新会话 ID，消息 id 与内容不变）。
  *                嵌套层的 `sessionId` 是内容，原样参与哈希 —— 删掉它会掩盖真实差异。
- *                只有 id 集合完全相等且同 id 内容全等，才算内容相同。
- *   4. 包含层  —— 仅显式开启（mode='containment'）时使用：A 的全部消息（含无 id 记录的多重集）
- *                都在 B 里，且同 id 内容无冲突、被包含者不早于容器创建，才认定 A 是 B 的旧副本；
- *                保留内容更完整的 B，绝不按 updated_at 反选。内容冲突、互相不包含、
+ *                只有 `seq` **逐位相同**才算副本：条数、内容、出现顺序三者同时相等。
+ *                顺序不同 = 不同的会话（消息被重排过，或本就独立），一律保留。
+ *   4. 包含层  —— 仅显式开启（mode='containment'）时使用：A 的完整记录序列必须是 B 的
+ *                **子序列**（保持相对顺序），且同 id 内容无冲突，才认定 A 是 B 的旧副本；
+ *                保留内容更完整的 B，绝不按 updated_at 反选。内容冲突、顺序对不上、
  *                候选保留者不唯一，一律跳过。
  *
  * 额外的「不猜」判据：
@@ -145,8 +147,9 @@ function inspectSessionFile(file, options = {}) {
     parsed: false,
     messageCount: 0,
     messages: new Map(),      // id -> 规范化内容哈希
-    order: [],                // 带 id 记录在文件里的出现顺序（含重复项）
-    unkeyed: new Map(),       // 无 id 记录：内容哈希 -> 出现次数
+    order: [],                // 带 id 记录在文件里的出现顺序（含重复项；诊断用）
+    seq: [],                  // 全部记录（含无 id）按文件顺序的规范化哈希 —— 判定唯一依据
+    unkeyed: new Map(),       // 无 id 记录：内容哈希 -> 出现次数（仅诊断，不参与判定）
     duplicateIds: [],
     artifactRefs: 0,          // 附件/图片等外部引用总数
     relativeArtifactRefs: 0,  // 其中相对路径的数量（>0 时禁止消息层判定）
@@ -188,6 +191,9 @@ function inspectSessionFile(file, options = {}) {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { parsedAll = false; break; }
     sawContent = true;
     const hash = sha256(JSON.stringify(canonicalize(obj)));
+    // 序列指纹：每条记录一个位置，无 id 记录同样占位 —— 顺序信息在这里被保留下来。
+    // 多重集（unkeyed）只用于诊断，判定不允许只看计数。
+    info.seq.push(hash);
     const id = typeof obj.id === 'string' && obj.id ? obj.id : null;
     if (id) {
       info.order.push(id);
@@ -220,7 +226,20 @@ function inspectSessionFile(file, options = {}) {
   return info;
 }
 
-/** 消息表是 id -> 内容哈希：子集要求键存在且哈希相等。 */
+/** 记录序列逐位相同（条数 + 内容 + 顺序）。 */
+function seqEqual(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** 两份序列是否有任意一条记录相同（用于区分「完全无关」与「有重叠但顺序对不上」）。 */
+function sharesRecord(a, b) {
+  const set = new Set(b);
+  return a.some((h) => set.has(h));
+}
+
+/** 消息表是 id -> 内容哈希：子集要求键存在且哈希相等。仅用于同 id 冲突预检。 */
 function messagesSubset(a, b) {
   for (const [id, hash] of a) {
     if (!b.has(id) || b.get(id) !== hash) return false;
@@ -230,14 +249,6 @@ function messagesSubset(a, b) {
 
 function messagesEqual(a, b) {
   return a.size === b.size && messagesSubset(a, b);
-}
-
-/** 多重集 A 是否为 B 的子集（含计数），用于无 id 记录。 */
-function multisetSubset(a, b) {
-  for (const [key, count] of a) {
-    if ((b.get(key) || 0) < count) return false;
-  }
-  return true;
 }
 
 /** a 是否为 b 的子序列（保持相对顺序）。用于包含关系的顺序证据。 */
@@ -250,19 +261,15 @@ function isSubsequence(a, b) {
   return i === a.length;
 }
 
-function multisetEqual(a, b) {
-  if (a.size !== b.size) return false;
-  return multisetSubset(a, b);
-}
-
 /**
  * 比较两份指纹。
  * 返回 { relation, reason }：
- *   'equal'      确定相同副本
+ *   'equal'      确定相同副本（记录序列逐位相同，或整文件字节相同）
  *   'a-contains' A 是 B 的超集（B 是旧副本）
  *   'a-contained' A 被 B 包含（A 是旧副本）
  *   'conflict'   同 id 内容冲突
- *   'disjoint'   互不包含
+ *   'subset'     有条数包含关系但没开 containment
+ *   'disjoint'   互不包含 / 顺序对不上
  *   'unknown'    证据不足
  */
 function compareFingerprints(a, b, options = {}) {
@@ -292,23 +299,36 @@ function compareFingerprints(a, b, options = {}) {
       return { relation: 'conflict', reason: `message-content-conflict:${id}` };
     }
   }
-  const sameMessages = messagesEqual(a.messages, b.messages);
-  const sameUnkeyed = multisetEqual(a.unkeyed, b.unkeyed);
-  if (sameMessages && sameUnkeyed) {
-    return { relation: 'equal', reason: 'message-content-identical' };
+
+  // ---- 判定只看完整记录序列 ----
+  // 精确副本：条数、每条内容、出现顺序三者同时相等。
+  // 只比集合/多重集是不够的：A=[m1,m2]、B=[m2,m1] 的计数完全一致，但那是两份
+  // 被重排过的不同记录；把它们当成副本删掉一份，等于丢数据。
+  if (seqEqual(a.seq, b.seq)) {
+    return { relation: 'equal', reason: 'record-sequence-identical' };
   }
-  const aInB = messagesSubset(a.messages, b.messages) && multisetSubset(a.unkeyed, b.unkeyed);
-  const bInA = messagesSubset(b.messages, a.messages) && multisetSubset(b.unkeyed, a.unkeyed);
-  if (aInB && bInA) return { relation: 'equal', reason: 'message-content-identical' };
+
+  // 包含关系：被包含者的记录序列必须是容器的**子序列**（保持相对顺序）。
+  const aInB = isSubsequence(a.seq, b.seq);
+  const bInA = isSubsequence(b.seq, a.seq);
+  if (aInB && bInA) {
+    // 同长度下双向子序列必定逐位相等，走到这里说明数据异常 —— 不猜。
+    return { relation: 'unknown', reason: 'sequence-order-ambiguous' };
+  }
   if (!allowContainment) {
-    // 包含关系存在但未开启：这是「可能重复但证据不足」，必须显式区别于互不相干。
     if (aInB) return { relation: 'subset', reason: 'a-contained-in-b-but-containment-disabled' };
     if (bInA) return { relation: 'subset', reason: 'b-contained-in-a-but-containment-disabled' };
-    return { relation: 'disjoint', reason: 'no-message-overlap' };
+    return {
+      relation: 'disjoint',
+      reason: sharesRecord(a.seq, b.seq) ? 'order-or-content-mismatch' : 'no-message-overlap',
+    };
   }
-  if (aInB) return { relation: 'a-contained', reason: `subset:${a.messages.size}->${b.messages.size}` };
-  if (bInA) return { relation: 'a-contains', reason: `superset:${b.messages.size}->${a.messages.size}` };
-  return { relation: 'disjoint', reason: 'mutually-incomparable' };
+  if (aInB) return { relation: 'a-contained', reason: `subsequence:${a.seq.length}->${b.seq.length}` };
+  if (bInA) return { relation: 'a-contains', reason: `subsequence:${b.seq.length}->${a.seq.length}` };
+  return {
+    relation: 'disjoint',
+    reason: sharesRecord(a.seq, b.seq) ? 'order-or-content-mismatch' : 'mutually-incomparable',
+  };
 }
 
 function tableColumns(db) {
@@ -333,8 +353,13 @@ async function planDedupe(db, dataRoot, options = {}) {
   const scopeSql = scope === 'background'
     ? `COALESCE(is_background_automation, 0) = 1`
     : `COALESCE(is_background_automation, 0) = 0`;
+  // 只对「能确定是活的」行做去重。老库没有 transport 列时，`deleted_at = -1` 的语义
+  // 无法交叉核对（可能是云会话哨兵，也可能是别的编码），一律不进入写入候选。
+  const liveSql = cols.has('transport')
+    ? `deleted_at IS NULL AND (transport IS NULL OR transport = 'local')`
+    : `deleted_at IS NULL`;
   const rows = await db.all(
-    `SELECT ${select.join(', ')} FROM sessions WHERE ${NOT_DELETED} AND ${scopeSql} ` +
+    `SELECT ${select.join(', ')} FROM sessions WHERE ${liveSql} AND ${scopeSql} ` +
     'ORDER BY cwd, title, updated_at DESC, created_at DESC'
   );
 
@@ -411,15 +436,13 @@ function judgeGroup(list, allowContainment) {
     return out('keep-all', `sidecar-artifacts(${bad.join(',')})`, items, []);
   }
 
-  // ---- 第 1 步：完全相同的副本聚类（字节相同 或 消息内容完全相同）----
+  // ---- 第 1 步：完全相同的副本聚类（字节相同 或 记录序列逐位相同）----
   const parent = new Map(items.map((it) => [it.id, it.id]));
   const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
   const union = (a, b) => { const ra = find(a); const rb = find(b); if (ra !== rb) parent.set(rb, ra); };
-  const pairs = [];
   for (let i = 0; i < items.length; i++) {
     for (let j = i + 1; j < items.length; j++) {
       const cmp = compareFingerprints(items[i].fp, items[j].fp, { allowContainment: false });
-      pairs.push({ a: items[i], b: items[j], cmp });
       if (cmp.relation === 'equal') union(items[i].id, items[j].id);
       if (cmp.relation === 'conflict') {
         return out('keep-all', `content-conflict(${items[i].id},${items[j].id})`, items, []);
@@ -448,7 +471,7 @@ function judgeGroup(list, allowContainment) {
       exactDrops.push({
         id: it.id, repId: keeper.id,
         reason: 'exact-duplicate',
-        evidence: it.fp.rawSha && it.fp.rawSha === keeper.fp.rawSha ? 'byte-identical' : 'message-content-identical',
+        evidence: it.fp.rawSha && it.fp.rawSha === keeper.fp.rawSha ? 'byte-identical' : 'record-sequence-identical',
       });
     }
   }
@@ -497,13 +520,13 @@ function judgeGroup(list, allowContainment) {
       if (cmp.relation === 'conflict') {
         return out('keep-all', `content-conflict(${a.id},${b.id})`, reps, exactDrops);
       }
-      if (cmp.relation !== 'a-contains') continue;          // 'a-contained' 由对称轮处理
-      // 顺序校验：被包含的那份，消息 id 序列必须是容器序列的**子序列**。
-      // 截断型旧副本一定满足（前缀）；两条独立会话只是撞了相同消息时通常不满足。
-      // 时间戳不能拿来判：先创建的那条完全可能是「聊了两句就复制走、原件继续聊」。
-      if (!isSubsequence(b.fp.order, a.fp.order)) {
-        containmentSkipped.push(`${b.id}!subsequence-of:${a.id}`);
-        continue;
+      if (cmp.relation !== 'a-contains') {
+        // 记录层面确实有重叠、但序列不是子序列（顺序不同 / 中间差异）：
+        // 这正是「看起来像重复、实际不是」的情形，留痕供审计，不删任何一行。
+        if (cmp.relation === 'disjoint' && cmp.reason === 'order-or-content-mismatch') {
+          containmentSkipped.push(`${b.id}!subsequence-of:${a.id}`);
+        }
+        continue;                                             // 'a-contained' 由对称轮处理
       }
       contains.get(a.id).push(b);
     }
@@ -523,7 +546,7 @@ function judgeGroup(list, allowContainment) {
     containmentDrops.push({
       id: rep.id, keepId: maximal[0].id,
       reason: 'strict-subset',
-      evidence: `${rep.fp.messageCount}->${maximal[0].fp.messageCount}`,
+      evidence: `${rep.fp.seq.length}->${maximal[0].fp.seq.length}`,
     });
   }
   const note = containmentSkipped.length
@@ -718,6 +741,7 @@ module.exports = {
   inspectSidecars,
   isAbsoluteRef,
   isSubsequence,
+  seqEqual,
   inspectSessionFile,
   compareFingerprints,
   buildJsonlIndex,
