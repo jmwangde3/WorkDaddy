@@ -8,25 +8,35 @@
  *   逐文件跑能拿到 `{文件, 用例名}` 二元组，基线因此可以做到「同文件 + 同名」双匹配。
  *   代价是每个文件一次 node 启动（约 +0.15s/文件），相对 40s 的总时长可以接受。
  *
- * 规则：
- *   - 任一文件退出码非 0 但没有解析到失败 → 视为崩溃（退出码 3）
- *   - 失败不在基线里（按 文件+用例名 双匹配）→ 退出码 2
- *   - 总用例数低于基线记录 → 视为「跑了一半就退了」（退出码 4）
- *   - 解析到的失败数与 TAP `# fail` 不一致 → 解析漏了（退出码 5）
+ * 为什么还要错误指纹（schema 4）：
+ *   「同文件 + 同名」仍然不够。同一个用例换成完全不同的原因失败（例：原来缺词条，
+ *   现在读目录没权限），名字一模一样，会被当成历史失败静静放过去。所以基线条目
+ *   再挂一个规范化错误签名（test/tap-fingerprint.js），三者全等才算已知失败。
+ *   schema 3 的旧条目没有签名，只能按名字匹配 —— 届时会打印告警，但不会静默放宽。
+ *
+ * 规则（退出码）：
+ *   2 = 有新增失败（签名变了也算）
+ *   3 = 文件级崩溃（退出码非 0 且没有解析到失败行）
+ *   4 = 总用例数低于基线记录（跑了一半就退了）
+ *   5 = 解析到的失败数与 TAP `# fail` 不一致（解析漏了）
+ *   0 = 只剩基线里的已知失败，或干净通过
  *
  * 用法：
  *   node test/run-ci.js             跑并比对
- *   node test/run-ci.js --update    人工确认后重写基线
+ *   node test/run-ci.js --update    人工确认后重写基线（会写入错误签名）
  */
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { parseTap, crashSignature, entryKey, buildBaselineIndex, matchFailure } = require('./tap-fingerprint');
 
 const root = path.join(__dirname, '..');
 const testDir = path.join(__dirname);
 const baselinePath = path.join(__dirname, 'known-failures.json');
 const update = process.argv.includes('--update');
 const QUIET = process.argv.includes('--quiet');
+
+const SIG_BRIEF = 120;
 
 function readBaseline() {
   try {
@@ -42,36 +52,13 @@ function readBaseline() {
   }
 }
 
-/** 基线条目兼容两种形态：v1 字符串（只有用例名）/ v2+ {file, name}。 */
-function entryKey(entry) {
-  if (typeof entry === 'string') return { file: null, name: entry };
-  if (entry && typeof entry === 'object') return { file: entry.file || null, name: String(entry.name || '') };
-  return { file: null, name: '' };
-}
+/** 失败项的展示键：`file :: name`。 */
+function label(f) { return `${f.file} :: ${f.name}`; }
 
-/** 解析单个文件的 TAP 输出。 */
-function parseTap(out) {
-  const res = {
-    tests: 0, pass: 0, fail: 0, skipped: 0,
-    fails: [], scenarios: [], mismatch: false,
-  };
-  for (const line of String(out).split(/\r?\n/)) {
-    let m;
-    if ((m = /^# tests (\d+)\s*$/.exec(line))) res.tests = Number(m[1]);
-    else if ((m = /^# pass (\d+)\s*$/.exec(line))) res.pass = Number(m[1]);
-    else if ((m = /^# fail (\d+)\s*$/.exec(line))) res.fail = Number(m[1]);
-    else if ((m = /^# skipped (\d+)\s*$/.exec(line))) res.skipped = Number(m[1]);
-    // 嵌套子测试在 TAP 里会带缩进，必须容忍前导空白，否则会漏掉真实失败。
-    else if ((m = /^\s*not ok \d+ - (.*)$/.exec(line))) res.fails.push(m[1].replace(/\s*#.*$/, '').trim());
-    else if ((m = /^# ok - (.*)$/.exec(line))) res.scenarios.push(m[1].trim());
-    else if ((m = /^ok - (.*)$/.exec(line))) res.scenarios.push(m[1].trim());
-  }
-  res.fails = Array.from(new Set(res.fails.filter(Boolean)));
-  res.scenarios = Array.from(new Set(res.scenarios.filter(Boolean)));
-  // TAP 的 # fail 会把「父测试因失败」也计入；解析到的行数应当与之相等。
-  // 不等说明有失败行没被匹配到（格式变化），必须报错而不是当没事。
-  res.mismatch = res.fail !== res.fails.length;
-  return res;
+/** 签名太长就截断展示，避免刷屏；比较用的是全长。 */
+function brief(sig) {
+  const s = String(sig || '');
+  return s.length > SIG_BRIEF ? `${s.slice(0, SIG_BRIEF)}…` : s;
 }
 
 function runFile(file) {
@@ -112,31 +99,31 @@ function main() {
     scenarios: acc.scenarios + r.scenarios.length,
   }), { tests: 0, pass: 0, fail: 0, skipped: 0, scenarios: 0 });
 
-  // 逐文件失败清单：{file, name}
+  // 逐文件失败清单：{file, name, signature}
   const failures = [];
   const crashes = [];
   const mismatches = [];
   for (const r of results) {
-    if (r.mismatch) mismatches.push(`${r.file}: fail=${r.fail} parsed=${r.fails.length}`);
+    if (r.mismatch) mismatches.push(`${r.file}: fail=${r.fail} parsed=${r.failNames.length}`);
     if (r.status !== 0 && r.fails.length === 0) {
       crashes.push({ file: r.file, status: r.status, signal: r.signal || null });
-      failures.push({ file: r.file, name: '<file-crash>' });
+      failures.push({ file: r.file, name: '<file-crash>', signature: crashSignature(r.status, r.signal) });
       continue;
     }
-    for (const name of r.fails) failures.push({ file: r.file, name });
+    for (const f of r.fails) failures.push({ file: r.file, name: f.name, signature: f.signature });
   }
 
-  const knownKeys = new Set();
-  let legacyStringEntries = 0;
-  for (const entry of baseline.baseline) {
-    const k = entryKey(entry);
-    if (!k.name) continue;
-    if (!k.file) legacyStringEntries += 1;
-    knownKeys.add(k.file ? `${k.file}\u0000${k.name}` : `\u0000${k.name}`);
+  // 基线索引：精确键（file+name+signature）与宽松键（无签名的旧条目，file+name / 纯名字）
+  const index = buildBaselineIndex(baseline.baseline);
+  const { legacyStringEntries, legacyNoSignature } = index;
+
+  const fresh = [];
+  const known = [];
+  for (const f of failures) {
+    const m = matchFailure(index, f);
+    if (m.kind) { known.push({ ...f, kind: m.kind }); continue; }
+    fresh.push({ ...f, reason: m.reason, previous: m.previous });
   }
-  const isKnown = (f) => knownKeys.has(`${f.file}\u0000${f.name}`) || knownKeys.has(`\u0000${f.name}`);
-  const fresh = failures.filter((f) => !isKnown(f));
-  const known = failures.filter((f) => isKnown(f));
   const fixed = baseline.baseline
     .map((e) => entryKey(e))
     .filter((e) => e.name && !failures.some((f) => f.name === e.name && (!e.file || f.file === e.file)));
@@ -146,20 +133,31 @@ function main() {
   for (const r of results) fileTests[r.file] = r.tests;
 
   console.log('==============================================');
-  console.log(' WorkDaddy 测试汇总（逐文件）');
+  console.log(' WorkDaddy 测试汇总（逐文件 + 错误指纹）');
   console.log('==============================================');
   console.log(` 文件: ${files.length}   用例: ${totals.tests}  通过: ${totals.pass}  失败: ${totals.fail}  跳过: ${totals.skipped}`);
   console.log(` 子断言: ${totals.scenarios}（测试文件自己 print 的 ok 行，不计入 TAP 用例数）`);
-  console.log(` 已知失败(基线): ${known.length}    新增失败: ${fresh.length}    基线已修复: ${fixed.length}`);
+  console.log(` 基线 schema: ${baseline.schema}   已知失败(基线): ${known.length}    新增失败: ${fresh.length}    基线已修复: ${fixed.length}`);
   if (floor) {
     const delta = totals.tests - floor;
     console.log(` 基线用例: ${floor}   本次: ${totals.tests}   差: ${delta >= 0 ? '+' : ''}${delta}`);
   }
   console.log(` 耗时: ${((Date.now() - started) / 1000).toFixed(1)}s   TAP: test/last-run.tap`);
 
-  if (fresh.length) {
-    console.log('\n[X] 新增失败（必须修，或显式 --update 承认）：');
-    for (const f of fresh) console.log(`  - ${f.file} :: ${f.name}`);
+  const changedSig = fresh.filter((f) => f.reason === 'signature-changed');
+  const unknownName = fresh.filter((f) => f.reason !== 'signature-changed');
+
+  if (changedSig.length) {
+    console.log('\n[X] 同名但错误内容变了（按新增失败处理 —— 修它，或人工确认后 --update）：');
+    for (const f of changedSig) {
+      console.log(`  - ${label(f)}`);
+      for (const p of f.previous) console.log(`      基线: ${brief(p)}`);
+      console.log(`      本次: ${brief(f.signature)}`);
+    }
+  }
+  if (unknownName.length) {
+    console.log('\n[X] 基线里没有的失败：');
+    for (const f of unknownName) console.log(`  - ${label(f)}\n      签名: ${brief(f.signature)}`);
   }
   if (mismatches.length) {
     console.log('\n[X] TAP 解析不一致（有失败行未被识别，不能当作通过）：');
@@ -171,6 +169,9 @@ function main() {
   }
   if (legacyStringEntries) {
     console.log(`\n[!] 基线里有 ${legacyStringEntries} 条旧格式（只有用例名，没有文件名），这些只能按名字匹配，判定会比新格式宽。--update 会写成新格式。`);
+  }
+  if (legacyNoSignature) {
+    console.log(`\n[!] 基线里有 ${legacyNoSignature} 条没有错误签名（schema < 4），这些仍只按「文件+用例名」匹配；--update 会补上签名。`);
   }
   if (fixed.length) {
     console.log('\n[+] 基线中已不再失败（可 --update 收紧基线）：');
@@ -188,8 +189,8 @@ function main() {
 
   if (update) {
     const payload = {
-      schema: 3,
-      note: 'CI 基线：按「文件 + 用例名」双匹配。这些失败在本次改造前就存在（环境/平台相关），不阻塞 CI；新增失败仍会报错。',
+      schema: 4,
+      note: 'CI 基线：按「文件 + 用例名 + 规范化错误签名」三重匹配。这些失败在本轮改造前就存在（环境/平台相关），不阻塞 CI；新增失败、以及同名但错误内容变化的失败都会报错。更新必须人工确认，不得用来消除新增失败。',
       generatedAt: new Date().toISOString(),
       node: process.version,
       platform: process.platform,
@@ -198,10 +199,12 @@ function main() {
         scenarios: totals.scenarios, files: files.length,
       },
       fileTests,
-      baseline: failures.slice().sort((a, b) => (a.file + a.name).localeCompare(b.file + b.name)),
+      baseline: failures
+        .slice()
+        .sort((a, b) => (a.file + a.name + a.signature).localeCompare(b.file + b.name + b.signature)),
     };
     fs.writeFileSync(baselinePath, JSON.stringify(payload, null, 2) + '\n');
-    console.log(`\n已写入基线: ${baselinePath} (${failures.length} 条，schema 3)`);
+    console.log(`\n已写入基线: ${baselinePath} (${failures.length} 条，schema 4，含错误签名)`);
     return 0;
   }
 
