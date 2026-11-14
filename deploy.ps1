@@ -1,6 +1,15 @@
 ﻿<#
     WorkDaddy 补丁部署 / 升级后恢复（原子化版）
 
+    ⚠ LEGACY（1.3.0 起，仅保留给旧补丁版用户）
+    本脚本做的是「把补丁覆盖到 WorkBuddy 安装目录」。1.3.0 起 WorkDaddy 是独立安装的
+    产品，安装 / 更新 / 卸载分别走 installer\install-workdaddy.ps1、
+    update-workdaddy.ps1、uninstall-workdaddy.ps1，装到 %LOCALAPPDATA%\Programs\WorkDaddy，
+    不再改动 WorkBuddy 目录。本脚本保留只为两件事：
+      ① 老用户先把 rehome / dedupe / permission 配置迁出来（新安装器也会自动识别）；
+      ② 上游大版本升级后临时救急。
+    新安装流程不引用本脚本。决策见 docs/migration/08-release-decisions.md。
+
     流程：
       1. 定位安装目录，检查目录可写
       2. 校验补丁清单与源文件哈希

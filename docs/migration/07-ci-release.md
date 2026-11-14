@@ -11,11 +11,13 @@
 | 2 | PowerShell 语法 / BOM / CRLF | `powershell-check`（5.1 与 7 两个矩阵） | 否（只解析文件） |
 | 3 | `node:sqlite` 最低版本 | `node-version-floor`（Node 22.13） | 否 |
 | 4 | 安装器生命周期 | `installer-tests` → `test/installer-lifecycle.test.js` | 否（仓库内 `tmp/`，`-NoShortcut`） |
-| 5 | 更新回滚 | 同上（坏包 → 回滚 → 字节级还原断言） | 否 |
+| 5 | 更新回滚 | 同上（坏包 → 回滚 → 字节级还原断言）+ `test/installer-transaction.test.js` 的故障注入 | 否 |
 | 6 | 上游兼容 / 同步结构契约 | `node-tests` 里的 `fork-sync-contract.test.js` | 否 |
 | 7 | 产物检查 | `package` → `test/package-hygiene.test.js` 真打一次包 | 否 |
 | 8 | 依赖与供应链 | `supply-chain`（零依赖断言 + engines 核对） | 否 |
 | 9 | 安装包内容 | 同 7：断言 zip 里没有 test/docs/tools/.git/workbuddy-exe.json/日志 | 否 |
+| 10 | 托盘可复现构建 | `tray-build`：现编 → `--selftest` / `--status` → 与仓库 EXE 比行为与字面量 | 否（只读端口/进程，自启动项写后即还原） |
+| 11 | Setup 真机验证 | `setup`：choco 装 Inno → 编译 → 静默安装 → 卸载 → 数据保留 | 是，但在**一次性 CI VM** 上，不是用户机器 |
 
 另有 `.github/workflows/upstream-watch.yml`：每周巡检上游，**只开 issue**。
 
@@ -41,11 +43,23 @@
 | `WorkDaddy-1.3.0-portable-win-x64.zip` | 185 个文件 / 4.65 MB；含 `installer/`，解压后可直接装到本机 | ✅ |
 | `WorkDaddy-1.3.0-source.zip` | `git archive HEAD`，7.01 MB；带 `WorkDaddy-1.3.0-source/` 前缀 | ✅ |
 | `SHA256SUMS.txt` | 上面两个包的哈希，报告里也有一份 | ✅ |
-| `WorkDaddy-1.3.0-setup.exe` | `-Setup` + 找到 `ISCC.exe` 时才产出 | ⚠ 未验证（本机无 Inno Setup 6） |
+| `WorkDaddy-1.3.0-setup.exe` | `-Setup` + 找到 `ISCC.exe` 时才产出 | CI 编译 + 真机安装；**开发机未验证** |
 
 Setup 的设计是**引导器而不是第二套安装逻辑**：解便携包到临时目录 → 调
 `install-workdaddy.ps1` → 卸载时调 `uninstall-workdaddy.ps1`（脚本随包落在 `{app}\_setup`）。
 这样安装逻辑只有一份，Setup 不会和脚本各自漂移。
+
+Setup 的验证分两层，别混：
+
+- **编译**：CI `setup` 作业 `choco install innosetup`，然后 `build-package.ps1 -Setup`。
+  失败会让整个作业红。
+- **真机行为**：`installer/setup/verify-setup.ps1 -IAmOnAThrowawayMachine`，
+  在一次性 runner 上静默装 → 逐条比对清单哈希 → 静默卸载 → 断言程序没了、数据还在。
+  不带这个开关直接 exit 2，防止有人在开发机上顺手跑。
+
+**仍然未验证**：开发机（本机）从未执行过 Setup；没有代码签名；没有在线下载与签名校验；
+Inno `[Run]` 不传递子进程退出码（CI 靠落盘检查兜底，用户侧没有这层）。
+完整清单见 `08-release-decisions.md` §3.3。
 
 ## 4. 实测证据
 

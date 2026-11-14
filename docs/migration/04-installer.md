@@ -62,6 +62,39 @@
   重启失败只记 warning，不回滚：文件已经验证过是好的，回滚只会把可用的新版本换回旧版本。
 - **暂存清理**：成功与失败两条路径都删暂存目录，报告里 `stageRemoved` 记录结果。
 
+### 4.1 状态提交属于更新事务（1.3.0 收尾新增）
+
+`install-state.json` 不再是「顺带写一下」的最后一步：
+
+1. 替换前先备份程序目录**和**状态文件（`backups\install-state-<版本>-<时间>.json`）；
+2. 替换前写 `update-journal.json`（from / to / backup / pid），状态提交成功后才删；
+3. 新状态先写 `.install-state.tmp-<stamp>.json`，用 `Test-StatePayload` 校验
+   （JSON 可解析、version、appDir、清单条数 ≥ 文件数、每条都有 path/sha256）；
+4. `[IO.File]::Replace` 同卷原子替换，再校验一次落盘文件。
+
+任一步失败都走 `Invoke-UpdateRollback`：**程序与状态各恢复一次、各记一次**。
+
+```json
+"rollback": { "attempted": true, "programRestored": true, "stateRestored": false,
+              "backup": "…\\backups\\app-1.3.0-preupdate-20261114-211500" }
+```
+
+`rolledBack` 只在两半都回来时为 true；错误消息分开写「程序已恢复到 X / 安装记录未恢复」，
+绝不出现「程序是新版本、记录是旧版本」却报成功的情况。
+
+**journal 的作用**：下次运行先比对「磁盘程序版本 / 状态版本 / journal.to」。
+两侧一致就清 journal 继续；不一致且没有 `-Force` 就 exit 8 拒绝继续 ——
+不在未知状态上再叠一次替换。
+
+### 4.2 故障注入（只给测试）
+
+`-InjectFault state-write | state-replace | state-restore` 分别模拟「状态写不进」
+「替换失败」「回滚时状态恢复失败」。最后一种会让磁盘停在「程序 1.3.0 / 状态 1.3.1」的
+真实不一致现场，用来验证 journal 拦截与 `-Force` 修复路径。
+
+另外还有一条不用注入的真实故障：把 `install-state.json` 设成只读，让 `File.Replace`
+真的失败，证明正确性不只存在于注入分支。
+
 ### PowerShell 5.1 的两个坑（都在代码里注释了）
 
 1. `$ErrorActionPreference='Stop'` 下原生命令往 stderr 写东西会抛 `NativeCommandError`。
@@ -100,6 +133,29 @@ node --test test/installer-lifecycle.test.js
 # PASS installer-lifecycle.test.js
 ```
 
+`test/installer-transaction.test.js`，14 条事务用例（更新 6 + 安装 8）：
+
+```
+node test/installer-transaction.test.js
+# ok - 更新：状态文件无法写入 → 程序与状态一起回滚，exit 7
+# ok - 更新：状态文件替换失败 → 同样回滚 exit 7
+# ok - 更新：状态文件真的只读（不用注入）→ 回滚 exit 7
+# ok - 更新：回滚时状态恢复失败 → 两半分开报告，且下次拒绝在未知状态上继续
+# ok - 更新：上次崩在替换之前（journal 残留但两侧都是旧版本）→ 自动清理并继续
+# ok - 更新：成功路径清 journal、留状态快照、状态清单可解析
+# ok - 安装：全新安装复制中途失败 → 清理本次文件，不留目录与状态
+# ok - 安装：新安装失败不删用户自己的文件与目录
+# ok - 安装：同版本重装中途失败 → 回滚到备份，状态不变
+# ok - 安装：升级中途失败 → 程序回到旧版本
+# ok - 安装：SHA-256 校验失败 → 全新安装清理 exit 5
+# ok - 安装：已有安装校验失败 → 回滚到备份 exit 5
+# ok - 安装：快捷方式已建但安装记录失败 → 快捷方式随回滚删除 exit 7
+# ok - 安装：状态提交成功后的记录与磁盘逐条一致
+# PASS installer-transaction.test.js
+```
+
+事务用例的断言全部落在「磁盘字节 + `-Json` 报告」上，不解析 stdout（CJK 控制台编码不可靠）。
+
 覆盖范围：
 
 - 安装 11 条：全新安装、同版本重装、旧版本升级（含备份内容比对）、目录逐级创建、
@@ -118,15 +174,17 @@ node --test test/installer-lifecycle.test.js
 跑完自查过：真实桌面快捷方式仍在、真实 `%APPDATA%\WorkDaddy` 67 个条目未动、
 真实守护进程（pid 42956 daemon / 23400 watchdog）仍在运行。
 
-## 8. 已知缺口（后续阶段）
+## 8. 已知缺口（发布前收尾后的现状）
 
-| 缺口 | 计划 |
+| 缺口 | 现状（1.3.0 收尾） |
 | --- | --- |
-| 没有下载 + 来源/签名校验 | 阶段 7 发布链：下载后先校验 SHA-256 与来源，再交给本脚本 |
-| 没有 Setup / Portable ZIP 打包 | 阶段 7：`scripts/build-win-release.ps1` 对接，产出 Setup + ZIP + 源码包 |
+| 没有在线下载 + 来源/签名校验 | **仍未实现**。更新器只接受「已经拿到可信包」之后的本地目录，不联网、不验签。见 `08-release-decisions.md` §3.3 |
+| Setup 真机验证 | 已能在 CI 一次性 Windows VM 上编译 + 静默安装 + 卸载 + 验证数据保留；**开发机从未跑过**，不能声称「本机通过」 |
+| 代码签名 | 未做。`setup.exe` / `WorkDaddyTray.exe` 均无签名，SmartScreen 会拦 |
 | 健康检查是静态的，没有 HTTP 探针 | 保持现状：安装器不启动会读真实账号的服务；需要真实探针时由启动器负责 |
-| 与上游 `install-win.ps1` / `workdaddy.iss` 的关系未打通 | 上游安装器是「装到 WorkBuddy 目录」的补丁模式，与本安装器互不替代；文档里要说清 |
-| `-StrictFileGate` 与代际闸门的一致性 | 阶段 7 与 `deploy.ps1` 一起对齐 |
+| 与上游 `install-win.ps1` / `workdaddy.iss` 的关系 | 上游安装器是「装到 WorkBuddy 目录」的补丁模式，与本安装器互不替代 |
+| `-StrictFileGate` 与代际闸门的一致性 | 本安装器不使用 `deploy.ps1`；该参数只属于 Legacy 工具（`deploy.ps1` 已标注 LEGACY） |
+| Inno `[Run]` 不传递子进程退出码 | CI 用「装完查落盘」兜底；真实用户侧没有这层兜底 |
 
 ## 9. 与上游安装器的关系
 

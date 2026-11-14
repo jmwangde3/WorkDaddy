@@ -12,8 +12,9 @@
 | [`01-risk-register.md`](01-risk-register.md) | R1–R16 风险与处置，其中 3 项需人工决策 | 审查前必看 |
 | [`02-full-fork-import.md`](02-full-fork-import.md) | 历史策略、5 个提交的分工、7 个核心文件的处理方式、验证证据 | 判断合并是否「真合并」 |
 | [`02-source-provenance.md`](02-source-provenance.md) | BASE/FORK/UP/NOW 四方 blob 台账 + 复核命令 | 追某一行代码的来源 |
-| [`04-installer.md`](04-installer.md) | 安装 / 更新 / 卸载的设计、退出码、数据位置、27 条测试证据、已知缺口 | 用或改安装器 |
+| [`04-installer.md`](04-installer.md) | 安装 / 更新 / 卸载的设计、退出码、数据位置、测试证据、已知缺口 | 用或改安装器 |
 | [`07-ci-release.md`](07-ci-release.md) | 九类 CI 检查的落点、打包产物实测、发布前人工清单 | 想发版前 |
+| [`08-release-decisions.md`](08-release-decisions.md) | **发布前稳定性收尾**：更新/安装事务完整性（含故障注入）、Setup 真机验证边界、托盘可复现构建、三项架构决策、两条环境失败的根因 | 发版前最后一关；想知道「哪些是真验证过、哪些没有」 |
 
 配套：
 

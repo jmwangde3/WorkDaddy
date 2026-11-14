@@ -13,6 +13,14 @@
 
 ## 安装
 
+### 方式零：Setup 安装包（CI 验证过，未签名）
+
+`WorkDaddy-<版本>-setup.exe` 是 Inno Setup 引导器：解便携包到临时目录 → 调**同一个**
+`install-workdaddy.ps1` → 登记卸载入口。安装逻辑只有一份，Setup 不会和脚本各自漂移。
+
+它已在 CI 的一次性 Windows VM 上通过「静默安装 → 安装记录逐条哈希核对 → 静默卸载 → 数据保留」验证。
+**开发机从未运行过它，也没有代码签名**，SmartScreen 会拦；拿不准就用方式一。
+
 ### 方式一：装到本机（推荐，可更新可卸载）
 
 ```powershell
@@ -39,7 +47,9 @@ powershell -ExecutionPolicy Bypass -File installer\update-workdaddy.ps1 -SourceD
 顺序是固定的：版本闸门（拒绝降级，需 `-Force`）→ 暂存到临时目录并逐文件验哈希 → 停掉**本安装目录**的 `daemon.js`/`watchdog.js`（按命令行路径精确匹配，不碰其它进程）→ 整目录备份 → 替换 → 装后校验 → `node --check` 四项健康检查 → 写状态 → 清理暂存。
 
 - 任何一步失败都自动回滚，报告里 `rolledBack` 写明结果；回滚不成功会直接给出备份路径，不会假装成功
-- 可恢复版本留在 `%APPDATA%\WorkDaddy\backups\app-<旧版本>-preupdate-<时间戳>`
+- **安装记录也在事务里**：先备份旧 `install-state.json` → 新状态写临时文件并校验（版本、目录、清单条数、每条 path/sha256）→ 同卷原子替换 → 再校验一次。任一步失败，程序与状态各自回滚并**分别**汇报（`rollback.programRestored` / `rollback.stateRestored`），不会出现「程序已是新版本、安装记录还是旧版本」
+- 替换前写 `update-journal.json`，状态提交成功后才删。上次更新没做完（磁盘程序与记录版本不一致）时，下一次会 **exit 8 拒绝继续**，确认后用 `-Force` 接着做
+- 可恢复版本留在 `%APPDATA%\WorkDaddy\backups\app-<旧版本>-preupdate-<时间戳>`，同目录还有一份旧 `install-state-<版本>-<时间戳>.json`
 - 加 `-Restart` 才会在更新后用 `scripts\launcher.cmd` 重新拉起（与双击快捷方式同一条路径）
 
 ## 卸载
@@ -78,9 +88,28 @@ powershell -ExecutionPolicy Bypass -File installer\uninstall-workdaddy.ps1
 ## 已知限制
 
 - 仓库里有 49 条**历史测试失败**（`test/known-failures.json` 逐条登记了文件、用例名与错误指纹），不是本次迁移引入的；CI 只对「新增失败」报警。
-- `installer/setup/workdaddy.iss`（Inno Setup 引导器）尚未在真机编译验证 —— 开发环境没有 ISCC。便携包与源码包已实测可用。
+- `WorkDaddy-<版本>-setup.exe` 已在 **CI 的一次性 Windows VM** 上完成编译与真机安装/卸载验证，但**开发机从未运行过**，且没有代码签名；首次发布前仍建议在一台干净机器上手动走一遍。
+- **没有在线下载与签名校验**：不自动检查新版本，也不校验安装包来源；请只使用自己构建或自己核对过 `SHA256SUMS.txt` 的包。
+- 仓库里仍提交着 `tray/WorkDaddyTray.exe`（可用 `tray\build.cmd` 或 `installer\build-tray.ps1` 复现，CI 每次现编比对）。等 CI 构建稳定后再评估是否移出 Git。
+- `deploy.ps1` 已标为 **LEGACY**：只用于旧补丁版用户迁出配置、或上游大版本升级后临时救急。新安装 / 更新 / 卸载都走 `installer\`，不会再改 WorkBuddy 安装目录。
 - 独立安装器目前只有 Windows 版；macOS / Linux 仍按上游方式使用。
 - 卸载不会碰 WorkBuddy 客户端自己的数据目录，也不会替你删旧补丁版留下的文件。
+
+## 托盘
+
+`tray\WorkDaddyTray.exe` 是系统托盘控制器（状态 / 启动 / 关闭 / 重启 / 恢复 CDP / 开机自启 / 退出）。
+
+重新编译只需 Windows 自带的 .NET Framework 4.x，不需要 Visual Studio、SDK 或 NuGet：
+
+```powershell
+tray\build.cmd
+# 或带构建清单与运行验证（推荐）：
+powershell -ExecutionPolicy Bypass -File installer\build-tray.ps1 -Verify
+```
+
+`installer\build-tray.ps1` 会记录 csc 版本、完整参数、源码与产物 SHA-256 到
+`WorkDaddyTray.exe.build.json`，`-Verify` 还会真的跑 `--selftest` / `--status`。
+CI 的 `tray-build` 作业每次现编一份，并与仓库里的 EXE 做行为与字面量比对。
 
 ## 许可证
 
