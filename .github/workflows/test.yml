@@ -4,7 +4,7 @@ name: Tests
 # 发布流程仍在 build-win.yml（仅 tag / 手动触发，权限另算）。
 on:
   push:
-    branches: ['main', 'fix/**']
+    branches: ['main', 'fix/**', 'feat/**', 'sync/**']
   pull_request:
   workflow_dispatch:
 
@@ -93,3 +93,101 @@ jobs:
           node -e "const {DatabaseSync}=require('node:sqlite'); const db=new DatabaseSync(':memory:'); db.exec('CREATE TABLE t(a)'); console.log('node:sqlite OK without flags');"
           node test/rehome-dedupe.test.js
           node test/session-scope.test.js
+
+  installer-tests:
+    # 安装 / 更新 / 卸载在临时目录里真跑 PowerShell 5.1：
+    #   装到 fixture 目录、坏包回滚、停服务、哈希变化跳过、越界路径防护。
+    # 全程不碰真实 %APPDATA%\WorkDaddy、不碰 WorkBuddy 安装目录、不建桌面快捷方式。
+    name: 安装器 / 更新回滚 / 卸载
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 安装器生命周期
+        shell: bash
+        run: node --test test/installer-lifecycle.test.js
+
+      - name: 安装记录与磁盘一致性（失败时留证据）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-tmp
+          path: tmp/
+          if-no-files-found: ignore
+
+  package:
+    # 产物检查：真打一次包，检查 zip 里到底装了什么。
+    # 「本机路径配置 / 测试夹具 / 迁移文档进了发布包」是发出去就收不回的事故。
+    name: 打包产物内容检查
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # git archive 要完整仓库，浅克隆会缺历史
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 便携包 / 源码包 / 哈希清单
+        shell: bash
+        env:
+          # 留档产物供人工核对；不设的话测试跑完会自己删掉
+          WD_PKG_KEEP: '1'
+        run: node test/package-hygiene.test.js
+
+      - name: 留档产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            tmp/pkg-hygiene-*/dist/*.zip
+            tmp/pkg-hygiene-*/dist/SHA256SUMS.txt
+          if-no-files-found: warn
+
+  supply-chain:
+    # 这个项目刻意做到零运行时依赖：node_modules 不存在，供应链面就是 0。
+    # 一旦有人加依赖，这条会失败，必须在 PR 里显式讨论。
+    name: 依赖与供应链
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.14.0'
+
+      - name: 断言零依赖并核对 engines
+        shell: bash
+        run: |
+          node -e "
+          const pkg = require('./package.json');
+          const deps = Object.keys(pkg.dependencies || {});
+          const dev = Object.keys(pkg.devDependencies || {});
+          if (deps.length || dev.length) {
+            console.error('本项目不引入第三方依赖，请先在 PR 里讨论：', deps, dev);
+            process.exit(1);
+          }
+          if (!pkg.engines || !pkg.engines.node) { console.error('package.json 缺 engines.node'); process.exit(1); }
+          console.log('零依赖 OK，engines.node =', pkg.engines.node);
+          "
+          test ! -d node_modules && echo "node_modules 不存在（符合预期）"
+
+      - name: 检查没有提交私密文件
+        shell: bash
+        run: |
+          set -e
+          BAD=$(git ls-files | grep -Ei '(^|/)(\.api-token|workbuddy-exe\.json|.*\.pem|.*\.pfx|credentials\.json)$' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::仓库里提交了疑似私密文件：$BAD"
+            exit 1
+          fi
+          echo "未发现私密文件"
