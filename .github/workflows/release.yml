@@ -1,0 +1,129 @@
+name: Release (tag → 正式资产)
+
+# 1.3.x 唯一的正式发布入口。
+#
+# 触发：推形如 `1.3.0` 的 tag（不带 v 前缀，沿用 1.2.x 惯例），或手动指定已有 tag。
+# 旧的 build-win.yml 已降级为手动 legacy 流程，不再挂 Release。
+#
+# 这里不重复实现打包逻辑 —— 只调用 installer/build-package.ps1，
+# 那套逻辑在 test.yml 的「打包产物内容检查」作业里已经被验证过。
+# 发布前额外守两道闸：
+#   1. tag 名必须等于 daemon.js 里的 DAEMON_VERSION（防止 tag 与程序版本脱节）；
+#   2. SHA256SUMS.txt 必须覆盖全部资产，且每条哈希当场重算一遍。
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的现有 tag（如 1.3.0）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建资产并发布
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 确定版本号并校验与程序一致
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ github.event.inputs.tag }}' } else { '${{ github.ref_name }}' }
+          if (-not $tag) { throw '拿不到 tag 名' }
+          if ($tag -match '^v') { throw "tag 不应带 v 前缀（本项目惯例是 1.3.0 这种形式）：$tag" }
+          $m = Select-String -Path scripts\daemon.js -Pattern "const DAEMON_VERSION = '([^']+)'" | Select-Object -First 1
+          if (-not $m) { throw '在 scripts/daemon.js 里找不到 DAEMON_VERSION' }
+          $ver = $m.Matches[0].Groups[1].Value
+          if ($tag -ne $ver) { throw "tag 与程序版本不一致：tag=$tag daemon=$ver。先改 DAEMON_VERSION 再打 tag。" }
+          Write-Output "version=$tag" >> $env:GITHUB_OUTPUT
+          Write-Output "版本: $tag （与 daemon.js 一致）"
+
+      - name: 安装 Inno Setup
+        shell: pwsh
+        run: |
+          choco upgrade innosetup --version=6.7.1 --allow-downgrade --no-progress --yes
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 安装失败：$LASTEXITCODE" }
+
+      - name: 打包（便携版 + 源码包 + Setup）
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "找不到 ISCC.exe：$iscc" }
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File .\installer\build-package.ps1 `
+            -Version '${{ steps.ver.outputs.version }}' -Setup -IsccPath $iscc `
+            -Json (Join-Path $env:GITHUB_WORKSPACE 'release-report.json')
+          if ($LASTEXITCODE -ne 0) { throw "打包失败：$LASTEXITCODE" }
+
+      - name: 校验资产清单完整且哈希可复现
+        shell: pwsh
+        run: |
+          $dist = 'release\dist'
+          $sumsPath = Join-Path $dist 'SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $sumsPath)) { throw '没有 SHA256SUMS.txt' }
+          $lines = @(Get-Content -LiteralPath $sumsPath -Encoding UTF8 | Where-Object { $_.Trim() })
+          if (-not $lines.Count) { throw 'SHA256SUMS.txt 是空的' }
+
+          $listed = @()
+          foreach ($line in $lines) {
+            # 标准 sha256sum 格式："<64位hex>  <文件名>"
+            $parts = $line -split '\s+', 2
+            if ($parts.Count -ne 2) { throw "SHA256SUMS 行格式不对：$line" }
+            $expect = $parts[0].Trim().ToLowerInvariant()
+            $name = $parts[1].Trim()
+            $listed += $name
+            $p = Join-Path $dist $name
+            if (-not (Test-Path -LiteralPath $p)) { throw "SHA256SUMS 列了不存在的文件：$name" }
+            $actual = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expect) { throw "哈希不符：$name（清单 $expect / 实算 $actual）" }
+            Write-Output "  ✓ $name"
+          }
+
+          # 反向检查：目录里的资产必须都被清单覆盖，否则「校验和」形同虚设
+          $assets = @(Get-ChildItem -LiteralPath $dist -File |
+            Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object Name)
+          $missing = @($assets | Where-Object { $listed -notcontains $_ })
+          if ($missing.Count) { throw "这些资产没被 SHA256SUMS 覆盖：$($missing -join ', ')" }
+          Write-Output "资产 $($assets.Count) 个，清单覆盖 $($listed.Count) 条，逐条哈希一致"
+
+      - name: 列出产物
+        shell: pwsh
+        run: Get-ChildItem -LiteralPath release\dist -File | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: 创建或更新 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ steps.ver.outputs.version }}'
+          $repo = '${{ github.repository }}'
+          $files = @(Get-ChildItem -LiteralPath release\dist -File | ForEach-Object FullName)
+          $existing = gh release view $tag --repo $repo --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0 -and $existing) {
+            Write-Output "Release $tag 已存在，改为覆盖上传"
+            gh release upload $tag @files --repo $repo --clobber
+            if ($LASTEXITCODE -ne 0) { throw "上传失败：$LASTEXITCODE" }
+          } else {
+            gh release create $tag @files --repo $repo --title $tag --generate-notes --latest
+            if ($LASTEXITCODE -ne 0) { throw "创建 Release 失败：$LASTEXITCODE" }
+          }
+          Write-Output "Release: https://github.com/$repo/releases/tag/$tag"
+
+      - name: 留档报告与产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.ver.outputs.version }}
+          path: |
+            release/dist/*
+            release-report.json

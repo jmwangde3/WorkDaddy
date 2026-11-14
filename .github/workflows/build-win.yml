@@ -1,22 +1,32 @@
-name: Build & Verify Windows Setup
+name: Build & Verify Windows Setup (LEGACY)
 
-# 触发方式（任选其一都会跑这套打包+验证）：
-#   - 推 v* 标签（正式发版）
-#   - 手动触发（workflow_dispatch，可传版本号）
-#   - 推 master/main（可选，防回归）
+# ⚠️ LEGACY（1.2.x 旧补丁版流程），1.3.x 起**不再用于正式发布**。
+#
+# 原因：这套流程产出的是旧补丁版资产 —— WorkDaddy-Setup-<ver>.exe、
+# WorkDaddy-AI-Setup-<ver>.exe、两个 Portable ZIP，校验 WorkDaddyLauncher.exe
+# 与 scripts/runtime/node/node.exe。而 1.3.x 的正式产物由 installer/build-package.ps1
+# 产出（WorkDaddy-<ver>-setup.exe / -portable-win-x64.zip / -source.zip / SHA256SUMS.txt），
+# 两者文件名、内容、校验方式都不同。
+#
+# 之前的触发条件是 `push tags: v*`，而实际 tag 是 `1.3.0`（无 v 前缀，沿用 1.2.x 惯例），
+# 所以它一次都没跑过 —— 但万一有人按 v* 打 tag，它会往 Release 上挂一套与正式流程
+# 不兼容的资产。这不是「多跑一次」的问题，是「发布资产来源有两个」的问题。
+#
+# 现在：
+#   - 去掉 push 触发与 Release 挂载，只剩手动 workflow_dispatch；
+#   - 保留原因是它还带着旧的构建校验（内置资产、CRLF、便携包内部结构），
+#     排查 1.2.x 遗留问题时仍可手动跑；
+#   - 正式发布走 .github/workflows/release.yml。
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（如 1.0.4），留空则从代码读取'
+        description: '版本号（如 1.2.22），留空则从代码读取'
         required: false
         default: ''
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-and-verify:
@@ -127,25 +137,17 @@ jobs:
         run: |
           call scripts\verify-win.cmd
 
-      - name: 上传产物（Setup.exe + 便携版 ZIP）
+      - name: 上传产物（仅留档，不挂 Release）
         uses: actions/upload-artifact@v4
         with:
-          name: workdaddy-win64
+          name: workdaddy-win64-legacy
           path: |
             release/windows/WorkDaddy-Setup-*.exe
             release/windows/WorkDaddy-AI-Setup-*.exe
             release/windows/WorkDaddy-Portable-*.zip
             release/windows/WorkDaddy-AI-Portable-*.zip
-
-      # ---- 只有打 tag 时才顺手挂到 GitHub Release ----
-      - name: 发布到 GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release/windows/WorkDaddy-Setup-*.exe
-            release/windows/WorkDaddy-AI-Setup-*.exe
-            release/windows/WorkDaddy-Portable-*.zip
-            release/windows/WorkDaddy-AI-Portable-*.zip
             release/*.dmg
+
+      # Release 挂载已移除：正式发布走 release.yml（现代打包器 + SHA256SUMS）。
+      # 这里保留旧流程只为手动排查 1.2.x 遗留问题，产物只进 Actions artifact。
           generate_release_notes: true
