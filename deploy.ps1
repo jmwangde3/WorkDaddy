@@ -7,8 +7,12 @@
       3. 读取 scripts/upstream.json：
          a) 版本号闸门（默认 advisory，只提示；-StrictVersionGate 才阻断）
             —— 上游版本号只来自提交信息，不足以作为强制判断依据
-         b) 文件代际闸门（硬）：目标文件字节数 == 上游实测字节数 → 无我们补丁的
-            原版上游文件，覆盖会丢上游修复，默认中止（-Force 可越过）
+         b) 文件代际闸门（硬，SHA-256 判定）：
+            目标哈希 == 本补丁哈希            → already-patched，可覆盖
+            目标哈希 == 上游 1.2.22 原版哈希  → pristine-upstream，默认中止
+            两者都不等 / 缺上游哈希           → unknown-generation，默认中止
+            只有 -Force 才能越过中止
+            —— -Force 只管代际闸门，不顺手拆版本闸门（见 3a）
          c) 客户端版本区间（只在 upstream.json 明确声明区间时检查）
       4. 备份将被修改/新增的文件到 %APPDATA%\WorkDaddy\script-backups\deploy-<时间戳>\
       5. 先复制到临时目录并逐个校验哈希
@@ -25,14 +29,16 @@
         .\deploy.ps1                    正常部署
         .\deploy.ps1 -DryRun            只做预检并输出报告，不写任何文件
         .\deploy.ps1 -NoRestart         只铺文件，不动正在运行的服务
-        .\deploy.ps1 -Force             目标版本更新时仍然继续（谨慎）
+        .\deploy.ps1 -Force             越过文件代际闸门（谨慎，会覆盖未知代际的文件）
         .\deploy.ps1 -TargetDir "D:\xxx\WorkDaddy\scripts"
         .\deploy.ps1 -StrictVersionGate   版本号不匹配也中止（默认只提示）
-        .\deploy.ps1 -StrictFileGate      目标文件代际不明也中止（默认只提示）
+        .\deploy.ps1 -ForceVersion        显式越过 -StrictVersionGate（与 -Force 分开，避免一次拆掉两道闸）
+        .\deploy.ps1 -StrictFileGate      兼容旧参数；代际闸门现已默认硬拦，无需再加
 #>
 param(
     [switch]$NoRestart,
     [switch]$Force,
+    [switch]$ForceVersion,
     [switch]$DryRun,
     [string]$TargetDir,
     [switch]$StrictVersionGate,
@@ -158,7 +164,9 @@ Say ("    新增文件 {0} 个 + 上游改版 {1} 个 = 共 {2} 个" -f $newFile
 # ---------------------------------------------------------------- 3. 版本与代际
 Head '3/7 检查上游元数据 / 文件代际'
 
-$upstreamPath = Join-Path $src 'upstream.json'
+# 元数据来源：默认读仓库里的 scripts/upstream.json。
+# WORKDADDY_UPSTREAM_JSON 只给测试用（可以指向合成元数据），生产路径不允许改。
+$upstreamPath = if ($env:WORKDADDY_UPSTREAM_JSON) { $env:WORKDADDY_UPSTREAM_JSON } else { Join-Path $src 'upstream.json' }
 $up = $null
 $forkVersion = ''
 if (Test-Path $upstreamPath) {
@@ -212,32 +220,55 @@ if ($targetVersion -and $forkVersion) {
 }
 if ($versionAdvisory) {
     $script:Report.versionAdvisory = $versionAdvisory
-    if ($StrictVersionGate -and -not $Force) {
-        Fail 'version' ("{0}；-StrictVersionGate 已开启，故中止。确认继续请加 -Force。" -f $versionAdvisory) 2
+    # 版本闸门与代际闸门各用各的开关：只要目标版本被改过，目标文件哈希必然不等于补丁哈希
+    # （DAEMON_VERSION 就在文件头），也就必然要 -Force 才能过代际闸门。若两道闸共用
+    # -Force，-StrictVersionGate 就永远不可能触发 —— 等于被代际闸门顺手拆掉。
+    if ($StrictVersionGate -and -not $ForceVersion) {
+        Fail 'version' ("{0}；-StrictVersionGate 已开启，故中止。确认继续请加 -ForceVersion（-Force 只越过代际闸门）。" -f $versionAdvisory) 2
     }
     Say ("    [!] {0}（advisory，不阻断；如需阻断加 -StrictVersionGate）" -f $versionAdvisory) 'Yellow'
 }
 
-# 3b) 文件代际闸门（硬）：依据是**可测量的字节数**，不是版本字符串推断。
-# 目标文件字节数 == 上游 1.2.22 实测字节数 → 目标是无我们补丁的原版上游文件，
-# 直接覆盖会丢掉上游修复（本 fork 的 daemon/inject 比 1.2.22 小）。
+# 3b) 文件代际闸门（硬）：依据是 **SHA-256**，不是字节数。
+#     字节数只能说明「大小碰巧一样」，不能说明「内容是什么」。同大小不同内容的目标
+#     文件在旧实现里会被判成 already-patched 然后被覆盖 —— 那是真的丢数据。
+#     现在三种判定全部要求哈希相等：
+#       目标哈希 == 本补丁哈希           → already-patched（可覆盖）
+#       目标哈希 == 上游原版哈希         → pristine-upstream（默认中止）
+#       其余（含缺上游哈希）             → unknown-generation（默认中止）
+#     只有 -Force 能越过中止。
 $generation = @()
-$upSizes = $null
-if ($up -and $up.deploy -and $up.deploy.upstreamFileSizes) { $upSizes = $up.deploy.upstreamFileSizes }
+$upHashes = $null
+if ($up -and $up.deploy -and $up.deploy.upstreamFileHashes) { $upHashes = $up.deploy.upstreamFileHashes }
+$localHashes = $null
+if ($up -and $up.deploy -and $up.deploy.localFileHashes) { $localHashes = $up.deploy.localFileHashes }
 foreach ($f in $patchedFiles) {
     $tf = Join-Path $dst $f
     if (-not (Test-Path $tf)) { continue }
-    $targetSize = (Get-Item $tf).Length
-    $ourSize = (Get-Item (Join-Path $src $f)).Length
-    $upSize = 0
-    if ($upSizes) {
-        $prop = $upSizes.PSObject.Properties[$f]
-        if ($prop -and $prop.Value) { $upSize = [int64]$prop.Value }
+    $targetItem = Get-Item $tf
+    $targetHash = (Get-FileHash -Algorithm SHA256 -Path $tf).Hash
+    $ourHash = [string]$sourceHash[$f]
+    $upHash = ''
+    if ($upHashes) {
+        $prop = $upHashes.PSObject.Properties[$f]
+        if ($prop -and $prop.Value -and $prop.Value.sha256) { $upHash = [string]$prop.Value.sha256 }
+    }
+    $recordedLocalHash = ''
+    if ($localHashes) {
+        $lp = $localHashes.PSObject.Properties[$f]
+        if ($lp -and $lp.Value -and $lp.Value.sha256) { $recordedLocalHash = [string]$lp.Value.sha256 }
     }
     $kind = 'unknown-generation'
-    if ($targetSize -eq $ourSize) { $kind = 'already-patched' }
-    elseif ($upSize -gt 0 -and $targetSize -eq $upSize) { $kind = 'pristine-upstream' }
-    $generation += [pscustomobject]@{ name = $f; kind = $kind; targetSize = $targetSize; upstreamSize = $upSize; patchSize = $ourSize }
+    $why = 'hash-matches-neither'
+    if ($targetHash -eq $ourHash) { $kind = 'already-patched'; $why = 'hash-equals-patch' }
+    elseif ($upHash -and $targetHash -eq $upHash) { $kind = 'pristine-upstream'; $why = 'hash-equals-upstream' }
+    elseif (-not $upHash) { $why = 'no-upstream-hash-recorded' }
+    $generation += [pscustomobject]@{
+        name = $f; kind = $kind; why = $why
+        targetSize = $targetItem.Length; patchSize = (Get-Item (Join-Path $src $f)).Length
+        targetHash = $targetHash; patchHash = $ourHash; upstreamHash = $upHash
+        recordedLocalHash = $recordedLocalHash
+    }
 }
 $script:Report.generation = $generation
 
@@ -246,18 +277,28 @@ $unknownGen = @($generation | Where-Object { $_.kind -eq 'unknown-generation' })
 if ($pristine.Count -gt 0) {
     $names = ($pristine | ForEach-Object { $_.name }) -join ', '
     if (-not $Force) {
-        Fail 'file-generation' ("目标这些文件是原版上游 1.2.22（字节数与上游一致），不是我们的补丁版: {0}。直接覆盖会丢掉上游修复。确认要降级请加 -Force。" -f $names) 2
+        Fail 'file-generation' ("目标这些文件与上游 1.2.22 原版逐字节一致（SHA-256 相同），是没打过我们补丁的原版上游文件: {0}。直接覆盖会丢掉上游修复。确认要降级请加 -Force。" -f $names) 2
     }
     Say ("    [!] 目标为原版上游文件，已按 -Force 继续: {0}" -f $names) 'Yellow'
 }
 if ($unknownGen.Count -gt 0) {
     $names = ($unknownGen | ForEach-Object { $_.name }) -join ', '
-    if ($StrictFileGate -and -not $Force) {
-        Fail 'file-generation' ("目标这些文件代际不明（既非本补丁版也非上游 1.2.22）: {0}；-StrictFileGate 已开启，故中止。" -f $names) 2
+    if (-not $Force) {
+        Fail 'file-generation' ("目标这些文件代际不明（SHA-256 既不等于本补丁版，也不等于上游 1.2.22 原版）: {0}。可能是别的版本打过补丁，直接覆盖无法保证可恢复。确认要继续请加 -Force。" -f $names) 2
     }
-    Say ("    [!] 目标文件代际不明（将覆盖）: {0}" -f $names) 'Yellow'
+    Say ("    [!] 目标文件代际不明，已按 -Force 继续覆盖: {0}" -f $names) 'Yellow'
 }
-Say ("    代际检查: {0} 个文件" -f $generation.Count) 'Green'
+# 记录哈希与仓库实际文件不一致：说明 upstream.json 写在别的补丁版本上（只提示，不影响判定）。
+$drift = @($generation | Where-Object { $_.recordedLocalHash -and $_.recordedLocalHash -ne $_.patchHash })
+if ($drift.Count -gt 0) {
+    $names = ($drift | ForEach-Object { $_.name }) -join ', '
+    $script:Report.patchDrift = $names
+    Say ("    [!] upstream.json 记录的补丁哈希与当前文件不一致（元数据过期）: {0}" -f $names) 'Yellow'
+}
+if ($StrictFileGate) {
+    Say '    (提示) 代际闸门现已默认硬拦，-StrictFileGate 不再需要。' 'Yellow'
+}
+Say ("    代际检查: {0} 个文件（SHA-256 判定）" -f $generation.Count) 'Green'
 
 # 3c) 客户端版本：只在明确声明了支持区间时才检查（当前 upstream.json 不声明区间）
 $clientVersion = ''
