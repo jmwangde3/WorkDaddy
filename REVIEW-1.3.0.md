@@ -228,3 +228,51 @@ daemon 的 `POST /api/rehome/dedupe/background` 同步改为默认 `dryRun`。�
 **推送前唯一需要你点头的**：是否允许 `git push -u origin fix/workdaddy-data-permission-hardening`。推送后 CI 会自动跑 `node-tests`（Windows + Node 22.14）、`powershell-check`（5.1/7 矩阵）、`node-version-floor`（22.13）。
 
 不推送、不合并、不发 Release —— 等你的指令。
+
+## 7. 推送与首轮 CI（2026-11-14）
+
+分支已推送，`main` 未动（远端 `main` 仍为 `041e3dcb`）。首轮 CI 连挂三轮，
+全部为 CI 环境适配问题，非安全改造回归；逐轮修复记录见 commit：
+
+| commit | 问题 | 修法 |
+| --- | --- | --- |
+| `46b6c91` | 工作流 0 秒 0 job：`steps[*].shell` 不接受 `${{ matrix.* }}` | 检查逻辑落到 `.github/scripts/check-powershell.ps1`，`shell: bash` + `matrix.exe` 起子进程 |
+| `4506d42` | 新增失败 16 条：runner `autocrlf=true` 让 `.js` 检出成 CRLF；另 1 条是 cp1252 下 `print` 中文崩溃 | `.gitattributes` 加 `* text=auto eol=lf`；品牌化块加 `sys.stdout.reconfigure(encoding='utf-8')` |
+| `be55268` | 新增失败 1 条：`localDate` 断言写死 UTC+8 的日期 | 期望值按本地日期规则算，另钉死 `runtime.time.iso` |
+
+最终运行 `43580991376`：`node-tests` 1611 用例 / 1553 通过 / 51 失败 / 7 跳过 /
+**新增失败 0**；`powershell-check` 5.1 与 7 双绿；`node-version-floor` 绿。
+基线未改动。
+
+## 8. 后续发布前事项（未在本轮处理）
+
+1. **无 ID 消息的包含关系安全性**
+   当前包含层对无 `id` 记录用「内容哈希多重集 ⊆」判定。同一条无 id 记录
+   重复出现多次时，多重集计数能区分，但**顺序信息丢失**：A 有 [m1,m2]、
+   B 有 [m2,m1]，集合层面互为子集，若同 id 部分也一致就会被判 equal。
+   发布前应改为「按行序列做子序列校验」或直接对无 id 记录要求逐字节相同。
+
+2. **Legacy `deleted_at = -1` 的处理**
+   `legacy-no-transport`（表里没有 `transport` 列）目前沿用旧行为，只把
+   `-1` 行数作为 `legacy-minus-one-rows` 报出来，不纳入接管范围也不判失败。
+   发布前需在真实旧库副本上确认：旧版到底用 `NULL` 还是 `-1` 表示未删除，
+   再决定是否把 legacy 分支也收紧为单一编码。
+
+3. **上游文件 SHA-256 代际验证**
+   现在的文件代际闸门比的是**字节数**（目标 == 上游实测大小 → 判为原版）。
+   字节数会撞：不同版本恰好同大小就无法区分。应改为比对上游文件的
+   SHA-256，把 `upstream.json.deploy.upstreamFileSizes` 扩成
+   `upstreamFileHashes`，同时保留大小作为快速预筛。
+
+4. **历史失败增加错误指纹**
+   `known-failures.json` 目前按 `{file, name}` 匹配。若某条历史失败换了
+   失败原因（比如断言语义变了但用例名没变），会被继续当成同一条已知失败。
+   应把 TAP 的 `error` / `code` 归一化后存成指纹，匹配时要求用例名 + 指纹
+   同时命中，否则算新增失败。
+
+5. **PowerShell 5.1 实际 DryRun 与回滚测试**
+   目前 `deploy-safety.test.js` 用 `spawnSync('powershell.exe')` 跑，覆盖了
+   版本闸门与故障注入回滚，但**没有**在 5.1 上跑一次完整 `-DryRun` 到
+   「生成部署报告」的端到端路径；也没验证 5.1 下 `Copy-Item` 失败时的
+   回滚顺序。发布前补一条「PS 5.1 + 真实临时目录 + 中途失败」的用例。
+
