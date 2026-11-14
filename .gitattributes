@@ -14,6 +14,12 @@
 # 会让容器 / CI 报 "bad interpreter"。
 *.sh text eol=lf
 
+# 包字节即身份：这些文件的 sha256 被 examples/automation-packages/workdaddy-automations.json
+# 钉死，工作区一旦检出成 CRLF，哈希就对不上（本机红、CI 绿）。
+# 显式再钉一次，并用 test/line-endings.test.js 兜底。
+# 历史克隆出现 CRLF 时的修复：删掉文件后 `git checkout -- <file>`。
+examples/automation-packages/*.json text eol=lf
+
 # 明确二进制，避免 auto 探测在这些文件上出错
 *.png binary
 *.jpg binary

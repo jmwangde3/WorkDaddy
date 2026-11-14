@@ -117,7 +117,20 @@ function wdCompatLog(msg) {
 // 校验的主程序路径；只在 Node/daemon 侧读取，注入到 renderer 的 compat 脚本不会触发。
 function wdCompatConfiguredExe() {
   if (!IS_WIN || typeof module === 'undefined' || !module.exports) return '';
-  // [rehome] 自定义安装盘符：同目录 workbuddy-exe.json 指定客户端路径。
+  // 显式配置优先：<数据目录>\workbuddy-target.json 是新版配置入口，会随安装迁移，
+  // 也是测试/安装器唯一可靠的注入点。旧补丁版遗留的 <scripts>\workbuddy-exe.json
+  // 只在没有显式 target 时兜底 —— 否则开发机上那份指向本机安装目录的遗留文件
+  // 会盖掉用户（或测试）显式配置的路径，取钥走错二进制。
+  try {
+    const target = require('./workbuddy-target.js').readWorkBuddyTarget({
+      dataDir: process.env.WBSWITCH_DATA_DIR || undefined,
+      profileId: process.env.WBSWITCH_PROFILE || undefined,
+    });
+    if (target && target.configured && typeof target.binary === 'string' && target.binary.trim()) {
+      return target.binary.trim();
+    }
+  } catch (_) {}
+  // [rehome] 旧补丁版兜底：同目录 workbuddy-exe.json 指定客户端路径。
   // 官方默认只找 %LOCALAPPDATA%\Programs\WorkBuddy，装在其它盘时取钥失败，
   // 会把 nickname / phone 显示成「(已加密)」，积分与成长接口也拿不到明文 token。
   try {
