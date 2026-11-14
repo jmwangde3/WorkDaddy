@@ -1,16 +1,16 @@
 {
   "schema": 4,
   "note": "CI 基线：按「文件 + 用例名 + 规范化错误签名」三重匹配。这些失败在本轮改造前就存在（环境/平台相关），不阻塞 CI；新增失败、以及同名但错误内容变化的失败都会报错。更新必须人工确认，不得用来消除新增失败。",
-  "generatedAt": "2026-11-14T12:17:18.822Z",
+  "generatedAt": "2026-11-14T13:35:05.091Z",
   "node": "v22.14.0",
   "platform": "win32",
   "counts": {
-    "tests": 1699,
-    "pass": 1643,
-    "fail": 49,
+    "tests": 1703,
+    "pass": 1649,
+    "fail": 47,
     "skipped": 7,
-    "scenarios": 71,
-    "files": 193
+    "scenarios": 92,
+    "files": 197
   },
   "fileTests": {
     "account-credit-cache.test.js": 2,
@@ -97,6 +97,8 @@
     "i18n-coverage.test.js": 11,
     "i18n.test.js": 4,
     "installer-lifecycle.test.js": 1,
+    "installer-transaction.test.js": 1,
+    "line-endings.test.js": 1,
     "linux-daemon-process.test.js": 2,
     "linux-paths.test.js": 9,
     "linux-release-script.test.js": 6,
@@ -114,6 +116,7 @@
     "oauth-platform.test.js": 4,
     "official-automation-sync.test.js": 11,
     "open-url.test.js": 3,
+    "package-hygiene.test.js": 1,
     "panel-brand-robot.test.js": 7,
     "panel-outside-dismiss.test.js": 3,
     "panel-theme-controls.test.js": 30,
@@ -189,6 +192,7 @@
     "token-stats-import.test.js": 10,
     "token-stats-modal.test.js": 2,
     "token-stats.test.js": 16,
+    "tray-build.test.js": 1,
     "ui-port.test.js": 2,
     "update-layout.test.js": 104,
     "usage-activity.test.js": 3,
@@ -267,11 +271,6 @@
       "file": "account-switch-session-rules.test.js",
       "name": "workbuddy-cn: SDK, hydration fallback and legacy cache keep their switch behavior",
       "signature": "Cannot read properties of undefined (reading 'openSessionId')"
-    },
-    {
-      "file": "automation-packages.test.js",
-      "name": "example index pins the exact package bytes",
-      "signature": "Expected values to be strictly equal:\n+ actual - expected\n\n+ '<HEX>'\n- '<HEX>'"
     },
     {
       "file": "automation-safety-review.test.js",
@@ -447,11 +446,6 @@
       "file": "verify-win-exit.test.js",
       "name": "Windows verifier returns success for a complete source package",
       "signature": "ENOENT: no such file or directory, copyfile '<PATH>' -> '<PATH>'"
-    },
-    {
-      "file": "workbuddy-compat.test.js",
-      "name": "Windows encrypted-field key lookup honors the configured WorkBuddy target path",
-      "signature": "Expected values to be strictly equal:\n+ actual - expected\n\n+ '<PATH> Files\\\\WorkBuddy\\\\WorkBuddy.exe'\n- '<PATH>'"
     }
   ]
 }
