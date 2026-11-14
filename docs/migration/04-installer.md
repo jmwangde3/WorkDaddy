@@ -123,6 +123,41 @@
 - 快捷方式只删**记录里那一条**，不按名字猜。桌面上同名的 `WorkDaddy.lnk` 可能是用户自己建的。
 - 默认保留数据目录；清理必须 `-PurgeData -YesPurgeData` 双开关，报告里列出清理范围。
 
+### 6.1 AppDir / DataDir 的强制边界（1.3.1 新增）
+
+三个脚本共用 `installer/lib/common.ps1` 里的两个函数：
+
+`Test-SafeRootDir -Path <p> -Label <名字>` 拒绝：
+
+| 情形 | 例子 |
+| --- | --- |
+| 盘根 | `C:\` |
+| Windows 系统目录 | `C:\Windows` |
+| `%APPDATA%` / `%LOCALAPPDATA%` 本身（用户可能想删的是父目录） | `C:\Users\x\AppData\Roaming` |
+| 用户主目录 | `C:\Users\x` |
+| 路径穿越 | `C:\app\..\..\Windows` |
+| 目录重解析点（junction / symlink） | 指向别处的目录 |
+
+`Test-DirOverlap -A <AppDir> -B <DataDir>` 拒绝两者相同或互相包含。
+
+**为什么不用 `StartsWith`**：`C:\Program\WorkDaddy-evil` 会被
+`StartsWith('C:\Program\WorkDaddy')` 判成子目录。必须按路径分段比较。
+
+**一个顺序陷阱**：`[IO.Path]::GetFullPath` 会把 `..` 归一化掉。穿越检查必须在
+归一化**之前**拿原始参数做 —— 否则那条检查永远命中不了。
+
+### 6.2 替换前必须停掉托盘（1.3.1 新增）
+
+`Stop-WorkDaddyProcesses -AppDir <目录>` 做两件事：
+
+1. 按命令行精确匹配停掉本安装目录的 `scripts\daemon.js` / `scripts\watchdog.js`
+   （watchdog 会在 daemon 退出 3 秒后把它拉回来，两个都得停）；
+2. 按 exe 路径结束占用 `tray\WorkDaddyTray.exe` 的进程 —— **托盘会锁住自己的 exe**，
+   不停它，同版本重装会在替换那一步失败，回滚也会因为旧文件同样被锁而失败，
+   留下既不是旧版也不是新版的目录。
+
+停不掉就 `Fail-Install` 退出，不带着未知的锁状态往下走。
+
 ## 7. 测试证据
 
 `test/installer-lifecycle.test.js`，27 条用例，全部在临时目录里真跑 PowerShell 5.1：
@@ -184,7 +219,8 @@ node test/installer-transaction.test.js
 | 健康检查是静态的，没有 HTTP 探针 | 保持现状：安装器不启动会读真实账号的服务；需要真实探针时由启动器负责 |
 | 与上游 `install-win.ps1` / `workdaddy.iss` 的关系 | 上游安装器是「装到 WorkBuddy 目录」的补丁模式，与本安装器互不替代 |
 | `-StrictFileGate` 与代际闸门的一致性 | 本安装器不使用 `deploy.ps1`；该参数只属于 Legacy 工具（`deploy.ps1` 已标注 LEGACY） |
-| Inno `[Run]` 不传递子进程退出码 | CI 用「装完查落盘」兜底；真实用户侧没有这层兜底 |
+| Setup 引导器的退出码 | 安装侧已解决：解包与安装搬进 `[Code]` 的 `CurStepChanged`，用 `Exec` 拿 `ResultCode`，并用 Inno 6 的 `GetCustomSetupExitCode` 让 Setup 以非零码退出。**卸载侧仍无等价物** —— `[UninstallRun]` 拿不到 `uninstall-workdaddy.ps1` 的退出码，见 §8 风险 7 |
+| 打包器会把上次产物打进新包 | **1.3.1 已修**：`Get-InstallFileList` 的排除列表加了 `dist`（`release\dist` 是打包器自己的输出）。之前的症状是包里带一份过期的 `SHA256SUMS.txt` |
 
 ## 9. 与上游安装器的关系
 

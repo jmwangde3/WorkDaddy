@@ -88,9 +88,11 @@ powershell -ExecutionPolicy Bypass -File installer\uninstall-workdaddy.ps1
 
 ## 已知限制
 
-- 仓库里有 49 条**历史测试失败**（`test/known-failures.json` 逐条登记了文件、用例名与错误指纹），不是本次迁移引入的；CI 只对「新增失败」报警。
+- 仓库里有 47 条**历史测试失败**（`test/known-failures.json` 逐条登记了文件、用例名与错误指纹），不是迁移引入的；CI 只对「新增失败」报警。其中约 7 条是 macOS / Linux 专属用例在 Windows 上必然跑不过，其余是上游注入面板与会话列表的 UI 行为断言在本 fork 的实现下不成立。
 - `WorkDaddy-<版本>-setup.exe` 已在 **CI 的一次性 Windows VM** 上完成编译与真机安装/卸载验证，但**开发机从未运行过**，且没有代码签名；首次发布前仍建议在一台干净机器上手动走一遍。
 - **没有在线下载与签名校验**：不自动检查新版本，也不校验安装包来源；请只使用自己构建或自己核对过 `SHA256SUMS.txt` 的包。
+- **正式发布走 `.github/workflows/release.yml`**：tag 形如 `1.3.0`（不带 `v` 前缀），发布前会校验 tag 与 `scripts/daemon.js` 的 `DAEMON_VERSION` 一致，并对 `SHA256SUMS.txt` 里每条哈希当场重算。旧的 `build-win.yml` 已降级为手动 legacy 流程，只产出旧补丁版资产、不再挂 Release。
+- 状态页的「恢复 CDP」与 `scripts\fix-cdp.cmd` 现在都要带本地 API token（`%APPDATA%\WorkDaddy\.api-token`，由 daemon 首次启动时生成）。这是有副作用的操作，不再对任意本机网页开放。
 - 仓库里仍提交着 `tray/WorkDaddyTray.exe`（可用 `tray\build.cmd` 或 `installer\build-tray.ps1` 复现，CI 每次现编比对）。等 CI 构建稳定后再评估是否移出 Git。
 - `deploy.ps1` 已标为 **LEGACY**：只用于旧补丁版用户迁出配置、或上游大版本升级后临时救急。新安装 / 更新 / 卸载都走 `installer\`，不会再改 WorkBuddy 安装目录。
 - 独立安装器目前只有 Windows 版；macOS / Linux 仍按上游方式使用。

@@ -210,7 +210,7 @@ CommandNotFoundException: The term 'Get-FileHash' is not recognized …
 - **没有增量更新**：每次全量替换，包体约 4.7 MB。
 - **没有自动升级检查**：不轮询版本，用户需手动下载。
 - **卸载侧没有做同样的退出码改造**：`[UninstallRun]` 依旧是「跑了就算」，
-  卸载脚本失败时卸载器仍可能报成功（见 §7 风险 7）。
+  卸载脚本失败时卸载器仍可能报成功（见 §8 风险 7）。
 
 ### 3.4 顺带修掉的编码问题
 
@@ -346,7 +346,120 @@ CommandNotFoundException: The term 'Get-FileHash' is not recognized …
 
 ---
 
-## 7. 剩余风险
+## 7. 1.3.1 加固：六个问题与它们的证据
+
+这一节只记「修之前到底会怎么坏」和「修完怎么证明它不坏了」。过程见提交信息。
+
+### 7.1 进程枚举：一条坏记录让整条查询作废
+
+**修之前**：`windows-process-boundary.ps1` 的 `ConvertTo-WorkDaddyProcessRecord` 要求
+ProcessId / Name / ExecutablePath / CommandLine 四项齐全，缺一项就 `throw`。
+而查询是 `... | ForEach-Object { ConvertTo-...IfPresent } | ConvertTo-Json`，
+**任何一条抛错都让整个 PowerShell 以退出码 1 结束**。
+
+现场证据（`launcher.log`，2026-11-15 00:56 与 00:57 两次）：
+
+```
+launcher 异常: Error: CIM process query exited with status 1: CIM 进程身份字段不完整
+  at parseCimProcessResult (windows-process-boundary.js:111)
+  at getWorkBuddyProcesses (win-launcher.js:444)
+  at findWorkBuddy (win-launcher.js:622)
+```
+
+后果链：WorkBuddy 升级后丢了 `--remote-debugging-port` → daemon 标记
+`needsDebugRelaunch` → 用户双击 WorkDaddy 图标 → 启动器要「先关旧的再带参数重启」
+→ 它必须先查进程 → 查不出来 → 崩在这里 → 用户看到「双击没反应」。
+**修复入口本身坏了**，比原来的故障更严重。
+
+**修之后**：分七类，只有 `PROCESS_DISAPPEARED` 静默跳过；其余写
+`WBD-PROCESS-SKIPPED <pid> <KIND> <原因>` 到 stderr，由调用方判定。
+新增 `enumerateCimProcesses()`；`verifiedWindowsWorkBuddyProcesses()` 读到
+`complete !== true` 直接抛错，不做任何动作。
+
+**证据**：`test/windows-cim-partial-record.test.js` 11 条；普通权限（explorer 拉起，
+Medium 完整性）实测 11 个真实进程全部正常读取，`workBuddyRunning()` 返回 true。
+
+**顺带修的归属兜底**（`cdp-targets.js:152`）：原来只要 `WBSWITCH_PROFILE` 有值、
+标题像 WorkBuddy 就认领页面。这是把环境变量当归属证据。实测证据：开发机
+`WBSWITCH_PROFILE=workbuddy-cn`，同一条用例本地红、CI（变量为空）绿；
+改为要求变量值等于 profile id 后，两边都绿。
+
+### 7.2 安装器：不停托盘 → 替换失败 → 回滚也失败
+
+**修之前**：同版本重装时 `tray\WorkDaddyTray.exe` 被托盘进程锁住，
+`Copy-InstalledFiles` 抛错；回滚要把旧文件写回去，同样被锁 → **程序目录留在
+半新半旧的状态，且回滚报告为失败**。`Get-ServiceProcesses` 只匹配
+`daemon.js` / `watchdog.js`，完全不看托盘；而且它遇到读不到 CommandLine 的进程
+直接 `continue`，等于把「读不到」当成「不存在」。
+
+**修之后**：`Stop-WorkDaddyProcesses` 按命令行停 daemon / watchdog，
+另按 exe 路径结束占用托盘的进程；停不掉就拒绝继续。
+
+### 7.3 卸载器：边界判断不能用 StartsWith
+
+`C:\Program\WorkDaddy-evil` 会被 `StartsWith('C:\Program\WorkDaddy')` 判成子目录。
+改成 `Test-SafeRootDir` + `Test-DirOverlap`：盘根 / Windows 目录 / `%APPDATA%` 与
+`%LOCALAPPDATA%` 父目录 / 用户主目录 / `..` 穿越 / 目录重解析点一律拒绝；
+AppDir 与 DataDir 相同或互相包含一律拒绝。
+
+**一个顺序陷阱**：`[IO.Path]::GetFullPath` 会把 `..` 吃掉。第一版把穿越检查写在
+归一化之后，测试里那条 `..` 用例根本触发不了 —— 检查形同虚设。现在先拿原始参数查穿越。
+
+### 7.4 打包器把上一次的产物打进这一次的包
+
+`Get-InstallFileList` 的 `IncludeDirs` 含 `release`，`ExcludeNames` 没有 `dist`。
+后果：`release\dist\**` 整个进包，包里还带一份过期的 `SHA256SUMS.txt`（哈希对不上自己）。
+这条是 `package-hygiene` 报出来的：`便携包 里这些文本文件不是 LF：release/dist/SHA256SUMS.txt`。
+
+同时把 `SHA256SUMS.txt` 改成 LF —— `sha256sum -c` 在 Linux/macOS 上读 CRLF 会把
+`\r` 当文件名的一部分，全部校验失败。
+
+### 7.5 去重：只比 deleted_at 挡不住身份变化
+
+计划与执行之间，切换账号（`user_id`）、改工作目录（`cwd`）、记录被覆盖（`title`/`transport`）
+都不会碰 `deleted_at` —— CAS 照样通过，但删的已经不是同一条会话。现在存身份快照并逐字段比对。
+
+sidecar 同理：计划时没有、执行前冒出来是真实时间窗（会话刚被打开、附件刚生成）。
+`inspectSidecars` 现在产出内容摘要参与比对。
+
+journal 从「一条记录」升级成七态状态机，且在**写库之前**落盘 —— 否则「改了库但没留记录」
+无从发现。`resumeDedupe()` 用数据库现状判定（不信 journal 自报状态），混合状态一律停下。
+
+**真实规模验证**（备份副本上，真实 244 KB JSONL）：
+
+```
+plan    scanned=45  groups=1  drops=1  keeps=1  reason=exact-duplicates
+apply   ok=true  dropped=1  备份 + journal 都生成
+verify  integrity ok→ok   行数 201→201   非目标行变化 0
+        drop.deleted_at=1794677805006   keep.deleted_at=null   JSONL 哈希未变
+resume  journalState=COMPLETED   两次调用均 already-terminal（幂等）
+rollback restored=1   drop.deleted_at=null   integrity ok
+final   源备份库 SHA-256 未变（sourceDbUnchanged=true）
+```
+
+真实库本身 **0 组重复候选**（200 条会话 / 50 条存活 / 按 title+cwd 分组无重复），
+按任务书要求没有为了测试去删真实会话。
+
+### 7.6 Sentry 与本地 API
+
+脱敏原来只在 `makeEvent` 里逐字段调用，最终 `sendEvent`/`queueEvent` 没有再检查 ——
+加一个新字段忘了脱敏就会原样发到外部服务。现在两个出口都对完整事件过一遍 `sanitize`。
+
+规则补了六类「换个位置就不认」的：裸 `Bearer`/`Basic`、`x-api-key`、裸 `Cookie`/`Set-Cookie`、
+命令行凭证、URL 查询参数（原来只覆盖三种）、JWT 与 `sk-`/`key-` 前缀。
+
+**测试方式**：patch `https.request` 捕获最终 envelope，构造七个假凭证
+（`FAKE_BEARER_SECRET_123` / `FAKE_API_KEY_456` / `FAKE_REFRESH_TOKEN_789` 等），
+断言一个都不出现，同时断言 `stage` 与非敏感 message 仍在。
+
+`/api/client/relaunch` 从 `PUBLIC_API_PATHS` 移除。它会重启客户端，免认证时任何本机网页
+（`Origin: null` 也在放行名单里）都能触发。现在要 token；状态页嵌进 HTML，
+`fix-cdp.cmd` 从 `.api-token` 读。Origin 校验与 Token 校验分开：
+`null` Origin 通过前者，但不再等于通过后者。
+
+---
+
+## 8. 剩余风险
 
 | # | 风险 | 影响 | 现状 |
 |---|---|---|---|
@@ -359,3 +472,9 @@ CommandNotFoundException: The term 'Get-FileHash' is not recognized …
 | 7 | 卸载侧仍拿不到 `uninstall-workdaddy.ps1` 的退出码 | 中 | `[UninstallRun]` 无 `GetCustomSetupExitCode` 等价物；失败时卸载器可能报成功 |
 | 8 | 安装器曾依赖 PowerShell 模块自动加载（`Get-FileHash`） | 已修 | 改用 .NET 计算；同类依赖（`ConvertTo-Json` 等）尚未逐个排查 |
 | 9 | 47 条历史失败仍在基线上 | 低 | 逐条有指纹、无新增；未在本次范围内清零 |
+| 10 | 进程枚举的「读不到」与「刚退出」仍可能被归错类 | 低 | 已用实际探测（`GetProcess.Path`）区分权限问题与瞬时缺失；极端时序下仍可能误判为瞬时，此时会失败关闭而不是误操作 |
+| 11 | 身份快照只能在 `sessions` 表有对应列时生效 | 低 | 老库缺 `user_id`/`transport` 时只比实际存在的列；无列可比的字段等于没有保护 |
+| 12 | 去重的 `RECOVERY_REQUIRED` 现场仍需人工判断 | 中 | 有意不做自动恢复 —— 自动覆盖会抹掉测试期间其它进程的新写入 |
+| 13 | 真实去重在备份副本上验证，未在真实库上执行 | 中 | 真实库 0 组重复候选（200 条 / 50 存活），按任务书不为人造测试删真实会话 |
+| 14 | `/api/client/relaunch` 加 token 后，第三方脚本若直接调用会 401 | 低 | 仓库内两条调用路径（状态页、`fix-cdp.cmd`）已同步；外部脚本需自行读 `.api-token` |
+| 15 | `release.yml` 尚未真正触发过（只推分支、未打 tag） | 中 | 语法与逻辑经本地核对，但「首次真跑」仍是未验证状态；打 tag 前建议先 `workflow_dispatch` 空跑一次 |
