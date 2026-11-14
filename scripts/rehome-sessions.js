@@ -253,11 +253,24 @@ function createRehomeRunner(options = {}) {
     const file = String(journalPath || '');
     if (!file || !fs.existsSync(file)) throw new Error(`操作日志不存在: ${file || '(未指定)'}`);
     const journal = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!journal || journal.version !== 1 || !Array.isArray(journal.rows)) {
+    // v1 只有 rows；v2 增加了 state 与 identity。两者都能回滚 —— 旧日志不能因为
+    // 升级了格式就变成不可读，那等于把已经写进去的记录丢在半路。
+    const supported = journal && (journal.version === 1 || journal.version === 2) && Array.isArray(journal.rows);
+    if (!supported) {
       throw new Error('操作日志格式不支持');
     }
+    // 已经是终态的回滚没有必要重做，直接说清楚而不是再跑一遍。
+    if (journal.state === 'ROLLED_BACK') {
+      return { ok: true, total: journal.rows.length, restored: 0, skipped: [], dryRun: !!opts.dryRun, alreadyTerminal: true };
+    }
     const db = createSessionDb({ dbPath });
-    return dedupe.rollbackDedupe(db, journal, { dryRun: !!opts.dryRun });
+    const result = await dedupe.rollbackDedupe(db, journal, { dryRun: !!opts.dryRun });
+    if (!opts.dryRun && result.ok && !result.skipped.length) {
+      journal.state = 'ROLLED_BACK';
+      journal.stateUpdatedAt = Date.now();
+      try { dedupe.writeJsonAtomic(file, journal); } catch (_) {}
+    }
+    return result;
   }
 
   /**

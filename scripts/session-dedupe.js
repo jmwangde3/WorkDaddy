@@ -36,6 +36,27 @@ const MODE_EXACT = 'exact';
 const MODE_CONTAINMENT = 'containment';
 const NOT_DELETED = '(deleted_at IS NULL OR deleted_at = -1)';
 
+/**
+ * journal 状态机（任务书 7.5）。
+ *
+ * 一次去重是「备份 → 写库」两个动作，中间任何一步都可能断电、被杀、或者被用户关掉窗口。
+ * 只写一条「做完了」的日志，等于什么都没记：崩溃后既不知道该不该回滚，也不知道回滚到哪。
+ * 所以每个阶段落一个状态，恢复时按状态决定动作：
+ *
+ *   PREPARED          备份已就绪，还没动数据库 —— 安全的回滚点，重试幂等
+ *   APPLYING          已经开始写库，结果未知 —— 只能靠逐行比对判断，不能盲重试
+ *   DB_COMMITTED      事务已提交 —— 允许继续校验并推进到 COMPLETED，不允许再重试写库
+ *   COMPLETED         终态，重复恢复直接返回
+ *   ROLLBACK_REQUIRED 检测到不一致，需要补偿 —— 补偿是幂等的（只在 deleted_at 仍等于本次值时改回）
+ *   ROLLED_BACK       终态
+ *   RECOVERY_REQUIRED 现场无法自动判定 —— 停下来要人看，绝不自动覆盖数据库
+ */
+const JOURNAL_STATES = Object.freeze([
+  'PREPARED', 'APPLYING', 'DB_COMMITTED', 'COMPLETED',
+  'ROLLBACK_REQUIRED', 'ROLLED_BACK', 'RECOVERY_REQUIRED',
+]);
+const TERMINAL_STATES = new Set(['COMPLETED', 'ROLLED_BACK']);
+
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
 }
@@ -113,13 +134,65 @@ function inspectSidecars(file) {
   const base = path.basename(file, '.jsonl');
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) {
-    return { present: false, names: [], error: 'sidecar-scan-failed' };
+    return { present: false, names: [], digest: null, error: 'sidecar-scan-failed' };
   }
-  const names = entries
+  const matched = entries
     .filter((e) => e.name !== path.basename(file))
-    .filter((e) => e.name === base || e.name.startsWith(`${base}.`) || e.name.startsWith(`${base}-`))
-    .map((e) => e.name);
-  return { present: names.length > 0, names: names.slice(0, 8) };
+    .filter((e) => e.name === base || e.name.startsWith(`${base}.`) || e.name.startsWith(`${base}-`));
+  const names = matched.map((e) => e.name);
+
+  // 计划时没有 sidecar、执行前冒出来了，是真实存在的时间窗（会话刚被打开、附件刚生成）。
+  // 只记名字不够：判定的依据是「有没有变」，所以要把内容也压成一个可比的摘要。
+  // 目录递归统计文件数与总量；小目录再逐文件哈希，避免「同名目录内容换了却看着没变」。
+  const detail = [];
+  for (const entry of matched.sort((a, b) => a.name.localeCompare(b.name))) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const agg = { name: entry.name, kind: 'dir', fileCount: 0, totalSize: 0, sha256: null };
+      const hashes = [];
+      const walk = (d, depth) => {
+        if (depth > 4) return;
+        let kids;
+        try { kids = fs.readdirSync(d, { withFileTypes: true }); } catch (_) { return; }
+        for (const kid of kids) {
+          const p = path.join(d, kid.name);
+          if (kid.isDirectory()) { walk(p, depth + 1); continue; }
+          try {
+            const st = fs.statSync(p);
+            agg.fileCount += 1;
+            agg.totalSize += st.size;
+            if (agg.fileCount <= 200) {
+              hashes.push(crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'));
+            }
+          } catch (_) { /* 读不到就少算一个，摘要仍会因 count 变化而变 */ }
+        }
+      };
+      walk(full, 0);
+      if (hashes.length && agg.fileCount === hashes.length) {
+        agg.sha256 = crypto.createHash('sha256').update(hashes.sort().join('')).digest('hex');
+      }
+      detail.push(agg);
+      continue;
+    }
+    try {
+      const buf = fs.readFileSync(full);
+      detail.push({
+        name: entry.name,
+        kind: 'file',
+        fileCount: 1,
+        totalSize: buf.length,
+        sha256: crypto.createHash('sha256').update(buf).digest('hex'),
+      });
+    } catch (_) {
+      detail.push({ name: entry.name, kind: 'file', fileCount: 1, totalSize: null, sha256: null });
+    }
+  }
+  const digest = detail.length
+    ? crypto.createHash('sha256')
+      .update(detail.map((d) => `${d.name}:${d.kind}:${d.fileCount}:${d.totalSize}:${d.sha256 || '?'}`).join('|'))
+      .digest('hex')
+    : null;
+  return { present: names.length > 0, names: names.slice(0, 8), digest, entries: detail };
 }
 
 function statSafe(file) {
@@ -348,8 +421,18 @@ async function planDedupe(db, dataRoot, options = {}) {
   const allowContainment = mode === MODE_CONTAINMENT;
   const idx = buildJsonlIndex(path.join(String(dataRoot || ''), 'projects'));
   const cols = await tableColumns(db);
-  const wanted = ['id', 'cwd', 'title', 'created_at', 'updated_at', 'status', 'deleted_at', 'is_background_automation'];
-  const select = wanted.filter((c) => cols.has(c));
+  // 身份列：写库前要逐条重读比对，不能只靠 deleted_at 的 CAS。
+  // 计划与执行之间可能有人切了账号、改了工作目录、或者这条会话被别处覆盖过 ——
+  // 那时 deleted_at 可能仍是 NULL，CAS 会照样通过，但删的已经不是同一个东西了。
+  const identityCandidates = ['id', 'user_id', 'cwd', 'title', 'transport', 'deleted_at'];
+  const identityCols = identityCandidates.filter((c) => cols.has(c));
+  const wanted = ['id', 'cwd', 'title', 'created_at', 'updated_at', 'status', 'deleted_at', 'is_background_automation', 'user_id', 'transport'];
+  const select = [...new Set(wanted.filter((c) => cols.has(c)))];
+  const pickIdentity = (row) => {
+    const out = {};
+    for (const c of identityCols) out[c] = row[c] === undefined ? null : row[c];
+    return out;
+  };
   const scopeSql = scope === 'background'
     ? `COALESCE(is_background_automation, 0) = 1`
     : `COALESCE(is_background_automation, 0) = 0`;
@@ -402,9 +485,15 @@ async function planDedupe(db, dataRoot, options = {}) {
     if (g.decision !== 'drop') { plan.groupsSkipped += 1; continue; }
     for (const [id, fp] of g.fingerprints) plan.fingerprints.set(id, fp);
     plan.keeps.push(...g.keeps);
-    plan.drops.push(...g.drops);
+    // 每条待删记录带上身份快照：执行前逐字段比对，不一致就中止整组。
+    const rowById = new Map(list.map(({ row }) => [String(row.id), row]));
+    for (const drop of g.drops) {
+      const row = rowById.get(drop.id);
+      plan.drops.push({ ...drop, identity: row ? pickIdentity(row) : null });
+    }
   }
 
+  plan.identityCols = identityCols;
   return plan;
 }
 
@@ -594,6 +683,16 @@ function verifyPlanFiles(plan) {
     const now = inspectSessionFile(fp.file);
     if (!now.exists || !now.rawSha) return { ok: false, id, reason: now.error || 'unreadable' };
     if (now.size !== fp.size || now.rawSha !== fp.rawSha) return { ok: false, id, reason: 'file-changed' };
+    // 附件/图片现场变化：判定的前提是「这两个会话只有一份内容」。
+    // 计划时没有 sidecar、执行前出现了，说明期间有东西写入，语义变了 —— 中止。
+    const beforeDigest = fp.sidecars ? fp.sidecars.digest || null : null;
+    const afterDigest = now.sidecars ? now.sidecars.digest || null : null;
+    if (beforeDigest !== afterDigest) {
+      return {
+        ok: false, id,
+        reason: `sidecar-changed(${fp.sidecars && fp.sidecars.present ? 'had' : 'none'}→${now.sidecars && now.sidecars.present ? 'has' : 'none'})`,
+      };
+    }
   }
   return { ok: true };
 }
@@ -637,14 +736,39 @@ async function applyDedupe(db, plan, options = {}) {
     }
   }
 
-  // 写前再读一次数据库，确认待删行仍是「未删除」状态。
+  // 写前再读一次数据库，逐字段核对身份快照。
+  // 只比 deleted_at 是不够的：切换账号、改工作目录都不会碰 deleted_at，
+  // 但那时这条会话已经不是计划里那一条了。
   const dropIds = plan.drops.map((d) => d.id);
   const placeholders = dropIds.map(() => '?').join(',');
-  const current = await db.all(`SELECT id, deleted_at FROM sessions WHERE id IN (${placeholders})`, dropIds);
+  const identityCols = Array.isArray(plan.identityCols) && plan.identityCols.length
+    ? plan.identityCols : ['id', 'deleted_at'];
+  const current = await db.all(
+    `SELECT ${identityCols.join(', ')} FROM sessions WHERE id IN (${placeholders})`, dropIds);
   const currentMap = new Map(current.map((r) => [String(r.id), r.deleted_at]));
+  const currentById = new Map(current.map((r) => [String(r.id), r]));
+  const sameValue = (a, b) => {
+    const na = a === undefined ? null : a;
+    const nb = b === undefined ? null : b;
+    if (na === null && nb === null) return true;
+    return String(na) === String(nb);
+  };
   for (const d of plan.drops) {
-    if (!currentMap.has(d.id)) {
+    const row = currentById.get(d.id);
+    if (!row) {
       return { ...result, ok: false, aborted: 'row-missing', abortedId: d.id };
+    }
+    if (d.identity) {
+      const changed = identityCols.filter((c) => !sameValue(row[c], d.identity[c]));
+      if (changed.length) {
+        log(`[dedupe] 中止：${d.id} 的身份字段在计划后被改动 (${changed.join(',')})`);
+        return {
+          ...result, ok: false, aborted: 'identity-changed', abortedId: d.id,
+          abortedReason: `fields-changed:${changed.join(',')}`,
+          identityBefore: d.identity,
+          identityNow: Object.fromEntries(identityCols.map((c) => [c, row[c] === undefined ? null : row[c]])),
+        };
+      }
     }
   }
 
@@ -667,7 +791,37 @@ async function applyDedupe(db, plan, options = {}) {
     reason: d.reason,
     keepId: d.keepId,
     evidence: d.evidence,
+    identity: d.identity || null,
   }));
+
+  // journal 在写库之前就要存在：否则「已经改了库但没留下记录」这件事无从发现。
+  const journalPath = backupRoot ? path.join(backupRoot, `${opId}.json`) : '';
+  const journal = {
+    version: 2,
+    opId,
+    state: 'PREPARED',
+    stateUpdatedAt: now,
+    createdAt: now,
+    scope: plan.scope,
+    mode: plan.mode,
+    backup: result.backup,
+    identityCols,
+    groups: plan.details.filter((d) => d.decision === 'drop'),
+    rows,
+  };
+  const persist = (state, extra = {}) => {
+    journal.state = state;
+    journal.stateUpdatedAt = Date.now();
+    Object.assign(journal, extra);
+    if (journalPath) {
+      try { writeJsonAtomic(journalPath, journal); } catch (error) {
+        // 落盘失败不能吞：状态机失去载体后，恢复逻辑就没有依据了。
+        log(`[dedupe] journal 写入失败（${state}）：${error.message}`);
+        throw error;
+      }
+    }
+  };
+  if (journalPath) { persist('PREPARED'); result.journal = journalPath; }
 
   const chunks = [];
   for (let i = 0; i < rows.length; i += 100) chunks.push(rows.slice(i, i + 100));
@@ -675,36 +829,113 @@ async function applyDedupe(db, plan, options = {}) {
     sql: `UPDATE sessions SET deleted_at = ? WHERE (${chunk.map(() => '(id = ? AND deleted_at IS ?)').join(' OR ')})`,
     params: [now, ...chunk.flatMap((r) => [r.id, r.before])],
   }));
-  const results = await db.transaction(statements);
+  if (journalPath) persist('APPLYING');
+  let results;
+  try {
+    results = await db.transaction(statements);
+  } catch (error) {
+    // 事务本身抛错：SQLite 保证这一批没提交，但要用逐行比对确认，
+    // 不能假设「抛错就等于没写」（进程被杀的场景根本走不到这里）。
+    if (journalPath) persist('ROLLBACK_REQUIRED', { error: String(error && error.message || error) });
+    const verdict = await inspectJournalRows(db, journal);
+    if (verdict.state === 'ROLLED_BACK') {
+      if (journalPath) persist('ROLLED_BACK');
+      return { ...result, ok: false, aborted: 'transaction-failed', journalData: journal };
+    }
+    if (journalPath) persist('RECOVERY_REQUIRED', { reason: verdict.reason });
+    return { ...result, ok: false, aborted: 'recovery-required', journalData: journal, abortedReason: verdict.reason };
+  }
+  if (journalPath) persist('DB_COMMITTED');
   const changed = results.reduce((sum, r) => sum + Number((r && r.changes) || 0), 0);
   const expected = rows.length;
   if (changed !== expected) {
     // 有行在计划后被改过：把本次已改的行恢复，保持「要么全做，要么全不做」。
+    if (journalPath) persist('ROLLBACK_REQUIRED', { changed, expected });
     const restore = rows.map((r) => ({
       sql: 'UPDATE sessions SET deleted_at = ? WHERE id = ? AND deleted_at = ?',
       params: [r.before, r.id, r.after],
     }));
-    try { await db.transaction(restore); } catch (error) { log(`[dedupe] 补偿回滚失败: ${error.message}`); }
-    return { ...result, ok: false, aborted: 'concurrent-modification', changed, expected };
+    let restoreOk = true;
+    try { await db.transaction(restore); } catch (error) {
+      restoreOk = false;
+      log(`[dedupe] 补偿回滚失败: ${error.message}`);
+    }
+    // 补偿是否真的到位，用数据库说话，不信「没抛错就是成功」。
+    const verdict = await inspectJournalRows(db, journal);
+    if (verdict.state === 'ROLLED_BACK') {
+      if (journalPath) persist('ROLLED_BACK');
+    } else if (journalPath) {
+      persist('RECOVERY_REQUIRED', { reason: verdict.reason, restoreOk });
+    }
+    return {
+      ...result, ok: false, aborted: 'concurrent-modification', changed, expected,
+      journalData: journal, rolledBack: verdict.state === 'ROLLED_BACK',
+    };
   }
 
-  const journal = {
-    version: 1,
-    opId,
-    createdAt: now,
-    scope: plan.scope,
-    mode: plan.mode,
-    backup: result.backup,
-    groups: plan.details.filter((d) => d.decision === 'drop'),
-    rows,
-  };
-  if (backupRoot) {
-    const journalPath = path.join(backupRoot, `${opId}.json`);
-    writeJsonAtomic(journalPath, journal);
-    result.journal = journalPath;
-  }
+  if (journalPath) persist('COMPLETED');
   log(`[dedupe] 完成 ${opId} groups=${result.groups} dropped=${rows.length}`);
   return { ...result, applied: true, journalData: journal };
+}
+
+/**
+ * 按数据库现状判定一次中断的去重走到了哪一步。
+ *
+ * 判据是「每一行的 deleted_at 是不是等于本次写入值」：
+ *   全等 → 已经写进去了；全不等 → 没写；混合 → 现场不一致，不能自动决定。
+ * 不依赖 journal 自己说的状态，因为崩溃可能发生在「写完库、还没来得及改状态」的窗口里。
+ */
+async function inspectJournalRows(db, journal) {
+  const rows = Array.isArray(journal && journal.rows) ? journal.rows : [];
+  if (!rows.length) return { state: 'ROLLED_BACK', counts: { applied: 0, pending: 0, missing: 0, moved: 0 } };
+  let applied = 0;
+  let pending = 0;
+  let missing = 0;
+  let moved = 0;
+  for (const row of rows) {
+    const current = await db.all('SELECT deleted_at FROM sessions WHERE id = ?', [row.id]);
+    if (!current.length) { missing += 1; continue; }
+    const value = current[0].deleted_at;
+    if (value === row.after) applied += 1;
+    else if (value === row.before) pending += 1;
+    else moved += 1;
+  }
+  const counts = { applied, pending, missing, moved };
+  if (applied === rows.length) return { state: 'DB_COMMITTED', counts };
+  if (pending === rows.length) return { state: 'ROLLED_BACK', counts };
+  const reason = `applied=${applied} pending=${pending} missing=${missing} moved=${moved}`;
+  return { state: 'RECOVERY_REQUIRED', reason, counts };
+}
+
+/**
+ * 崩溃恢复：读一份 journal，判断该做什么。
+ *
+ * 安全前提：**重复调用必须安全**。终态直接返回；APPLYING 走逐行比对，
+ * 拿不准（混合状态、行不见了、被别人改过）就停在 RECOVERY_REQUIRED，绝不自动覆盖。
+ * 这里不做整库还原 —— 那会把测试期间其它进程写进去的新数据一起抹掉。
+ */
+async function resumeDedupe(db, journal, options = {}) {
+  const dryRun = options.dryRun !== false; // 默认只判定不动作，要动必须显式 dryRun:false
+  const report = { ok: true, state: String(journal && journal.state || 'UNKNOWN'), action: 'none', dryRun };
+  if (TERMINAL_STATES.has(report.state)) return { ...report, action: 'already-terminal' };
+
+  const verdict = await inspectJournalRows(db, journal);
+  report.verdict = verdict;
+
+  if (verdict.state === 'ROLLED_BACK') {
+    if (!dryRun) { journal.state = 'ROLLED_BACK'; journal.stateUpdatedAt = Date.now(); }
+    return { ...report, action: 'mark-rolled-back', ok: true };
+  }
+  if (verdict.state === 'DB_COMMITTED') {
+    // 库已经改了，只是日志没标完成 —— 这是可安全推进的中间态。
+    if (!dryRun) { journal.state = 'COMPLETED'; journal.stateUpdatedAt = Date.now(); }
+    return { ...report, action: 'mark-completed', ok: true };
+  }
+  return {
+    ...report, ok: false, action: 'stop',
+    reason: verdict.reason || '数据库现状与日志不一致，无法自动判定',
+    hint: '检查 journal 里的 rows 与数据库 deleted_at；确认后再决定恢复备份还是按行补偿',
+  };
 }
 
 /**
@@ -750,6 +981,9 @@ module.exports = {
   applyDedupe,
   verifyPlanFiles,
   rollbackDedupe,
+  inspectJournalRows,
+  resumeDedupe,
+  JOURNAL_STATES,
   writeJsonAtomic,
   stamp,
 };
