@@ -31,6 +31,9 @@ scripts/picker-internal.js
 # 构建缓存(安装器临时产物)
 release/.cache/
 
+# 测试用临时安装目录（test/installer-lifecycle.test.js 在这里造夹具）
+/tmp/
+
 # Python 缓存
 __pycache__/
 *.pyc
