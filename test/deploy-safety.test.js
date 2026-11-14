@@ -220,7 +220,13 @@ function main() {
     assert.ok(local, 'upstream.json 必须记录本地补丁哈希');
     for (const [name, rec] of Object.entries(local)) {
       const actual = sha256(path.join(srcScripts, name));
-      assert.equal(rec.sha256, actual, `${name} 的 SHA-256 与记录不一致：改了补丁文件就要重算 upstream.json`);
+      assert.equal(
+        rec.sha256,
+        actual,
+        `${name} 的 SHA-256 与记录不一致：改了补丁文件就要重算 upstream.json。`
+        + '另外注意行尾——.gitattributes 强制 eol=lf，若工作副本是 CRLF，'
+        + '哈希会与 CI 检出（LF）不同，重跑 git checkout 后再算。',
+      );
       assert.equal(rec.size, fs.statSync(path.join(srcScripts, name)).size, `${name} 的字节数与记录不一致`);
     }
   });

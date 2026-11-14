@@ -51,13 +51,13 @@
 
     "localFileHashes": {
       "daemon.js": { "sha256": "13454f02bf3e3f5beb330645f9b458bbadc0c66f2c58e1a00edd9b75085b05a3", "size": 737269 },
-      "inject.js": { "sha256": "4425e75f6286f14f236be8f05232a8c1d7ea2a3d1ab0278ed3ad156d7b7a4b29", "size": 1378619 },
-      "lib.js": { "sha256": "0073a69931e53064a06d75ca3258a0dd493a30ccd9e5813272e6dec2ad80425d", "size": 97154 },
-      "win-launcher.js": { "sha256": "a991063c64652162cf30710a83cb8a4085c5bec412f835fbbe4d07c517bb2ec0", "size": 88039 }
+      "inject.js": { "sha256": "5f26b4ce744d193238b1db09b875aad6c248fd8999143ac2e8a535a818ef6b63", "size": 1359561 },
+      "lib.js": { "sha256": "73dbf3a1004d58a9211cfcddf85057a02b1e00bbdcd080450a3612ebe7701625", "size": 95030 },
+      "win-launcher.js": { "sha256": "10dbcbcdaae714720f83a58786bcabee46bb84da44b55a35ae375772e549f927", "size": 86115 }
     },
     "localFileHashesNote": "本仓库 scripts/ 下补丁文件在记录时刻的 SHA-256。deploy.ps1 判定用运行时实际计算的哈希；这一组只用于发现元数据过期（patch-drift 提示）。改动补丁文件后必须重算，deploy-safety 测试会校验两者一致。",
 
-    "generationFinding": "本 fork 的 daemon.js / inject.js 比上游 1.2.22 小（分别少 12021 / 7663 字节），lib.js / win-launcher.js 比上游大。说明补丁基线不是 1.2.22；把本 fork 的文件直接覆盖到 1.2.22 安装目录会丢掉上游修复。",
+    "generationFinding": "按仓库规范化行尾（LF）后的字节数比较：daemon.js / inject.js / lib.js 都比上游 1.2.22 小（少 11819 / 26721 / 1020 字节），win-launcher.js 比上游大 314 字节。四个文件三个不同，说明补丁基线不是 1.2.22；把本 fork 的文件直接覆盖到 1.2.22 安装目录会丢掉上游修复。",
     "fileGenerationGate": "hard-sha256",
     "fileGenerationGateReason": "闸门依据是目标文件与「本补丁版 / 上游原版」的 SHA-256 是否相等，属于可测量的事实；未知代际一律中止，-Force 才可越过。旧版只比字节数，同大小不同内容会被误判成已打补丁。",
 
