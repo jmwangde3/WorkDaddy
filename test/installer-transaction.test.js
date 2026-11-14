@@ -390,6 +390,39 @@ function main() {
     assert.ok(/^state:hashing /.test(stages[stages.length - 1]),
       '最后一步应停在状态提交，实际：' + stages[stages.length - 1]);
   });
+
+  test('安装：Get-Sha256 不依赖 PowerShell 模块，且与 Node 算出的一致', () => {
+    // 这条依赖真的把 CI 弄红过：Inno 起的那个子进程里 Get-FileHash 不存在
+    // （CommandNotFoundException），安装走到「算安装记录」时静默死掉，
+    // 程序文件已经落盘、记录没写、回滚也没跑 —— 正是最难查的半安装状态。
+    const { spawnSync } = require('child_process');
+    const { repo } = require('./helpers/installer-fixture');
+    const commonPs1 = path.join(repo, 'installer', 'lib', 'common.ps1');
+    const src = fs.readFileSync(commonPs1, 'utf8');
+    // 只看代码行：注释里提到这个 cmdlet 是解释为什么不用它，不算依赖
+    const code = src.split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+    assert.equal(/Get-FileHash/.test(code), false,
+      'common.ps1 不能依赖 Get-FileHash：它属于要自动加载的模块，某些会话里没有');
+
+    const root = tmpRoot('tx-hash');
+    const target = path.join(root, 'sample.bin');
+    fs.writeFileSync(target, Buffer.from('WorkDaddy hash probe\n'.repeat(97), 'utf8'));
+    const probe = path.join(root, 'probe.ps1');
+    fs.writeFileSync(probe, [
+      'param([string]$Target, [string]$Common)',
+      '. $Common',
+      'Write-Output (Get-Sha256 $Target)',
+      '',
+    ].join('\r\n'), 'utf8');
+
+    const res = spawnSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', probe, '-Target', target, '-Common', commonPs1,
+    ], { encoding: 'utf8', timeout: 120000 });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout.replace(/^\uFEFF/, '').trim().toLowerCase(), sha256(target),
+      'PS 侧的 SHA-256 与 Node 算出来的不一致');
+  });
 }
 
 try {

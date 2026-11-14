@@ -6,6 +6,19 @@
 #   3. 失败一律给非零退出码，并把原因写进 -Json 报告，便于 CI 与被调用方解析。
 $ErrorActionPreference = 'Stop'
 
+# 环境自愈（防御性，不是已确认的根因）：
+# CI 上观测到安装脚本在「算安装记录」那一步静默死掉，痕迹里写着
+#   CommandNotFoundException: The term 'Get-FileHash' is not recognized
+# 那个子进程是 Inno 起的，父进程是 pwsh 7。本机试过把 PSModulePath 指向
+# pwsh 7 的模块目录或指向空目录，Get-FileHash 都还在，所以机制没能完全复现。
+# 两手都做：Get-Sha256 不再依赖这个 cmdlet（见下），同时把 $PSHOME\Modules
+# 补回模块搜索路径第一位 —— 后者对上面那类「5.1 找不到自己的模块」是有用的。
+$psHomeModules = Join-Path $PSHOME 'Modules'
+if ($env:PSModulePath -notlike ('*' + $psHomeModules + '*')) {
+    if ($env:PSModulePath) { $env:PSModulePath = $psHomeModules + ';' + $env:PSModulePath }
+    else { $env:PSModulePath = $psHomeModules }
+}
+
 function Write-Line {
     param([object]$Message)
     [Console]::WriteLine([string]$Message)
@@ -14,7 +27,20 @@ function Write-Line {
 function Get-Sha256 {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    # 用 .NET 直接算，不走 Get-FileHash：
+    #   * 少一个模块依赖（见上面的 PSModulePath 说明）；
+    #   * FileShare 放宽到 ReadWrite，别的进程正开着这个文件也能算；
+    #   * 逐块读，大文件不会一次性进内存。
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try { return ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLowerInvariant() }
+        finally { $fs.Dispose() }
+    } catch {
+        return ''
+    } finally {
+        $sha.Dispose()
+    }
 }
 
 function Read-JsonFile {

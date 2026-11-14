@@ -58,7 +58,8 @@ Setup 的验证分两层，别混：
   不带这个开关直接 exit 2，防止有人在开发机上顺手跑。
 
 **仍然未验证**：开发机（本机）从未执行过 Setup；没有代码签名；没有在线下载与签名校验；
-Inno `[Run]` 不传递子进程退出码（CI 靠落盘检查兜底，用户侧没有这层）。
+卸载侧仍拿不到 `uninstall-workdaddy.ps1` 的退出码（安装侧已经改造：解包与安装走 `[Code]`，
+由 `GetCustomSetupExitCode` 把失败码交回去）。
 完整清单见 `08-release-decisions.md` §3.3。
 
 ## 4. 实测证据

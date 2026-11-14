@@ -20,6 +20,7 @@
 
 它已在 CI 的一次性 Windows VM 上通过「静默安装 → 安装记录逐条哈希核对 → 静默卸载 → 数据保留」验证。
 **开发机从未运行过它，也没有代码签名**，SmartScreen 会拦；拿不准就用方式一。
+安装脚本失败时 Setup 会以非零码退出（`GetCustomSetupExitCode`），不再出现「提示装好了、实际装了一半」。
 
 ### 方式一：装到本机（推荐，可更新可卸载）
 
@@ -32,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File installer\install-workdaddy.ps1
 - 装后逐文件校验 SHA-256，写 `install-state.json` 作为卸载依据
 - 检测到旧补丁版时**只复制**配置到 `%APPDATA%\WorkDaddy\legacy-import\<时间戳>\`，原目录不动
 - 常用参数：`-AppDir` `-DataDir` `-NoShortcut` `-SkipClientCheck` `-DryRun` `-Force`
-- 退出码：`0` 成功 / `1` 源目录问题 / `2` 预检或路径越界 / `3` 不可写 / `4` 复制失败 / `5` 校验失败 / `6` 数据初始化失败
+- 退出码：`0` 成功 / `1` 源目录问题 / `2` 预检或路径越界 / `3` 不可写 / `4` 复制失败 / `5` 校验失败 / `6` 数据初始化失败 / `7` 状态提交失败 / `9` 未捕获错误（`4`–`7`、`9` 都已回滚，磁盘上不会留半安装）
 
 ### 方式二：便携版（解压即用，不写注册表）
 

@@ -52,11 +52,21 @@ function Write-Stage {
         [IO.File]::AppendAllText($script:tracePath, $line, (New-Object System.Text.UTF8Encoding($false)))
     } catch { }
 }
-# 兜底：任何没被本地 try/catch 接住的终止性错误都记一笔再退出，
-# 免得又变成「什么都没留下」。
+# 兜底：任何没被本地 try/catch 接住的终止性错误都记一笔、回滚、再退出，
+# 免得又变成「什么都没留下」的半安装状态。
+$script:mutated = $false
+$script:rollingBack = $false
 trap {
-    Write-Stage ('UNHANDLED ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message)
-    Write-Line ('未捕获的错误：' + $_.Exception.Message)
+    $msg = $_.Exception.GetType().Name + ': ' + $_.Exception.Message
+    Write-Stage ('UNHANDLED ' + $msg)
+    Write-Line ('未捕获的错误：' + $msg)
+    $report.error = '未捕获的错误：' + $msg
+    $report.exitCode = 9
+    if ($script:mutated -and -not $script:rollingBack) {
+        # 已经动过磁盘：走回滚。Invoke-InstallRollback 自己会 Fail-Install 退出。
+        $script:rollingBack = $true
+        Invoke-InstallRollback -Why ('未捕获的错误：' + $msg) -Code 9
+    }
     try { Write-Report -Report $report -JsonPath $Json } catch { }
     exit 9
 }
@@ -426,6 +436,8 @@ function Invoke-InstallRollback {
 
 # ---- 4. 复制 ----
 Write-Stage 'copy'
+# 从这里开始磁盘会被改动：之后任何未捕获的错误都要回滚
+$script:mutated = $true
 if ($DryRun) {
     Write-Line ('预检模式：将安装 ' + $files.Count + ' 个文件到 ' + $AppDir)
 } else {

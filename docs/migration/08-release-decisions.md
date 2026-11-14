@@ -163,10 +163,43 @@
 
 `verify-setup.ps1` 不带 `-IAmOnAThrowawayMachine` 会直接 exit 2，防止有人在开发机上顺手跑。
 
-Setup 的 `[Run]` 拿不到子进程退出码，所以安装器额外的 `-Json`（写到
-`%APPDATA%\WorkDaddy\install-report.json`，不用 `{tmp}` —— 那是 Inno 自己的临时目录，
-Setup 退出就删）是唯一能把「脚本没跑起来」和「跑起来但失败了」区分开的线索。
-失败消息里会带出脚本的 `exitCode`、`error` 和安装目录的文件数。
+### 3.2.1 Setup 的退出码终于能反映安装结果
+
+原来解包与安装都挂在 `[Run]` 上，而 Inno 的 `[Run]` **不带回子进程退出码**：
+安装脚本失败，Setup 照样返回 0，用户看到「装好了」、磁盘上是半套文件。
+
+现在两步都搬到 `[Code]` 的 `CurStepChanged(ssPostInstall)`，用 `Exec` 拿 `ResultCode`：
+
+- 非零 → 记进全局变量，由 `GetCustomSetupExitCode`（Inno 6 的官方钩子）返回；
+- 同时 `SuppressibleMsgBox` 弹一次错误（`/VERYSILENT` + `/SUPPRESSMSGBOXES` 下不弹）。
+
+**踩过的坑**：一开始用的是 `RaiseException`，以为能中止安装。CI 实测（run 43603643905）
+异常抛了、Setup 仍返回 0 —— 在 `ssPostInstall` 抛异常不会改变退出码。所以必须用
+`GetCustomSetupExitCode`。
+
+顺序上两步必须都在 `[Code]` 里：`ssPostInstall` 早于 `[Run]`，拆开放会先跑安装再解包。
+
+配套的 `-Trace` 阶段痕迹（`%APPDATA%\WorkDaddy\install-trace.log`，成功即删）解决另一类问题：
+报告只在成功和「已处理的失败」路径上写，进程被外部杀掉或直接崩掉时什么都不留。
+
+### 3.2.2 CI 抓到的第一个真实缺陷：Get-FileHash 不存在
+
+Setup 改成传 `-Trace` 之后，CI 立刻给出了确切死因：
+
+```
+CommandNotFoundException: The term 'Get-FileHash' is not recognized …
+```
+
+即安装走到「按磁盘重算清单」时，那个 PowerShell 会话里根本没有 `Get-FileHash`。
+后果正是最难查的那种：**程序文件已落盘、安装记录没写、回滚也没跑**。
+
+修法是不再依赖它：`Get-Sha256` 改成 `[Security.Cryptography.SHA256]` + `FileStream`
+（顺带把 `FileShare` 放宽到 `ReadWrite`，别的进程正开着目标文件也能算）。
+另外在 `common.ps1` 顶部把 `$PSHOME\Modules` 补回 `PSModulePath` 第一位，作为同类问题的防御。
+
+**仍未解释清楚的部分**（如实记录）：本机把 `PSModulePath` 指向 pwsh 7 的模块目录、
+甚至指向不存在的目录，`Get-FileHash` 都还在。所以「为什么那个子进程里没有它」没能复现，
+只能说清「怎么坏的、怎么不再依赖它」。不把机制写成结论。
 
 ### 3.3 仍然未验证 / 未实现（不要当成已完成）
 
@@ -176,8 +209,8 @@ Setup 退出就删）是唯一能把「脚本没跑起来」和「跑起来但�
   不联网、不验签。发布链（下载 → 校验 SHA-256 → 验签 → 暂存）尚未实现。
 - **没有增量更新**：每次全量替换，包体约 4.7 MB。
 - **没有自动升级检查**：不轮询版本，用户需手动下载。
-- Inno 的 `[Run]` 不传递子进程退出码，所以「安装脚本失败但 Setup 报成功」在 Setup 层面
-  看不出来 —— CI 靠落盘检查兜住，真实用户侧没有这层兜底。
+- **卸载侧没有做同样的退出码改造**：`[UninstallRun]` 依旧是「跑了就算」，
+  卸载脚本失败时卸载器仍可能报成功（见 §7 风险 7）。
 
 ### 3.4 顺带修掉的编码问题
 
@@ -318,4 +351,6 @@ Setup 退出就删）是唯一能把「脚本没跑起来」和「跑起来但�
 | 4 | 托盘 EXE 仍是提交进 Git 的二进制 | 低 | 可复现构建已就位，待 CI 稳定后评估移出 |
 | 5 | 5 条 `/api/permission/*` 仍在 daemon.js 里 | 低 | 见 `src/features/README.md`，需要先做守卫控制器 |
 | 6 | 更新器健康检查是静态的（`node --check`） | 中 | 不启动守护进程是有意的（不该读真实账号） |
-| 7 | Inno `[Run]` 不传递子进程退出码 | 中 | CI 用落盘检查兜底，用户侧无兜底 |
+| 7 | 卸载侧仍拿不到 `uninstall-workdaddy.ps1` 的退出码 | 中 | `[UninstallRun]` 无 `GetCustomSetupExitCode` 等价物；失败时卸载器可能报成功 |
+| 8 | 安装器曾依赖 PowerShell 模块自动加载（`Get-FileHash`） | 已修 | 改用 .NET 计算；同类依赖（`ConvertTo-Json` 等）尚未逐个排查 |
+| 9 | 47 条历史失败仍在基线上 | 低 | 逐条有指纹、无新增；未在本次范围内清零 |

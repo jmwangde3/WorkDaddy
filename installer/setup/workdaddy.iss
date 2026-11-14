@@ -73,17 +73,44 @@ Type: filesandordirs; Name: "{tmp}\workdaddy-setup"
 // Step 1（解包）与 Step 2（安装）放在这里而不是 [Run]，只有一个原因：
 // [Run] 无法把子进程的退出码带回来。以前安装脚本失败，Setup 仍然报「成功」，
 // 用户看到的是一个装了一半、还提示装好了的程序；CI 那边也只能靠「装完有没有
-// 安装记录」倒推。用 Exec 拿 ResultCode，失败就 RaiseException，让 Setup
-// 自己以非零码退出 —— 这样「装失败」在系统层面就是一个可观测的事实。
+// 安装记录」倒推。
+//
+// 注意 ssPostInstall 里 RaiseException 并不能让 Setup 以失败退出 —— 实测
+// （CI run 43603643905）抛了异常、Setup 仍然返回 0。真正决定退出码的是
+// GetCustomSetupExitCode（Inno 6 的官方钩子）：把失败码存到全局，在那里返回。
 //
 // 顺序注意：CurStepChanged(ssPostInstall) 在 [Run] 之前执行，所以两步必须
 // 都在这里，不能一步在 [Code] 一步在 [Run]。
+
+var
+  InstallFailed: Boolean;
+  InstallFailCode: Integer;
 
 procedure SetStatusText(const Text: String);
 begin
   if Assigned(WizardForm) then
     if Assigned(WizardForm.StatusLabel) then
       WizardForm.StatusLabel.Caption := Text;
+end;
+
+procedure FailInstall(const Msg: String; Code: Integer);
+begin
+  // 存下来给 GetCustomSetupExitCode 用；码值限制在 1..255，
+  // 免得和 Windows 的退出码约定混淆。
+  InstallFailed := True;
+  InstallFailCode := Code;
+  if InstallFailCode < 1 then InstallFailCode := 1;
+  if InstallFailCode > 255 then InstallFailCode := 255;
+  // 交互安装时让人看见；/SUPPRESSMSGBOXES 下不弹窗，只靠退出码。
+  SuppressibleMsgBox(Msg, mbCriticalError, MB_OK, IDOK);
+end;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  if InstallFailed then
+    Result := InstallFailCode
+  else
+    Result := 0;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -105,9 +132,15 @@ begin
   Args := '-NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '''
         + ZipPath + ''' -DestinationPath ''' + PayloadDir + ''' -Force"';
   if not Exec('powershell.exe', Args, SetupDir, SW_HIDE, ewWaitUntilTerminated, Code) then
-    RaiseException('无法启动解包步骤（powershell.exe 调用失败）');
+  begin
+    FailInstall('无法启动解包步骤（powershell.exe 调用失败）', 1);
+    Exit;
+  end;
   if Code <> 0 then
-    RaiseException('解包失败：powershell 返回 ' + IntToStr(Code));
+  begin
+    FailInstall('解包失败：powershell 返回 ' + IntToStr(Code), Code);
+    Exit;
+  end;
 
   // ---- Step 2：走测试过的安装器 ----
   // -Json / -Trace 都落在数据目录：Setup 退出时不会删它，失败后还能查。
@@ -119,8 +152,11 @@ begin
         + ' -Json "' + DataDir + '\install-report.json"'
         + ' -Trace "' + DataDir + '\install-trace.log"';
   if not Exec('powershell.exe', Args, PayloadDir, SW_HIDE, ewWaitUntilTerminated, Code) then
-    RaiseException('无法启动安装脚本（powershell.exe 调用失败）');
+  begin
+    FailInstall('无法启动安装脚本（powershell.exe 调用失败）', 1);
+    Exit;
+  end;
   if Code <> 0 then
-    RaiseException('安装脚本返回 ' + IntToStr(Code)
-      + '。详见 ' + DataDir + '\install-report.json 与 install-trace.log');
+    FailInstall('安装脚本返回 ' + IntToStr(Code) + '。详见 ' + DataDir
+      + '\install-report.json 与 install-trace.log', Code);
 end;
