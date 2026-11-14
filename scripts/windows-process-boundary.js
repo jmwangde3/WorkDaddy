@@ -101,18 +101,33 @@ function validateProcessRecord(row, options = {}) {
   };
 }
 
-// helper 在字段读不全时会跳过该进程，并往 stderr 留一行 WBD-PROCESS-SKIPPED。
-// 调用方需要知道「跳过」而不是「没有」：一个进程都没解析出来但确实有进程被跳过时，
-// 说明当前权限/时机下读不到任何身份字段，此时假装"没有客户端在跑"会导致误启动。
+// helper 对读不全的进程写一行 WBD-PROCESS-SKIPPED <pid> <KIND> <原因>。
+// KIND 取自 PROCESS_DISAPPEARED / TRANSIENT_FIELD_MISSING / ACCESS_DENIED /
+// OWNER_UNVERIFIED / PATH_UNVERIFIED / COMMANDLINE_UNVERIFIED / UNKNOWN_ERROR。
+// 调用方需要区分「没有进程」和「有进程但没验证成」：后者绝不能拿去当危险决策的输入。
 const SKIPPED_PROCESS_MARKER = 'WBD-PROCESS-SKIPPED';
+const SKIP_KINDS = new Set([
+  'PROCESS_DISAPPEARED', 'TRANSIENT_FIELD_MISSING', 'ACCESS_DENIED',
+  'OWNER_UNVERIFIED', 'PATH_UNVERIFIED', 'COMMANDLINE_UNVERIFIED', 'UNKNOWN_ERROR',
+]);
 function parseSkippedProcesses(stderr) {
   const skipped = [];
   for (const line of String(stderr || '').split(/\r?\n/)) {
     const at = line.indexOf(SKIPPED_PROCESS_MARKER);
     if (at < 0) continue;
     const rest = line.slice(at + SKIPPED_PROCESS_MARKER.length).trim();
-    const pid = (rest.match(/^\d+/) || [''])[0];
-    skipped.push({ pid: pid ? Number(pid) : null, reason: rest.slice(pid.length).trim() });
+    const structured = rest.match(/^(\d+)\s+([A-Z_]+)\s*(.*)$/);
+    if (structured && SKIP_KINDS.has(structured[2])) {
+      skipped.push({ pid: Number(structured[1]), kind: structured[2], reason: structured[3].trim() });
+      continue;
+    }
+    // 兼容旧格式（只有 pid + 原因）：不猜类型，按未知处理，让调用方失败关闭。
+    const pidOnly = (rest.match(/^\d+/) || [''])[0];
+    skipped.push({
+      pid: pidOnly ? Number(pidOnly) : null,
+      kind: 'UNKNOWN_ERROR',
+      reason: rest.slice(pidOnly.length).trim(),
+    });
   }
   return skipped;
 }
@@ -127,29 +142,48 @@ function parseCimProcessResult(result, options = {}) {
     throw new Error(`CIM process query exited with status ${result.status}${detail ? ': ' + detail : ''}`);
   }
   const skipped = parseSkippedProcesses(result.stderr);
-  // 一条都认不出来时，把第一条失败原因带出去：没有它只能看到一堆 PID，
-  // 现场排查等于从零开始（这次就卡在「字段不完整」到底缺哪个字段上）。
+  const kindSummary = () => {
+    const counts = new Map();
+    for (const item of skipped) counts.set(item.kind, (counts.get(item.kind) || 0) + 1);
+    return [...counts.entries()].map(([kind, n]) => `${kind}×${n}`).join(',');
+  };
   const describeSkipped = () => {
     const ids = skipped.map((item) => item.pid || '?').join(',');
-    // 全部 NO-ACCESS = 对端进程的完整性级别高于本进程。重试没有意义，
-    // 直接说清楚怎么办，别再让用户对着「字段不完整」猜。
-    const allNoAccess = skipped.length > 0 && skipped.every((item) => /^NO-ACCESS\b/.test(String(item.reason || '')));
-    if (allNoAccess) {
+    // 全部 ACCESS_DENIED：对端进程完整性级别更高。重试没有意义，得改权限。
+    if (skipped.length > 0 && skipped.every((item) => item.kind === 'ACCESS_DENIED')) {
       return `检测到 ${skipped.length} 个客户端进程，但一个都读不到（PID=${ids}）。` +
         '客户端多半是以管理员权限运行的，而 WorkDaddy 以普通权限运行 —— ' +
         '这种情况下 Windows 不允许读取对方进程信息，也不允许结束它。' +
         '请先完全退出客户端（主窗口和托盘一起），再双击 WorkDaddy 桌面图标，' +
         '由 WorkDaddy 以普通权限重新启动它。';
     }
+    // 全部是「瞬时读不到」：可能刚重启，重试有意义。
+    const transientKinds = new Set(['TRANSIENT_FIELD_MISSING', 'PATH_UNVERIFIED', 'COMMANDLINE_UNVERIFIED', 'OWNER_UNVERIFIED']);
+    if (skipped.length > 0 && skipped.every((item) => transientKinds.has(item.kind))) {
+      const first = skipped.find((item) => item.reason) || {};
+      const detail = first.reason ? `；首个原因：${String(first.reason).slice(0, 160)}` : '';
+      return `检测到 ${skipped.length} 个进程，但身份字段暂时读不全（PID=${ids}）${detail}；稍后重试即可。`;
+    }
+    // 其余组合（含 UNKNOWN_ERROR）：不猜，按失败处理，绝不当作「没有进程」。
     const first = skipped.find((item) => item.reason) || {};
-    const detail = first.reason ? `；首个原因：${String(first.reason).slice(0, 180)}` : '';
-    return `检测到 ${skipped.length} 个进程，但一个都无法确认身份（PID=${ids}）${detail}；` +
-      '通常是客户端刚重启或权限不同，稍后重试即可';
+    const detail = first.reason ? `；首个原因（${first.kind}）：${String(first.reason).slice(0, 160)}` : '';
+    return `检测到 ${skipped.length} 个进程，但无法确认身份（PID=${ids}；分类=${kindSummary()}）${detail}；` +
+      '为避免在信息不全时误操作，本次查询按失败处理。';
+  };
+  const withMetadata = (rows) => {
+    // 非枚举属性：保持数组语义兼容现有调用方，同时把「枚举是否完整」带出去。
+    Object.defineProperty(rows, 'skipped', { value: skipped, enumerable: false });
+    Object.defineProperty(rows, 'complete', { value: skipped.length === 0, enumerable: false });
+    Object.defineProperty(rows, 'errors', {
+      value: skipped.map((item) => ({ pid: item.pid, kind: item.kind, reason: item.reason })),
+      enumerable: false,
+    });
+    return rows;
   };
   const output = String(result.stdout || '').trim();
   if (!output) {
     if (skipped.length) throw new Error(describeSkipped());
-    return [];
+    return withMetadata([]);
   }
   let parsed;
   try {
@@ -161,7 +195,21 @@ function parseCimProcessResult(result, options = {}) {
     .map((row) => validateProcessRecord(row, options))
     .filter(Boolean);
   if (!rows.length && skipped.length) throw new Error(describeSkipped());
-  return rows;
+  return withMetadata(rows);
+}
+
+// 显式结构化枚举（任务书 5.2）。数组 + 隐藏属性的形式对老调用方友好，
+// 但要做「结束进程」「替换程序文件」这类决定时，用一个说得清的结构更安全：
+// complete=false 的含义是「确实有进程存在，但至少一条没验证成」，
+// 它和「没有进程在跑」是两件完全不同的事，绝不能混用。
+function enumerateCimProcesses(result, options = {}) {
+  const processes = parseCimProcessResult(result, options);
+  return {
+    processes,
+    skipped: processes.skipped || [],
+    errors: processes.errors || [],
+    complete: processes.complete !== false,
+  };
 }
 
 function resolveWindowsExecutable(value, realpath = fs.realpathSync.native) {
@@ -445,6 +493,7 @@ module.exports = {
   assertStandardWindowsPrivilege,
   assertVerifiedNodeProcess,
   buildNativeProcessQuery,
+  enumerateCimProcesses,
   filterVerifiedNodeProcesses,
   filterVerifiedWindowsProcesses,
   parseCimProcessResult,

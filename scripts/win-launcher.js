@@ -441,12 +441,18 @@ function getWorkBuddyProcesses() {
   const result = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
     encoding: 'utf8', timeout: 10000, windowsHide: true,
   });
-  return parseCimProcessResult(result, {
+  const rows = parseCimProcessResult(result, {
     requireCommandLine: true,
     requireCurrentOwner: true,
     requireNativeArguments: true,
     allowTransientNotFound: true,
-  }).filter(row => PROFILE.kind !== 'codebuddy' || isCodeBuddyBinary(row.ExecutablePath,PROFILE.id));
+  });
+  const filtered = rows.filter(row => PROFILE.kind !== 'codebuddy' || isCodeBuddyBinary(row.ExecutablePath,PROFILE.id));
+  // filter 会产出新数组，把「枚举是否完整」的元信息一起带过去：
+  // 调用方据此决定能不能拿这份结果去做结束进程之类的危险决策。
+  Object.defineProperty(filtered, 'skipped', { value: rows.skipped || [], enumerable: false });
+  Object.defineProperty(filtered, 'complete', { value: rows.complete !== false, enumerable: false });
+  return filtered;
 }
 
 // 仅保留为本地端口诊断；daemon 启动成功必须走 exactDaemonStatus 完整身份校验。

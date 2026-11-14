@@ -147,9 +147,16 @@ function isTargetForProfile(target, profile) {
   }
 
   // WorkBuddy 家族无强信号（罕见）：
-  //   - 已绑定 profile（WBSWITCH_PROFILE 固定了 CDP 端口）：标题兜底可以接受；
-  //   - 未绑定（旧式 CN daemon 扫描多端口）：禁止裸标题匹配，避免误连兄弟客户端。
-  if (process.env.WBSWITCH_PROFILE && /^WorkBuddy(?:\s|$)/i.test(title)) return true;
+  //   - 已绑定到本 profile（WBSWITCH_PROFILE 恰好等于当前 profile id）：标题兜底可以接受；
+  //   - 未绑定 / 绑定的是别的 profile：禁止裸标题匹配，避免误连兄弟客户端。
+  //
+  // 这里必须比较值，不能只判断「有没有设置」。只判断存在性等于把环境变量本身
+  // 当成归属证据 —— 而环境变量任何人都能设，写上 workbuddy-cn 就能让 AI profile
+  // 去认领国内版的页面。实测就是这样：开发机里留着 WBSWITCH_PROFILE=workbuddy-cn，
+  // 同一条用例在本地红、在 CI（变量为空）绿。
+  const boundProfile = String(process.env.WBSWITCH_PROFILE || '').trim().toLowerCase();
+  if (boundProfile && boundProfile === String(profile.id || '').trim().toLowerCase() &&
+      /^WorkBuddy(?:\s|$)/i.test(title)) return true;
   return false;
 }
 

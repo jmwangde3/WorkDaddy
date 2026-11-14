@@ -102,32 +102,47 @@ function Test-StrictCommandTokenPath {
 function ConvertTo-WorkDaddyProcessRecord {
   param([Parameter(Mandatory = $true)]$Process)
   $processId = 0
-  if (-not [int]::TryParse([string]$Process.ProcessId, [ref]$processId) -or $processId -le 0 -or
-      [string]::IsNullOrWhiteSpace([string]$Process.Name) -or
-      [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath) -or
-      [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)) { throw 'CIM 进程身份字段不完整' }
+  # 每个缺失字段单独报类型：上层要能区分「瞬时读不到」和「权限不够」，
+  # 不能笼统一个「字段不完整」然后把两种完全不同的处置方式混在一起。
+  # 前缀 WBD-<KIND> 是机器可读的，JS 侧按它分类，改措辞时要同步。
+  if (-not [int]::TryParse([string]$Process.ProcessId, [ref]$processId) -or $processId -le 0) {
+    throw 'WBD-PROCESSID_INVALID 进程号无效'
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$Process.Name)) {
+    throw 'WBD-NAME_UNVERIFIED 缺少进程名'
+  }
+  $hasPath = -not [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath)
+  $hasCmdLine = -not [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)
+  if (-not $hasPath -and -not $hasCmdLine) {
+    throw 'WBD-IDENTITY_UNREADABLE 可执行文件路径与命令行都读不到'
+  }
+  if (-not $hasPath) { throw 'WBD-PATH_UNVERIFIED 缺少可执行文件路径' }
+  if (-not $hasCmdLine) { throw 'WBD-COMMANDLINE_UNVERIFIED 缺少命令行' }
   try {
     $ownerResult = Invoke-CimMethod -InputObject $Process -MethodName GetOwner -ErrorAction Stop
   } catch {
     if (Test-CimProcessDisappearedError $_) { return $null }
-    throw
+    throw ('WBD-OWNER_UNVERIFIED ' + $_.Exception.Message)
   }
   if ($ownerResult.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace([string]$ownerResult.User)) {
-    throw "无法确认 PID $processId 的进程所有者"
+    throw "WBD-OWNER_UNVERIFIED 无法确认 PID $processId 的进程所有者"
   }
   $owner = if ([string]::IsNullOrWhiteSpace([string]$ownerResult.Domain)) {
     [string]$ownerResult.User
   } else { ([string]$ownerResult.Domain + '\' + [string]$ownerResult.User) }
   $arguments = [string[]]@(ConvertTo-WindowsCommandLineArgs -CommandLine ([string]$Process.CommandLine))
   if ($arguments.Count -eq 0 -or @($arguments | Where-Object { $null -eq $_ }).Count -ne 0) {
-    throw "PID $processId 的原生 Arguments 无效"
+    throw "WBD-ARGUMENTS_INVALID PID $processId 的原生 Arguments 无效"
   }
+  $resolvedPath = ''
+  try { $resolvedPath = Resolve-StrictWindowsPath -Path ([string]$Process.ExecutablePath) }
+  catch { throw ('WBD-PATH_UNVERIFIED ' + $_.Exception.Message) }
   $currentOwner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
   return [pscustomobject]@{
     ProcessId = $processId
     ParentProcessId = [int]$Process.ParentProcessId
     Name = [string]$Process.Name
-    ExecutablePath = Resolve-StrictWindowsPath -Path ([string]$Process.ExecutablePath)
+    ExecutablePath = $resolvedPath
     CommandLine = [string]$Process.CommandLine
     ArgumentsSource = 'CommandLineToArgvW'
     Arguments = $arguments
@@ -142,30 +157,50 @@ function Test-CimProcessDisappearedError {
   return $text -match '(?i)(0x80041002|ObjectNotFound|not found|不存在)'
 }
 
+# 进程还在、但基本信息读不到时，用一次独立探测判断是不是权限问题。
+# 不能只凭「路径和命令行都为空」就下结论 —— 那既可能是跨完整性级别，
+# 也可能是进程正在退出，两者处置方式完全相反（前者要用户改权限，后者重试即可）。
+function Test-ProcessAccessDenied {
+  param([Parameter(Mandatory = $true)][int]$ProcessId)
+  if ($ProcessId -le 0) { return $false }
+  try {
+    $target = Get-Process -Id $ProcessId -ErrorAction Stop
+    if ($null -eq $target) { return $false }
+  } catch {
+    return $false   # 进程不存在或无法枚举，不认定为权限问题
+  }
+  try { $imagePath = $target.Path } catch { return $true }
+  return [string]::IsNullOrEmpty($imagePath)
+}
+
 function ConvertTo-WorkDaddyProcessRecordIfPresent {
   param([Parameter(Mandatory = $true)]$Process)
   try { return ConvertTo-WorkDaddyProcessRecord -Process $Process }
   catch {
+    # 只有「明确确认进程已经消失」才允许静默跳过。其余一律带类型上报，
+    # 由调用方决定能否继续 —— 跳过本身不降低安全性（跳过的进程不会被动），
+    # 但把「未验证」当成「不存在」会让危险操作在信息不全时继续。
     if (Test-CimProcessDisappearedError $_) { return $null }
-    # 字段读不全：5.11.x 起客户端带 prewarm 进程池，进程会在查询瞬间退出，
-    # CommandLine / ExecutablePath 随之变空。这是「这一条不可用」，不是「查询失败」。
-    # 以前在这里 throw，一个瞬时进程就能让整个列表查询作废 —— 表现为安装目录里
-    # 明明有客户端在跑，launcher 却报 CIM 退出码 1 直接崩掉，连修复入口都没了。
-    # 跳过它不降低安全性：跳过的进程不会被结束，后续要动手时仍会走单 PID 的
-    # Get-StrictProcessRecord 精确验证。
-    # 往 stderr 留一行，让调用方能区分「真的没有进程」和「有进程但一条都读不到」。
-    $skippedPid = '?'
-    try { if ($null -ne $Process) { $skippedPid = [string]$Process.ProcessId } } catch { }
-    $skippedReason = ([string]$_.Exception.Message) -replace '\r', ' ' -replace '\n', ' '
-    # 跨完整性级别时 Windows 的表现就是「进程在，但路径和命令行都读不到」。
-    # 单独标出来：这不是客户端刚重启的竞态，重试多少次都一样，得让用户改权限。
-    $noAccess = $false
-    try {
-      $noAccess = [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath) -and
-                  [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)
-    } catch { }
-    if ($noAccess) { $skippedReason = 'NO-ACCESS ' + $skippedReason }
-    [Console]::Error.WriteLine('WBD-PROCESS-SKIPPED ' + $skippedPid + ' ' + $skippedReason)
+
+    $skippedPid = 0
+    try { $null = [int]::TryParse([string]$Process.ProcessId, [ref]$skippedPid) } catch { }
+    $message = ([string]$_.Exception.Message) -replace '\r', ' ' -replace '\n', ' '
+    $kind = 'UNKNOWN_ERROR'
+    if ($message -match '^WBD-([A-Z_]+)\s*(.*)$') {
+      $kind = $Matches[1]
+      $message = $Matches[2]
+    } elseif ($message -match '(?i)access is denied|0x80070005|拒绝访问') {
+      $kind = 'ACCESS_DENIED'
+    }
+    # 「身份字段整体读不到」本身不下结论，实际探测一次再归类。
+    if ($kind -eq 'IDENTITY_UNREADABLE' -or $kind -eq 'UNKNOWN_ERROR') {
+      if ($skippedPid -gt 0 -and (Test-ProcessAccessDenied -ProcessId $skippedPid)) {
+        $kind = 'ACCESS_DENIED'
+      } elseif ($kind -eq 'IDENTITY_UNREADABLE') {
+        $kind = 'TRANSIENT_FIELD_MISSING'
+      }
+    }
+    [Console]::Error.WriteLine('WBD-PROCESS-SKIPPED ' + $skippedPid + ' ' + $kind + ' ' + $message)
     return $null
   }
 }
