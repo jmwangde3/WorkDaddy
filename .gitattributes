@@ -1,7 +1,27 @@
-# .cmd / .bat 由 cmd.exe 执行：裸 LF 会让 goto / for / 多行 if 出错。
-# 这里显式声明 eol=crlf，保证任何平台 checkout 出来都是 CRLF（CI 的 CRLF 检查依赖它）。
+# 行尾由仓库决定，不依赖各机器的 core.autocrlf。
+#
+# 默认 LF：Node、PowerShell 5.1/7、Git Bash 都能正确读取 LF 文本。
+# 只有 cmd.exe 执行的文件强制 CRLF —— 裸 LF 会让 goto / for / 多行 if 出错。
+#
+# 这一条是「让 CI 与本地可复现」的前提：此前只有 *.cmd 有规则，其余文件在
+# Windows 上按 core.autocrlf 检出成 CRLF，导致同一份测试在 CI 与本机结果不同。
+* text=auto eol=lf
+
 *.cmd text eol=crlf
 *.bat text eol=crlf
 
-# shell 脚本必须 LF，否则容器/CI 里会因 shebang 后的 \r 报 "bad interpreter"。
+# shell 脚本即使有人在 Windows 上编辑也必须 LF，否则 shebang 后多出的 \r
+# 会让容器 / CI 报 "bad interpreter"。
 *.sh text eol=lf
+
+# 明确二进制，避免 auto 探测在这些文件上出错
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.dll binary
+*.zip binary
+.DS_Store binary
