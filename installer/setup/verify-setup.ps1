@@ -136,6 +136,22 @@ if (-not (Test-Path -LiteralPath $statePath)) {
 if ($null -ne $report.install.reportExitCode -and $report.install.reportExitCode -ne 0) {
     Fail-Setup ('安装器报告退出码 ' + [string]$report.install.reportExitCode + '：' + [string]$report.install.reportError) 5
 }
+
+# 成功路径也要读一眼安装器自己的结论：「文件都在」不等于「脚本认为装完了」。
+# 报告是脚本最后一步写的，装成功就一定在；不在说明这条链路有地方不对。
+if (-not (Test-Path -LiteralPath $installReport)) {
+    Fail-Setup ('装完了但没有安装器报告：' + $installReport + '（脚本没走到收尾）') 5
+}
+try {
+    $jr = Get-Content -LiteralPath $installReport -Raw -Encoding UTF8 | ConvertFrom-Json
+    $report.install.reportExitCode = [int]$jr.exitCode
+    $report.checks.installerSaidOk = [bool]$jr.ok
+    $report.checks.installerStateCommitted = [bool]$jr.state.committed
+    if (-not $jr.ok) { Fail-Setup ('安装器报告 ok=false，但程序文件已落盘：' + [string]$jr.error) 5 }
+    if (-not $jr.state.committed) { Fail-Setup '安装器报告里状态未提交，但 install-state.json 存在' 5 }
+} catch {
+    Fail-Setup ('安装器报告无法解析：' + $_.Exception.Message) 5
+}
 # 报告与痕迹都是一次性的：留着会让下一轮的「装完有记录」判断失去意义
 foreach ($f in @($installReport, $tracePath)) {
     if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
