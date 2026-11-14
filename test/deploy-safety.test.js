@@ -149,6 +149,33 @@ function main() {
     assert.equal(r.code, 0, r.out);
   });
 
+  test('旧代际的原版上游文件同样判为 pristine-upstream（多代际哈希）', () => {
+    // 场景：补丁基线是 1.2.20，用户机器上装的是 1.2.22 原版。
+    // 主 upstreamFileHashes 只记 1.2.20；1.2.22 的哈希在 upstreamFileHashesByVersion 里。
+    // 旧实现只比主哈希 → 会判成「代际不明」；这里要确认它被认出是原版上游。
+    const oldGen = "var DAEMON_VERSION = '1.2.20';\n// upstream original older\n";
+    const newGen = "var DAEMON_VERSION = '1.2.22';\n// upstream original newer\n";
+    const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+    const dir = tmpRoot('multi-gen-meta');
+    const file = path.join(dir, 'upstream.json');
+    fs.writeFileSync(file, JSON.stringify({
+      schema: 4,
+      deploy: {
+        upstreamFileHashes: { 'daemon.js': { sha256: sha(oldGen), size: Buffer.byteLength(oldGen) } },
+        upstreamFileHashesByVersion: {
+          '1.2.20': { 'daemon.js': { sha256: sha(oldGen), size: Buffer.byteLength(oldGen) } },
+          '1.2.22': { 'daemon.js': { sha256: sha(newGen), size: Buffer.byteLength(newGen) } },
+        },
+      },
+    }, null, 2));
+
+    const { scripts } = makeTarget('multi-gen', { pristineContent: newGen });
+    const r = runDeploy(['-TargetDir', scripts, '-DryRun'], { WORKDADDY_UPSTREAM_JSON: file });
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /原版上游/, '1.2.22 原版也必须被认出是没打补丁的上游文件');
+    assert.equal(/代际不明/.test(r.out), false, '不得退化成「代际不明」');
+  });
+
   test('同大小不同内容的目标判为未知代际并中止（回归：旧版只比字节数会误判）', () => {
     // 取本补丁版 daemon.js，改一个字符、保持字节长度完全一致。
     const src = fs.readFileSync(path.join(srcScripts, 'daemon.js'));

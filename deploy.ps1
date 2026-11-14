@@ -9,7 +9,7 @@
             —— 上游版本号只来自提交信息，不足以作为强制判断依据
          b) 文件代际闸门（硬，SHA-256 判定）：
             目标哈希 == 本补丁哈希            → already-patched，可覆盖
-            目标哈希 == 上游 1.2.22 原版哈希  → pristine-upstream，默认中止
+            目标哈希 == 任一已知上游代际哈希 → pristine-upstream，默认中止
             两者都不等 / 缺上游哈希           → unknown-generation，默认中止
             只有 -Force 才能越过中止
             —— -Force 只管代际闸门，不顺手拆版本闸门（见 3a）
@@ -240,6 +240,8 @@ if ($versionAdvisory) {
 $generation = @()
 $upHashes = $null
 if ($up -and $up.deploy -and $up.deploy.upstreamFileHashes) { $upHashes = $up.deploy.upstreamFileHashes }
+$upHashesByVersion = $null
+if ($up -and $up.deploy -and $up.deploy.upstreamFileHashesByVersion) { $upHashesByVersion = $up.deploy.upstreamFileHashesByVersion }
 $localHashes = $null
 if ($up -and $up.deploy -and $up.deploy.localFileHashes) { $localHashes = $up.deploy.localFileHashes }
 foreach ($f in $patchedFiles) {
@@ -253,6 +255,21 @@ foreach ($f in $patchedFiles) {
         $prop = $upHashes.PSObject.Properties[$f]
         if ($prop -and $prop.Value -and $prop.Value.sha256) { $upHash = [string]$prop.Value.sha256 }
     }
+    # 任一已知上游代际命中都算「没打过我们的补丁」：装 1.2.20 还是 1.2.22 原版，
+    # 覆盖都会丢那个代际的上游修复，方向都是降级。只认最新代际会漏掉旧安装。
+    $knownUpstream = @()
+    if ($upHash) { $knownUpstream += $upHash }
+    if ($upHashesByVersion) {
+        foreach ($verProp in $upHashesByVersion.PSObject.Properties) {
+            $verTable = $verProp.Value
+            if (-not $verTable) { continue }
+            $fileProp = $verTable.PSObject.Properties[$f]
+            if ($fileProp -and $fileProp.Value -and $fileProp.Value.sha256) {
+                $h = [string]$fileProp.Value.sha256
+                if ($knownUpstream -notcontains $h) { $knownUpstream += $h }
+            }
+        }
+    }
     $recordedLocalHash = ''
     if ($localHashes) {
         $lp = $localHashes.PSObject.Properties[$f]
@@ -261,12 +278,13 @@ foreach ($f in $patchedFiles) {
     $kind = 'unknown-generation'
     $why = 'hash-matches-neither'
     if ($targetHash -eq $ourHash) { $kind = 'already-patched'; $why = 'hash-equals-patch' }
-    elseif ($upHash -and $targetHash -eq $upHash) { $kind = 'pristine-upstream'; $why = 'hash-equals-upstream' }
-    elseif (-not $upHash) { $why = 'no-upstream-hash-recorded' }
+    elseif ($knownUpstream -contains $targetHash) { $kind = 'pristine-upstream'; $why = 'hash-equals-upstream' }
+    elseif ($knownUpstream.Count -eq 0) { $why = 'no-upstream-hash-recorded' }
     $generation += [pscustomobject]@{
         name = $f; kind = $kind; why = $why
         targetSize = $targetItem.Length; patchSize = (Get-Item (Join-Path $src $f)).Length
         targetHash = $targetHash; patchHash = $ourHash; upstreamHash = $upHash
+        upstreamHashes = $knownUpstream
         recordedLocalHash = $recordedLocalHash
     }
 }
@@ -277,14 +295,14 @@ $unknownGen = @($generation | Where-Object { $_.kind -eq 'unknown-generation' })
 if ($pristine.Count -gt 0) {
     $names = ($pristine | ForEach-Object { $_.name }) -join ', '
     if (-not $Force) {
-        Fail 'file-generation' ("目标这些文件与上游 1.2.22 原版逐字节一致（SHA-256 相同），是没打过我们补丁的原版上游文件: {0}。直接覆盖会丢掉上游修复。确认要降级请加 -Force。" -f $names) 2
+        Fail 'file-generation' ("目标这些文件与某个已知上游原版逐字节一致（SHA-256 相同），是没打过我们补丁的原版上游文件: {0}。直接覆盖会丢掉上游修复。确认要降级请加 -Force。" -f $names) 2
     }
     Say ("    [!] 目标为原版上游文件，已按 -Force 继续: {0}" -f $names) 'Yellow'
 }
 if ($unknownGen.Count -gt 0) {
     $names = ($unknownGen | ForEach-Object { $_.name }) -join ', '
     if (-not $Force) {
-        Fail 'file-generation' ("目标这些文件代际不明（SHA-256 既不等于本补丁版，也不等于上游 1.2.22 原版）: {0}。可能是别的版本打过补丁，直接覆盖无法保证可恢复。确认要继续请加 -Force。" -f $names) 2
+        Fail 'file-generation' ("目标这些文件代际不明（SHA-256 既不等于本补丁版，也不等于任一已知上游原版）: {0}。可能是别的版本打过补丁，直接覆盖无法保证可恢复。确认要继续请加 -Force。" -f $names) 2
     }
     Say ("    [!] 目标文件代际不明，已按 -Force 继续覆盖: {0}" -f $names) 'Yellow'
 }
