@@ -227,7 +227,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: release-${{ needs.build.outputs.version }}
-          path: release/dist
+          # 必须落到工作区根：upload-artifact 按「公共父目录」存路径，条目本身就是
+          # release/dist/xxx；这里若写 path: release/dist，解出来会变成
+          # release/dist/release/dist/xxx，后面按 release\dist 找资产就找不到
+          # （1.3.1 首次发布的 publish 就是栽在这行）。
+          path: .
 
       - name: 确认资产齐全
         shell: pwsh
