@@ -63,6 +63,12 @@ namespace WorkDaddyTray
         private static string s_scripts;
         private static string s_launcher;
         private static string s_watchdog;
+        // 从托盘启动后台服务时显式传给 watchdog 的绑定。托盘由 explorer 拉起，
+        // 环境里没有 WBSWITCH_*，靠继承会把 daemon 送进「默认 profile + 默认数据目录」。
+        private static string s_profile = "workbuddy-cn";
+        private static string s_dataDir = "";
+        private static string s_bindingSource = "default";
+        private static string s_startError = "";
         private static NotifyIcon s_notify;
         private static ContextMenuStrip s_menu;
         private static System.Windows.Forms.Timer s_timer;
@@ -96,6 +102,7 @@ namespace WorkDaddyTray
             s_scripts = ResolveScripts();
             s_launcher = Path.Combine(s_scripts, "launcher.cmd");
             s_watchdog = Path.Combine(s_scripts, "watchdog.js");
+            ResolveLaunchBinding();
 
             if (args.Length > 0 && args[0].StartsWith("--", StringComparison.Ordinal))
             {
@@ -147,6 +154,59 @@ namespace WorkDaddyTray
                 catch { }
             }
             return Path.Combine(local, @"Programs\WorkDaddy\scripts");
+        }
+
+        // ------------------------------------------------------------ 绑定
+        // 后台服务的 profile 与数据目录必须在启动时显式给出。托盘由 explorer 拉起，
+        // 进程环境里没有 WBSWITCH_PROFILE / WBSWITCH_DATA_DIR；只靠继承的话 daemon
+        // 会落到「默认 profile + 默认数据目录」，而 Windows 通用安装路径
+        // （如 H:\Program Files\WorkBuddy）没有 CN/AI 路径强信号，CDP 归属判定
+        // 在「无强信号 + 未显式绑定」处一律拒绝 —— 现象就是注入永久失败：
+        // /api/inject 一直返回「CDP 未连接」，日志只剩「跳过同族页面清理」。
+        //
+        // 取值优先级：进程环境（启动器 / 命令行） > install-state.json > 默认。
+        private static void ResolveLaunchBinding()
+        {
+            string envProfile = Environment.GetEnvironmentVariable("WBSWITCH_PROFILE");
+            string envDataDir = Environment.GetEnvironmentVariable("WBSWITCH_DATA_DIR");
+            string stateProfile = "";
+            string stateDataDir = "";
+            try
+            {
+                string stateFile = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "WorkDaddy", "install-state.json");
+                if (File.Exists(stateFile))
+                {
+                    string text = File.ReadAllText(stateFile);
+                    stateProfile = JsonStringField(text, "clientProfile");
+                    stateDataDir = JsonStringField(text, "dataDir");
+                }
+            }
+            catch { }
+
+            if (!string.IsNullOrEmpty(envProfile)) s_bindingSource = "env";
+            else if (!string.IsNullOrEmpty(stateProfile)) s_bindingSource = "install-state.json";
+
+            string profile = !string.IsNullOrEmpty(envProfile) ? envProfile : stateProfile;
+            // 只接受形如 workbuddy-cn 的 id：这个值要写进子进程环境，不认识的形态
+            // 一律退回默认，避免被篡改的 state 文件把任意字符串塞给服务。
+            if (Regex.IsMatch(profile ?? "", @"^[a-z0-9][a-z0-9.-]{1,62}$")) s_profile = profile;
+
+            string dataDir = !string.IsNullOrEmpty(envDataDir) ? envDataDir : stateDataDir;
+            try
+            {
+                if (!string.IsNullOrEmpty(dataDir) && Path.IsPathRooted(dataDir)) s_dataDir = dataDir;
+            }
+            catch { }
+        }
+
+        private static string JsonStringField(string json, string name)
+        {
+            Match m = Regex.Match(json ?? "",
+                "\"" + Regex.Escape(name) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+            if (!m.Success) return "";
+            return m.Groups[1].Value.Replace("\\\\", "\\").Replace("\\/", "/");
         }
 
         // ------------------------------------------------------------ 状态
@@ -260,7 +320,7 @@ namespace WorkDaddyTray
 
         private static bool StartWd()
         {
-            if (!File.Exists(s_watchdog)) return false;
+            if (!File.Exists(s_watchdog)) { s_startError = "watchdog 不存在: " + s_watchdog; return false; }
             if (TestPort(DaemonPort)) return true;
             try
             {
@@ -268,14 +328,30 @@ namespace WorkDaddyTray
                 psi.FileName = FindNode();
                 psi.Arguments = "\"" + s_watchdog + "\"";
                 psi.WorkingDirectory = s_scripts;
-                // UseShellExecute=true 让 shell 分配自己的句柄，不继承托盘
-                // (winexe) 的无效标准句柄；Hidden 隐藏 node 的控制台窗口。
+                // UseShellExecute=true 让 shell 分配自己的句柄，不继承托盘 (winexe)
+                // 的无效标准句柄；Hidden 隐藏 node 的控制台窗口。
                 psi.UseShellExecute = true;
                 psi.WindowStyle = ProcessWindowStyle.Hidden;
-                Process.Start(psi);
+                // 绑定通过本进程环境块传给子进程，不能用 psi.EnvironmentVariables：
+                // 它在 .NET Framework 里是大小写不敏感的 StringDictionary，环境里同时
+                // 存在 HTTPS_PROXY 与 https_proxy 时一访问就抛 ArgumentException
+                // （实测「start = False」，用户看到的就是点了启动没反应）。
+                string prevProfile = Environment.GetEnvironmentVariable("WBSWITCH_PROFILE");
+                string prevDataDir = Environment.GetEnvironmentVariable("WBSWITCH_DATA_DIR");
+                try
+                {
+                    Environment.SetEnvironmentVariable("WBSWITCH_PROFILE", s_profile);
+                    if (!string.IsNullOrEmpty(s_dataDir)) Environment.SetEnvironmentVariable("WBSWITCH_DATA_DIR", s_dataDir);
+                    Process.Start(psi);
+                }
+                finally
+                {
+                    Environment.SetEnvironmentVariable("WBSWITCH_PROFILE", prevProfile);
+                    Environment.SetEnvironmentVariable("WBSWITCH_DATA_DIR", prevDataDir);
+                }
                 return true;
             }
-            catch { return false; }
+            catch (Exception ex) { s_startError = ex.GetType().Name + ": " + ex.Message; return false; }
         }
 
         private static bool StopWd()
@@ -563,6 +639,8 @@ namespace WorkDaddyTray
                     sb.AppendLine("cdp        : " + (TestPort(CdpPort) ? "connected" : "disconnected"));
                     sb.AppendLine("processes  : " + GetWdProcesses().Count);
                     sb.AppendLine("autostart  : " + GetAutoStart());
+                    sb.AppendLine("launch     : profile=" + s_profile + " dataDir=" +
+                        (string.IsNullOrEmpty(s_dataDir) ? "(default)" : s_dataDir) + " source=" + s_bindingSource);
                     sb.AppendLine("wd scripts : " + s_scripts);
                     break;
 
@@ -590,6 +668,7 @@ namespace WorkDaddyTray
 
                 case "--start":
                     sb.AppendLine("start = " + StartWd());
+                    if (!string.IsNullOrEmpty(s_startError)) sb.AppendLine("startError : " + s_startError);
                     break;
                 case "--stop":
                     sb.AppendLine("stop = " + StopWd());

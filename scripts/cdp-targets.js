@@ -33,6 +33,50 @@ const APP_CN_LINUX = /\/opt\/WorkBuddy\//i;
 // AI 安装目录名可区分；通用 WorkBuddy 目录可能被 CN/AI 共用，不作强信号。
 const APP_AI_WIN = /\/WorkBuddy(?:%20| )?AI\/resources\/app\.asar(?:\/|$)/i;
 const APP_AI_WIN_COMPACT = /\/WorkBuddyAI\/resources\/app\.asar(?:\/|$)/i;
+const WINDOWS_FILE_PATH = /^[A-Za-z]:[\\/]/;
+
+/**
+ * 取 file:// 页面的本地路径（Windows 的 /H:/... 去掉前导斜杠）。
+ * 非 file 页面、以及带 host 的 file URL（file://主机/共享）返回空串 —— 后者
+ * 指向的是网络位置，不能用来证明归属。
+ */
+function fileTargetPath(url) {
+  const raw = String(url || '');
+  if (!/^file:/i.test(raw)) return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.hostname) return '';
+    const pagePath = decodeURIComponent(parsed.pathname);
+    return WINDOWS_FILE_PATH.test(pagePath.slice(1)) ? pagePath.slice(1) : pagePath;
+  } catch (_) {
+    return '';
+  }
+}
+
+/**
+ * 页面是否落在某个已确认的客户端安装目录内。
+ * 目录本身必须是绝对路径：空串 / 相对路径一律不成立，避免「证据缺失」被当成证据。
+ */
+function fileTargetInsideDir(url, dir) {
+  const pagePath = fileTargetPath(url);
+  const root = String(dir || '').trim();
+  if (!pagePath || !root) return false;
+  const rootIsWindows = WINDOWS_FILE_PATH.test(root);
+  const pageIsWindows = WINDOWS_FILE_PATH.test(pagePath);
+  // 相对路径不构成归属证据；Windows 路径与 POSIX 路径不跨形态比较。
+  if (!rootIsWindows && !root.startsWith('/')) return false;
+  if (rootIsWindows !== pageIsWindows) return false;
+  const normalize = (value) => String(value).replace(/\\/g, '/').replace(/\/+$/, '');
+  const page = normalize(pagePath);
+  const base = normalize(root);
+  if (rootIsWindows) {
+    const lowerPage = page.toLowerCase();
+    const lowerBase = base.toLowerCase();
+    return lowerPage === lowerBase || lowerPage.startsWith(lowerBase + '/');
+  }
+  return page === base || page.startsWith(base + '/');
+}
+
 const DOMAIN_WB_AI = /https?:\/\/(?:[^/]+\.)?workbuddy\.ai(?:\/|$)/i;
 const DOMAIN_WB_CN = /https?:\/\/(?:[^/]+\.)?workbuddy\.cn(?:\/|$)/i;
 const DOMAIN_CB_CN = /https?:\/\/(?:[^/]+\.)?codebuddy\.cn(?:\/|$)/i;
@@ -88,8 +132,12 @@ function looksLikeWbFamilyTarget(target) {
  * 判定一个 CDP target 是否属于当前 daemon 的 profile。
  * @param {object} target CDP /json/list 中的 page target
  * @param {object} profile profiles.js 中的 profile 对象
+ * @param {object} [evidence] 调用方已确认的归属证据（不是环境变量）
+ * @param {string} [evidence.installRoot] 本 profile 客户端已验证安装目录；
+ *   页面 file:// 路径落在其中即归属成立。daemon 由托盘/快捷方式启动时环境里
+ *   没有 WBSWITCH_PROFILE，这条路径证据是唯一可靠依据。
  */
-function isTargetForProfile(target, profile) {
+function isTargetForProfile(target, profile, evidence = {}) {
   if (!target || target.type !== 'page') return false;
   const url = String(target.url || '');
   const title = String(target.title || '');
@@ -135,6 +183,14 @@ function isTargetForProfile(target, profile) {
     return signals.some((signal) => lower.includes(signal));
   }
 
+  // 页面来自本 profile 已验证的客户端安装目录 → 归属成立。这是路径证据，与 Linux
+  // 的 targetsBelongToProfile 走同一条链：
+  //   - 不依赖 WBSWITCH_PROFILE：托盘 / 桌面快捷方式启动的 daemon 环境里没有这个
+  //     变量，旧逻辑在「无强信号 + 未绑定」处一律拒绝，注入会永久失败；
+  //   - 也不放松隔离：目录取自本 profile 自己的可执行文件（运行进程 / 显式配置 /
+  //     唯一磁盘候选），兄弟 profile 的安装目录不同，互相不匹配。
+  if (fileTargetInsideDir(url, evidence.installRoot)) return true;
+
   if (cls) return cls === profile.id;
 
   // CodeBuddy：Editor 模式的 target URL 通常是 vscode-file://，不包含产品名；
@@ -165,9 +221,9 @@ function isTargetForProfile(target, profile) {
  * separate settings utility window before the main conversation page; that
  * window shares the same app URL and must not become the CDP session target.
  */
-function selectPageTarget(targets, profile) {
+function selectPageTarget(targets, profile, evidence = {}) {
   const candidates = (Array.isArray(targets) ? targets : []).filter((target) => {
-    if (!isTargetForProfile(target, profile)) return false;
+    if (!isTargetForProfile(target, profile, evidence)) return false;
     // CodeBuddy's standalone Agents window is distinct from the IDE and its
     // extension webviews. Wait for that window instead of attaching to the IDE.
     // [CodeBuddy IDE 状态栏] 主连接保持 1.2.9 原行为：只认 agentManager.html。
@@ -192,11 +248,14 @@ function selectPageTarget(targets, profile) {
  * 由 daemon 的 IDE 浮层管理器维护）；非 codebuddy profile 返回空数组。
  * inject.js 运行时通过 location.href 自判 IDE 模式，无需 target 侧附加标记。
  */
-function selectIdeTargets(targets, profile) {
+function selectIdeTargets(targets, profile, evidence = {}) {
   if (!profile || profile.kind !== 'codebuddy') return [];
   return (Array.isArray(targets) ? targets : []).filter((target) =>
-    isTargetForProfile(target, profile)
+    isTargetForProfile(target, profile, evidence)
     && /\/workbench\.html(?:[?#]|$)/i.test(String(target.url || '')));
 }
 
-module.exports = { normalizeTargetUrl, classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile, selectPageTarget, selectIdeTargets };
+module.exports = {
+  normalizeTargetUrl, fileTargetPath, fileTargetInsideDir, classifyTarget, looksLikeWbFamilyTarget,
+  isTargetForProfile, selectPageTarget, selectIdeTargets,
+};

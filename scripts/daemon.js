@@ -56,15 +56,37 @@ const {
   filterVerifiedNodeProcesses,
   parseCimProcessResult,
   resolveWindowsExecutable,
+  resolveWindowsPrivilege,
   sameWindowsPath,
   selectRunningProfileBinary,
   selectPreferredDiscoveredBinary,
 } = require('./windows-process-boundary.js');
-const DAEMON_PRIVILEGE = process.platform === 'win32'
-  ? (process.env.WBSWITCH_NATIVE_LAUNCHER === '1'
-    ? detectNativeWindowsPrivilege(path.resolve(__dirname, '..'), process.env.WBSWITCH_PROFILE || 'workbuddy-cn')
-    : detectWindowsPrivilege())
-  : 'standard';
+// 权限探测失败不能让整个服务起不来：Windows 上这两条探测各要 spawn 一个外部进程
+// （powershell / 原生 helper），被组策略、AppLocker、8 秒超时或 helper 缺失挡住是
+// 真实存在的环境问题。旧逻辑在模块加载期直接 throw，用户看到的现象就是「托盘点了
+// 启动没反应、后台服务根本没起来」，且没有任何可读原因。
+//
+// 退化为 'unknown' 不会放松安全边界：daemon 自己不用这个值做危险动作判定
+// （结束进程走 assertDaemonTerminationIdentity / assertSameProcessIdentity，
+// 启动校验由启动器按自己的探测结果做），它只出现在 /api/status 里。
+function detectDaemonPrivilege() {
+  if (process.platform !== 'win32') return 'standard';
+  const appDir = path.resolve(__dirname, '..');
+  const profileId = process.env.WBSWITCH_PROFILE || 'workbuddy-cn';
+  const nativeDetect = () => detectNativeWindowsPrivilege(appDir, profileId);
+  const shellDetect = () => detectWindowsPrivilege();
+  // 优先走当前启动方式那条路，失败再用另一条：powershell 被挡时原生 helper 通常还能用。
+  const detectors = process.env.WBSWITCH_NATIVE_LAUNCHER === '1'
+    ? [nativeDetect, shellDetect]
+    : [shellDetect, nativeDetect];
+  const { privilege, errors } = resolveWindowsPrivilege(detectors);
+  if (privilege === 'unknown') {
+    DAEMON_PRIVILEGE_WARNING = '无法确认 Windows 运行权限，已退化为 unknown：' + errors.join(' / ');
+  }
+  return privilege;
+}
+let DAEMON_PRIVILEGE_WARNING = '';
+const DAEMON_PRIVILEGE = detectDaemonPrivilege();
 // ws（WebSocketServer）用于 DevTools 代理：Electron 的 CDP server 拒绝带 Origin 的 WS 连接
 // （浏览器必带 Origin → DevTools 前端 "websocket disconnected"），daemon 代理中转去掉 Origin
 let wsLib = null;
@@ -2361,13 +2383,13 @@ function targetsBelongToProfile(targets) {
 function isWorkBuddyCdpTarget(target) {
   // 严格归属判定（见 cdp-targets.js）：页面明确属于其他客户端 → 一律拒绝，
   // 未绑定 profile 的旧 daemon 不会再靠标题 "WorkBuddy" 误连兄弟客户端页面。
-  return isTargetForProfile(target, PROFILE);
+  return isTargetForProfile(target, PROFILE, cdpProfileEvidence());
 }
 
 async function getPageTarget(port) {
   const r = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) });
   const list = await r.json();
-  return selectPageTarget(list, PROFILE);
+  return selectPageTarget(list, PROFILE, cdpProfileEvidence());
 }
 
 async function cleanupForeignInjectedTargets(targets) {
@@ -3337,6 +3359,31 @@ function resolveWorkBuddyBinary() {
     log('检测到多个 dormant WorkBuddy 安装目录，按发现优先级选择: ' + selected);
   }
   return selected ? (wbBinaryCache = selected) : null;
+}
+
+// CDP 归属判定需要的路径证据：本 profile 客户端到底装在哪个目录。
+// 来源与启动客户端用的是同一条解析链（运行进程 / workbuddy-target.json / 注册表 /
+// 唯一磁盘候选）。解析成功就长期缓存（与 wbBinaryCache 同寿命，安装目录不会自己变）；
+// 失败 60 秒后再试 —— 客户端刚被关掉/刚装好时这段窗口足够短，也不会让每轮清理
+// 循环都去 spawn 一次 powershell。
+const INSTALL_ROOT_FAILURE_RETRY_MS = 60 * 1000;
+let installRootCache = { root: '', retryAt: 0 };
+function workBuddyInstallRoot() {
+  if (!IS_WIN) return WORKBUDDY_APP;
+  if (installRootCache.root) return installRootCache.root;
+  if (installRootCache.retryAt && Date.now() < installRootCache.retryAt) return '';
+  let root = '';
+  try {
+    const binary = resolveWorkBuddyBinary();
+    if (binary) root = path.win32.dirname(binary);
+  } catch (_) { root = ''; }
+  installRootCache = { root, retryAt: root ? 0 : Date.now() + INSTALL_ROOT_FAILURE_RETRY_MS };
+  return root;
+}
+
+function cdpProfileEvidence() {
+  const installRoot = workBuddyInstallRoot();
+  return installRoot ? { installRoot } : {};
 }
 
 function runCommand(command, args, options = {}) {
@@ -4839,7 +4886,7 @@ async function injectWidget(reason, executionContextId) {
   // 防御闸与发现/选页共用归属规则，既隔离兄弟客户端，也尊重自定义安装目录绑定。
   if (cdp.targetUrl) {
     const target = { type: 'page', url: cdp.targetUrl, title: cdp.targetTitle || '', description: cdp.targetDescription || '' };
-    if (!isTargetForProfile(target, PROFILE)) {
+    if (!isTargetForProfile(target, PROFILE, cdpProfileEvidence())) {
       const cls = classifyTarget(target.url, target.title, target.description) || 'unknown';
       log(`[cdp] 目标页面属于 ${cls}（当前 profile=${PROFILE.id}），拒绝注入`);
       return Promise.reject(new Error(`目标页面 ${cls} 不属于当前 profile ${PROFILE.id}`));
@@ -13130,7 +13177,7 @@ function handleApi(req, res) {
         r.on('end', () => {
           try {
             const list = JSON.parse(d);
-            const page = selectPageTarget(list, PROFILE);
+            const page = selectPageTarget(list, PROFILE, cdpProfileEvidence());
             const id = page && page.id;
             if (!id) return resolve(json(res, 500, { ok: false, error: '未找到 WorkBuddy 页面 target' }));
             if (!wsLib) return resolve(json(res, 500, { ok: false, error: 'ws 代理库未加载，无法打开 DevTools' }));
@@ -14211,6 +14258,11 @@ const sessionCwdRepairTimer = setInterval(() => {
 }, 5000);
 sessionCwdRepairTimer.unref && sessionCwdRepairTimer.unref();
 log('WorkBuddy 多账号切换器启动 (CDP 模式)');
+// 绑定的来源必须落在日志里：托盘 / 快捷方式启动时环境变量可能根本不存在，
+// 而 CDP 归属判定曾经依赖它，现场只能看到「注入一直失败」看不出原因。
+log(`[init] 绑定: profile=${PROFILE.id} source=${process.env.WBSWITCH_PROFILE ? 'env' : 'default'} ` +
+  `dataDir=${process.env.WBSWITCH_DATA_DIR ? 'env' : 'default'} privilege=${DAEMON_PRIVILEGE}`);
+if (DAEMON_PRIVILEGE_WARNING) log(`[init] ${DAEMON_PRIVILEGE_WARNING}`);
 log(`登录信息文件: ${currentAuthFile() || '(未唯一确认)'}`);
 log(`备份目录: ${DATA_DIR}`);
 updateDebug('daemon-start', { authFile: currentAuthFile(), dataDir: DATA_DIR, appPath: IS_WIN ? WORKDADDY_DIR_WIN : macWorkDaddyAppPath(), apiPort: UI_PORT_BASE });

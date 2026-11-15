@@ -33,6 +33,24 @@ function detectWindowsPrivilege(run = spawnSync) {
   throw new Error('无法确认 Windows 进程是否为普通用户权限');
 }
 
+// 权限探测的两条路（powershell / 原生 helper）都要 spawn 外部进程，被组策略、
+// AppLocker、超时或 helper 缺失挡住是真实现象。这里只负责「按顺序试，全失败给
+// unknown」，不做安全判定本身：危险动作由 assertStandardWindowsPrivilege 与
+// 逐 PID 身份断言把关，调用方拿到 unknown 只是「不知道」，不是「放行」。
+function resolveWindowsPrivilege(detectors) {
+  const errors = [];
+  for (const detect of Array.isArray(detectors) ? detectors : []) {
+    try {
+      const privilege = detect();
+      if (privilege === 'standard' || privilege === 'elevated') return { privilege, errors };
+      errors.push(`权限探测返回无效值：${String(privilege)}`);
+    } catch (error) {
+      errors.push(String((error && error.message) || error));
+    }
+  }
+  return { privilege: 'unknown', errors };
+}
+
 // Native children inherit the real Windows token. Ask the installed helper to
 // verify it (including saved consent for elevated sessions), never an env flag.
 function detectNativeWindowsPrivilege(appDir, profile, run = spawnSync) {
@@ -560,6 +578,7 @@ module.exports = {
   parseCimProcessResult,
   readProcessEnumeration,
   resolveWindowsExecutable,
+  resolveWindowsPrivilege,
   sameWindowsPath,
   selectRunningProfileBinary,
   selectPreferredDiscoveredBinary,
