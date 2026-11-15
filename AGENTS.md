@@ -182,6 +182,26 @@ Use this exact flow for a Windows release. The two client packages are built fro
 
 6. Smoke-test installation and startup in this order: install WorkDaddy AI first (including an elevated installer run), launch it; install WorkDaddy second with a normal installer run, launch it; then repeat normal and elevated shortcut launches for both profiles. Both clients must remain open simultaneously. Separately on a clean profile, extract each Portable ZIP, launch it with Start, stop it with Stop, then confirm manual replacement works without deleting account data. Do not run an installed and portable copy of the same profile simultaneously. If a previous install left a daemon/watchdog running, the installer may stop only the exact current-profile lifecycle after verifying script path, Node path, PID, owner, profile, port, and daemon status. It must never kill all `WorkBuddy.exe`/`Electron.exe` processes.
 
+   Dual-profile smoke test (the build only passes if every step holds):
+
+   1. start WorkBuddy AI (its own tray + daemon) and wait for `运行中`;
+   2. start WorkBuddy CN (its own tray + daemon) and wait for `运行中`;
+   3. both clients stay open and both daemons stay alive — profiles use separate
+      UI ports (47833 / 47832), separate CDP ports (9223 / 9222) and separate
+      profile locks (47933 / 47932), so neither blocks the other;
+   4. open each admin page (`http://127.0.0.1:47833/`, `http://127.0.0.1:47832/`)
+      and confirm each shows *its own* profile;
+   5. confirm each daemon reports CDP connected to its own client (no cross-claim);
+   6. stop CN from its tray → CN daemon exits, AI keeps running and keeps answering;
+   7. restart CN → CN comes back, AI is still untouched;
+   8. confirm there is never more than one daemon per profile (`watchdog-state.json`
+      per data dir, plus a live `/api/status` check).
+
+   A second start of the *same* profile must be refused (`exit 3`, log names the lock
+   port) — that is the only single-instance rule left. Killing a watchdog must take
+   its daemon with it (IPC channel closes); if a daemon outlives its watchdog, the
+   next watchdog must refuse to start (`exit 4`) rather than run a second one.
+
 7. When a PID file is missing during an install/update race, the launcher may reconstruct it only for one exact current-profile watchdog. Multiple matches, an unverified path, a foreign owner, an elevated target from a standard process, or an unbound daemon must fail closed with actionable logs. The old generic “请先完全退出 WorkBuddy” cold-start gate must not be used for a verified current-profile process; the launcher should restart that process precisely and wait for its expected CDP port.
 
 ## Change Workflow
