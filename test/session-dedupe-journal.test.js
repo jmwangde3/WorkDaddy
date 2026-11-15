@@ -19,6 +19,7 @@ const { createSessionDb } = require('../scripts/session-db.js');
 const {
   MODE_EXACT, planDedupe, applyDedupe, resumeDedupe, inspectJournalRows, JOURNAL_STATES,
 } = require('../scripts/session-dedupe.js');
+const { createRehomeRunner } = require('../scripts/rehome-sessions.js');
 
 const CREATE = 'CREATE TABLE sessions (' +
   'id TEXT PRIMARY KEY, user_id TEXT, cwd TEXT, title TEXT, status TEXT, ' +
@@ -247,3 +248,112 @@ test('journal 状态集合覆盖任务书要求的七种', () => {
     'RECOVERY_REQUIRED', 'ROLLBACK_REQUIRED', 'ROLLED_BACK',
   ].sort());
 });
+
+// ---------- 恢复状态必须真正写回磁盘 ----------
+// 只改内存对象是不够的：进程退出后磁盘仍停在 APPLYING，下次恢复会以为
+// 操作没结束。下面三组覆盖「写回」「写不回去」「重复恢复」。
+async function seedBrokenApply(root, db, tag) {
+  await seedPair(root, db, tag);
+  const plan = await planDedupe(db, root, { scope: 'manual', mode: MODE_EXACT });
+  const out = await applyDedupe(db, plan, { backupRoot: path.join(root, 'bak') });
+  assert.ok(out.journal, '前置：必须有 journal 文件');
+  const journal = JSON.parse(fs.readFileSync(out.journal, 'utf8'));
+  // 模拟崩溃现场：库已提交，日志停在 APPLYING，磁盘上也是 APPLYING
+  journal.state = 'APPLYING';
+  delete journal.stateUpdatedAt;
+  fs.writeFileSync(out.journal, JSON.stringify(journal, null, 2) + '\n');
+  return { journal, journalPath: out.journal, appliedAt: journal.rows[0].after };
+}
+
+test('恢复：推进成功后，重新读取磁盘 journal 必须是 COMPLETED', async () => {
+  const root = tempDir('resume-persist');
+  const db = await makeDb(root);
+  const { journal, journalPath, appliedAt } = await seedBrokenApply(root, db, '落盘');
+
+  const resume = await resumeDedupe(db, journal, { dryRun: false, journalPath });
+  assert.equal(resume.ok, true, JSON.stringify(resume));
+  assert.equal(resume.action, 'mark-completed');
+  assert.equal(resume.persisted, true, '必须明确报告已经写回磁盘');
+
+  const onDisk = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  assert.equal(onDisk.state, 'COMPLETED', '磁盘上的状态没变，等于没恢复');
+  assert.ok(Number.isFinite(onDisk.stateUpdatedAt), '要留下状态更新时间');
+  assert.equal(onDisk.rows[0].after, appliedAt, '不得为了标记日志而重写数据库');
+
+  const dbNow = (await deletedMap(db))['id-drop'];
+  assert.equal(dbNow, appliedAt, '数据库里的写入值必须原样保留');
+});
+
+test('恢复：状态写不进磁盘时必须报错，不能报告恢复完成', async () => {
+  const root = tempDir('resume-persist-fail');
+  const db = await makeDb(root);
+  const { journal, journalPath } = await seedBrokenApply(root, db, '写不进去');
+
+  const resume = await resumeDedupe(db, journal, {
+    dryRun: false,
+    journalPath,
+    // 磁盘写满 / 只读盘 / 同步盘占用：写入这一步抛错。
+    write: () => { throw new Error('EIO: 磁盘已满'); },
+  });
+  assert.equal(resume.ok, false, '写盘失败不能算成功');
+  assert.equal(resume.action, 'persist-failed');
+  assert.equal(resume.persisted, false);
+  assert.match(String(resume.error), /状态写盘失败/);
+  assert.equal(journal.state, 'APPLYING', '没写成功就不能把内存状态也改掉');
+  assert.equal(JSON.parse(fs.readFileSync(journalPath, 'utf8')).state, 'APPLYING',
+    '磁盘没有被改动，报告里就不能出现「恢复完成」');
+});
+
+test('回滚入口：日志状态写不进磁盘时，命令必须报失败而不是静默成功', async () => {
+  const root = tempDir('rollback-persist-fail');
+  const db = await makeDb(root);
+  await insert(db, { id: 'id-drop', title: '回滚落盘' });
+  const appliedAt = 1700000000123;
+  await db.run('UPDATE sessions SET deleted_at = ? WHERE id = ?', [appliedAt, 'id-drop']);
+
+  const journalPath = path.join(root, 'journal.json');
+  const journal = {
+    version: 2, opId: 'dedupe-test', state: 'APPLYING',
+    rows: [{ id: 'id-drop', before: null, after: appliedAt, reason: 'test' }],
+  };
+  fs.writeFileSync(journalPath, JSON.stringify(journal, null, 2) + '\n');
+  // 只读文件：回滚能改库，但状态写不回去。Windows 上 rename 覆盖只读目标会失败。
+  fs.chmodSync(journalPath, 0o444);
+
+  const runner = createRehomeRunner({
+    dataDir: path.join(root, 'data'), dataRoot: root, dbPath: path.join(root, 'workbuddy.db'),
+  });
+  const result = await runner.runRollback(journalPath, { dryRun: false });
+
+  assert.equal(result.ok, false, '日志没写回去就不能报成功');
+  assert.equal(result.action, 'persist-failed');
+  assert.equal(result.persisted, false);
+  assert.match(String(result.note || ''), /重跑本命令是安全的/, '要说清下一步能不能重试');
+  assert.equal((await deletedMap(db))['id-drop'], null, '回滚本身已经生效，不该被日志失败推翻');
+  assert.equal(JSON.parse(fs.readFileSync(journalPath, 'utf8')).state, 'APPLYING',
+    '磁盘上仍然是 APPLYING，报告里就不能说已回滚完成');
+
+  fs.chmodSync(journalPath, 0o666);
+});
+
+test('恢复：重复恢复是幂等的，且以磁盘上的状态为准', async () => {
+  const root = tempDir('resume-idempotent');
+  const db = await makeDb(root);
+  const { journal, journalPath } = await seedBrokenApply(root, db, '幂等落盘');
+
+  const first = await resumeDedupe(db, journal, { dryRun: false, journalPath });
+  assert.equal(first.action, 'mark-completed');
+
+  const second = await resumeDedupe(db, journal, { dryRun: false, journalPath });
+  assert.equal(second.ok, true);
+  assert.equal(second.action, 'already-terminal', '第二次不该再动任何东西');
+  assert.equal(JSON.parse(fs.readFileSync(journalPath, 'utf8')).state, 'COMPLETED');
+
+  // 调用方手里的对象还是 APPLYING（例如从旧变量继续用）：磁盘那份说了算。
+  const stale = { ...journal, state: 'APPLYING' };
+  const third = await resumeDedupe(db, stale, { dryRun: false, journalPath });
+  assert.equal(third.action, 'already-terminal', '磁盘已是终态，就不能被内存里的旧状态带回去');
+  assert.equal(third.state, 'COMPLETED');
+  assert.equal(JSON.parse(fs.readFileSync(journalPath, 'utf8')).state, 'COMPLETED');
+});
+

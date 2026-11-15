@@ -266,9 +266,18 @@ function createRehomeRunner(options = {}) {
     const db = createSessionDb({ dbPath });
     const result = await dedupe.rollbackDedupe(db, journal, { dryRun: !!opts.dryRun });
     if (!opts.dryRun && result.ok && !result.skipped.length) {
-      journal.state = 'ROLLED_BACK';
-      journal.stateUpdatedAt = Date.now();
-      try { dedupe.writeJsonAtomic(file, journal); } catch (_) {}
+      // 会话已经回滚进库了，但操作日志必须写回磁盘才算这条记录闭环。
+      // 吞掉写入错误会让命令报告「已回滚」而磁盘仍停在 APPLYING —— 下次恢复
+      // 会以为操作没结束，甚至再回滚一遍。
+      const written = dedupe.persistJournalState(file, journal, 'ROLLED_BACK');
+      if (!written.ok) {
+        return {
+          ...result, ok: false, persisted: false, action: 'persist-failed',
+          error: written.error,
+          note: '会话已回滚，但操作日志未能写回状态；重跑本命令是安全的（回滚幂等）',
+        };
+      }
+      return { ...result, persisted: true, journal: written.journal };
     }
     return result;
   }

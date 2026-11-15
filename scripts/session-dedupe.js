@@ -913,29 +913,136 @@ async function inspectJournalRows(db, journal) {
  * 安全前提：**重复调用必须安全**。终态直接返回；APPLYING 走逐行比对，
  * 拿不准（混合状态、行不见了、被别人改过）就停在 RECOVERY_REQUIRED，绝不自动覆盖。
  * 这里不做整库还原 —— 那会把测试期间其它进程写进去的新数据一起抹掉。
+ *
+ * 恢复只推进「日志状态」，不重跑任何数据库写入：能推进的前提是数据库现状
+ * 已经被逐行比对证明到位（ROLLED_BACK / DB_COMMITTED），再执行一次写入
+ * 只会把已经正确的库改坏。
+ *
+ * 传入 options.journalPath 时，以磁盘上那份日志为准（崩溃现场在磁盘上，
+ * 内存对象可能已经被上一次调用改过），并且状态必须写回磁盘 + 回读确认后才算成功。
+ * 没有路径时只改内存，report.persisted=false 会明确说出来，不会假装已经落盘。
  */
+function validateJournalShape(journal) {
+  if (!journal || typeof journal !== 'object' || Array.isArray(journal)) {
+    return { ok: false, reason: '操作日志不是有效对象' };
+  }
+  if (![1, 2].includes(journal.version)) {
+    return { ok: false, reason: `操作日志版本不支持: ${JSON.stringify(journal.version)}` };
+  }
+  if (!Array.isArray(journal.rows)) return { ok: false, reason: '操作日志缺少 rows' };
+  for (const row of journal.rows) {
+    if (!row || typeof row !== 'object' || !row.id) {
+      return { ok: false, reason: '操作日志存在缺少会话 ID 的行' };
+    }
+    // 没有「本次写入值」就没有比对基准，任何推进都是在猜。
+    if (!Number.isFinite(Number(row.after))) {
+      return { ok: false, reason: `操作日志缺少写入值（id=${row.id}），无法判定数据库现状` };
+    }
+  }
+  return { ok: true };
+}
+
+// 写盘 + 回读确认。rename 成功不等于文件内容是对的（杀毒/同步盘/磁盘满都可能
+// 让写入只落了一半），状态机的载体必须读回来验一遍才敢说成功。
+function persistJournalState(journalPath, journal, state, extra = {}, deps = {}) {
+  if (!journalPath) return { ok: true, persisted: false, state, stateUpdatedAt: Date.now(), journal };
+  const write = typeof deps.write === 'function' ? deps.write : writeJsonAtomic;
+  const next = { ...journal, ...extra, state, stateUpdatedAt: Date.now() };
+  try {
+    write(journalPath, next);
+  } catch (error) {
+    return { ok: false, persisted: false, state, error: `状态写盘失败（${state}）：${error.message}` };
+  }
+  let readBack;
+  try {
+    readBack = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  } catch (error) {
+    return { ok: false, persisted: false, state, error: `状态回读失败（${state}）：${error.message}` };
+  }
+  if (!readBack || readBack.state !== state) {
+    return {
+      ok: false, persisted: false, state,
+      error: `状态回读不一致（期望 ${state}，磁盘上是 ${readBack && readBack.state}）`,
+    };
+  }
+  return { ok: true, persisted: true, state, stateUpdatedAt: next.stateUpdatedAt, journal: readBack };
+}
+
 async function resumeDedupe(db, journal, options = {}) {
   const dryRun = options.dryRun !== false; // 默认只判定不动作，要动必须显式 dryRun:false
-  const report = { ok: true, state: String(journal && journal.state || 'UNKNOWN'), action: 'none', dryRun };
+  const log = typeof options.log === 'function' ? options.log : () => {};
+  const journalPath = String(options.journalPath || (journal && journal.path) || '');
+
+  // ① 格式与操作 ID：这两样不对，后面的数据库比对就没有意义。
+  const shape = validateJournalShape(journal);
+  if (!shape.ok) {
+    return { ok: false, dryRun, state: 'UNKNOWN', action: 'rejected', reason: shape.reason, journalPath: journalPath || null };
+  }
+  const report = {
+    ok: true, dryRun, state: String(journal.state || 'UNKNOWN'), action: 'none',
+    persisted: false, journalPath: journalPath || null,
+    identityUnknown: journal.version < 2 || !journal.rows.every((row) => row && row.identity),
+  };
+
+  // 带了路径就以磁盘那份为准：它才是崩溃后真实留下的记录。
+  let source = journal;
+  if (journalPath) {
+    let onDisk;
+    try {
+      onDisk = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    } catch (error) {
+      return { ...report, ok: false, action: 'rejected', reason: `无法读取操作日志 ${journalPath}: ${error.message}` };
+    }
+    const diskShape = validateJournalShape(onDisk);
+    if (!diskShape.ok) {
+      return { ...report, ok: false, action: 'rejected', reason: `磁盘上的操作日志不可用: ${diskShape.reason}` };
+    }
+    if (onDisk.opId && journal.opId && String(onDisk.opId) !== String(journal.opId)) {
+      return {
+        ...report, ok: false, action: 'rejected',
+        reason: `操作日志 ID 不一致（磁盘 ${onDisk.opId} / 传入 ${journal.opId}），拒绝恢复`,
+      };
+    }
+    source = onDisk;
+    report.state = String(onDisk.state || 'UNKNOWN');
+  }
+
   if (TERMINAL_STATES.has(report.state)) return { ...report, action: 'already-terminal' };
 
-  const verdict = await inspectJournalRows(db, journal);
+  const verdict = await inspectJournalRows(db, source);
   report.verdict = verdict;
 
-  if (verdict.state === 'ROLLED_BACK') {
-    if (!dryRun) { journal.state = 'ROLLED_BACK'; journal.stateUpdatedAt = Date.now(); }
-    return { ...report, action: 'mark-rolled-back', ok: true };
+  let nextState = '';
+  let action = 'none';
+  if (verdict.state === 'ROLLED_BACK') { nextState = 'ROLLED_BACK'; action = 'mark-rolled-back'; }
+  else if (verdict.state === 'DB_COMMITTED') { nextState = 'COMPLETED'; action = 'mark-completed'; }
+  else {
+    return {
+      ...report, ok: false, action: 'stop',
+      reason: verdict.reason || '数据库现状与日志不一致，无法自动判定',
+      hint: '检查 journal 里的 rows 与数据库 deleted_at；确认后再决定恢复备份还是按行补偿',
+    };
   }
-  if (verdict.state === 'DB_COMMITTED') {
-    // 库已经改了，只是日志没标完成 —— 这是可安全推进的中间态。
-    if (!dryRun) { journal.state = 'COMPLETED'; journal.stateUpdatedAt = Date.now(); }
-    return { ...report, action: 'mark-completed', ok: true };
+
+  if (dryRun) return { ...report, action, nextState };
+
+  // ② 只改日志状态，不重跑数据库写入（见函数头注释）。
+  const written = persistJournalState(journalPath, source, nextState, {}, { write: options.write });
+  if (!written.ok) {
+    log(`[dedupe] 恢复中止：${written.error}`);
+    return {
+      ...report, ok: false, action: 'persist-failed', nextState,
+      state: String(source.state || report.state), error: written.error, persisted: false,
+    };
   }
-  return {
-    ...report, ok: false, action: 'stop',
-    reason: verdict.reason || '数据库现状与日志不一致，无法自动判定',
-    hint: '检查 journal 里的 rows 与数据库 deleted_at；确认后再决定恢复备份还是按行补偿',
-  };
+  source.state = nextState;
+  source.stateUpdatedAt = written.stateUpdatedAt;
+  if (source !== journal) {
+    // 传入的对象也同步一份，避免调用方拿着旧状态继续用。
+    journal.state = nextState;
+    journal.stateUpdatedAt = written.stateUpdatedAt;
+  }
+  return { ...report, action, state: nextState, persisted: written.persisted, journal: source };
 }
 
 /**
@@ -983,6 +1090,8 @@ module.exports = {
   rollbackDedupe,
   inspectJournalRows,
   resumeDedupe,
+  persistJournalState,
+  validateJournalShape,
   JOURNAL_STATES,
   writeJsonAtomic,
   stamp,
