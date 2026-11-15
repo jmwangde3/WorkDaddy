@@ -202,6 +202,36 @@ jobs:
           }
           Write-Output "产物 $($files.Count) 个"
 
+      - name: 生成发布说明（未签名声明 + 校验方法）
+        shell: pwsh
+        run: |
+          $tag = '${{ needs.build.outputs.version }}'
+          $commit = '${{ needs.build.outputs.commit }}'
+          $sums = Get-Content -LiteralPath release\dist\SHA256SUMS.txt -Raw -Encoding UTF8
+          $lines = @(
+            "# WorkDaddy $tag",
+            "",
+            "## 下载前请先看",
+            "",
+            "- 本安装包**未进行 Authenticode 代码签名**。Windows SmartScreen 可能提示「未知发布者」，需要点「更多信息 → 仍要运行」才能继续。",
+            "- ``SHA256SUMS.txt`` 只能验证文件完整性，不能证明发布者身份。",
+            "- 校验方法：``sha256sum -c SHA256SUMS.txt``；Windows 可用 ``Get-FileHash <文件> -Algorithm SHA256`` 逐条比对。",
+            "",
+            "## 资产与哈希",
+            "",
+            '```',
+            $sums.Trim(),
+            '```',
+            "",
+            "构建提交：``$commit``",
+            "源码与打包脚本见同版本的 source 包；构建流程见仓库 ``.github/workflows/release.yml``。"
+          )
+          # 显式无 BOM：BOM 会变成 Release 正文的第一个字符。
+          $notesPath = Join-Path (Get-Location) 'release-notes.md'
+          [IO.File]::WriteAllText($notesPath, ($lines -join [Environment]::NewLine) + [Environment]::NewLine,
+            (New-Object System.Text.UTF8Encoding($false)))
+          Get-Content -LiteralPath $notesPath -Raw -Encoding UTF8
+
       - name: 创建 Release
         shell: pwsh
         env:
@@ -220,7 +250,7 @@ jobs:
             gh release upload $tag @files --repo $repo --clobber
             if ($LASTEXITCODE -ne 0) { throw "上传失败：$LASTEXITCODE" }
           } else {
-            gh release create $tag @files --repo $repo --title $tag --generate-notes --latest
+            gh release create $tag @files --repo $repo --title $tag --notes-file release-notes.md --latest
             if ($LASTEXITCODE -ne 0) { throw "创建 Release 失败：$LASTEXITCODE" }
           }
           Write-Output "Release: https://github.com/$repo/releases/tag/$tag"
