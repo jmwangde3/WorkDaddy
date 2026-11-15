@@ -390,6 +390,32 @@ function Get-WorkDaddyProcesses {
     }
 
     if ($unreadable.Count -gt 0) {
+        # 进程正在退出时，CIM 会先返回一条「CommandLine 与 ExecutablePath 都为空」的记录。
+        # 直接判定成「读不到身份」会让任何一次相邻的 node.exe 退出都拦下安装/更新
+        # （实测：连续两次跑全量测试都撞上，PID 每次不同；静置时 12 轮探测一次都没出现）。
+        # 所以先复读一次：进程已经没了就按「不在运行」处理，复读能读到就按正常规则判归属。
+        Start-Sleep -Milliseconds 200
+        $stillUnreadable = @()
+        foreach ($id in $unreadable) {
+            $again = $null
+            try { $again = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$id) -ErrorAction Stop } catch { }
+            if (-not $again) { continue }
+            $cmd2 = [string]$again.CommandLine
+            $exe2 = [string]$again.ExecutablePath
+            if ([string]::IsNullOrWhiteSpace($cmd2) -and [string]::IsNullOrWhiteSpace($exe2)) {
+                $stillUnreadable += $id
+                continue
+            }
+            $role2 = ''
+            if ($cmd2 -match $patWatch) { $role2 = 'watchdog' }
+            elseif ($cmd2 -match $patDaemon) { $role2 = 'daemon' }
+            elseif ($cmd2 -match $patTray -or $exe2 -match $patTray) { $role2 = 'tray' }
+            if ($role2) { $found += [pscustomobject]@{ pid = [int]$id; role = $role2 } }
+        }
+        $unreadable = @($stillUnreadable)
+    }
+
+    if ($unreadable.Count -gt 0) {
         $result.unreadable = $unreadable
         $result.error = ('有 ' + $unreadable.Count + ' 个同名进程读不到身份（PID=' + ($unreadable -join ',') +
             '）；无法确认它们是否属于本安装，为避免替换到运行中的程序，已中止')
