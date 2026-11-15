@@ -521,6 +521,11 @@ function main() {
       'StopWd 应先做归属校验');
     assert(/属于另一个安装/.test(cs), 'StopWd 应拒绝停止别的安装的服务');
     assert(/拒绝停止/.test(cs), 'StopWd 应在身份不明时拒绝');
+    assert(/dataDir 与本实例不一致/.test(cs), '状态文件的 dataDir 必须与当前绑定一致');
+    // 超时兜底不得退化成「按目录枚举 daemon.js」：CN 与 AI 可能共用一个 AppDir。
+    assert(/DaemonOwnershipProof/.test(cs), 'StopWd 必须有 daemon 归属证明入口');
+    assert(/\.daemon\.lock/.test(cs), '证明必须用到 daemon 自己写的 .daemon.lock');
+    assert(!/OwnedDaemonProcesses/.test(cs), '不得再按目录枚举 daemon.js 结束进程');
     const readme = fs.readFileSync(path.join(repo, 'README.md'), 'utf8');
     assert(/同一 ?Profile/.test(readme), 'README 必须写明同一 profile 单实例');
     assert(/可以同时运行/.test(readme), 'README 必须写明不同 profile 可以同时运行');

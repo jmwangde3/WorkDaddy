@@ -56,6 +56,11 @@ function start(ctx, extra) {
   return record;
 }
 
+// 托盘只探本测试的端口：默认候选 47832 那族是本机真实安装的端口。
+function stopTray(ctx) {
+  return fixture.runTray(ctx, ['--stop'], { WORKDADDY_TRAY_PORT: String(ctx.uiPort) });
+}
+
 async function waitRunning(ctx) {
   await fixture.waitFor(() => {
     const state = fixture.readStateFile(ctx);
@@ -129,7 +134,7 @@ async function main() {
     await waitRunning(b);
     const aDaemon = fixture.readStateFile(a).daemonPid;
     const bDaemon = fixture.readStateFile(b).daemonPid;
-    const stopA = fixture.runTray(a, ['--stop'], {});
+    const stopA = stopTray(a);
     assert(/stop = True/.test(stopA.cli), '停止 CN 应成功：' + stopA.cli);
     await fixture.waitFor(() => !fixture.alive(aDaemon), 15000, 'CN daemon 退出');
     const aiStatus = await fixture.statusOf(b.uiPort);
@@ -140,7 +145,7 @@ async function main() {
     start(a);
     await waitRunning(a);
     const newCN = fixture.readStateFile(a).daemonPid;
-    const stopB = fixture.runTray(b, ['--stop'], {});
+    const stopB = stopTray(b);
     assert(/stop = True/.test(stopB.cli), '停止 AI 应成功：' + stopB.cli);
     await fixture.waitFor(() => !fixture.alive(bDaemon), 15000, 'AI daemon 退出');
     const cnStatus = await fixture.statusOf(a.uiPort);
@@ -158,7 +163,7 @@ async function main() {
     // 把 B 的归属记录搬到 A 的数据目录：profile 一样，appDir 不一样
     const bState = fixture.readStateFile(b);
     fs.writeFileSync(path.join(a.dataDir, 'watchdog-state.json'), JSON.stringify(bState, null, 2));
-    const r = fixture.runTray(a, ['--stop'], {});
+    const r = stopTray(a);
     assert(/stop = False/.test(r.cli), '应拒绝停止：' + r.cli);
     assert(/属于另一个安装/.test(r.cli), '应说明归属不符：' + r.cli);
     assert(fixture.alive(bDaemon), 'B 的 daemon 必须还活着');
@@ -173,7 +178,7 @@ async function main() {
     const bystander = spawn(process.execPath, ['-e', 'setTimeout(()=>{},120000)'], { stdio: 'ignore', windowsHide: true });
     extraProcs.push(bystander.pid);
     await fixture.delay(300);
-    const r = fixture.runTray(a, ['--stop'], {});
+    const r = stopTray(a);
     assert(/stop = True/.test(r.cli), '停止应成功：' + r.cli);
     await fixture.delay(500);
     let alive = true;
