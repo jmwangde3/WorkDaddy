@@ -1,0 +1,320 @@
+'use strict';
+/**
+ * B 架构（不同 profile 并行、同 profile 单实例）的测试夹具。
+ *
+ * 每个 ctx = 一份「安装」：临时 app 目录里放的是**仓库里真正的** watchdog.js /
+ * profiles.js / ui-port.js / lifecycle-child.js，只把 daemon.js 换成替身，
+ * 因此测的是生产代码的锁、状态文件和 IPC 生命周期，而不是 mock 出来的结论。
+ *
+ * 替身 daemon 复用生产模块 lifecycle-child.js（IPC 断开即退出），行为可用环境变量调：
+ *   STUB_MODE=fail            启动即退出（码 7）
+ *   STUB_STARTUP_DELAY_MS     延迟 N ms 再监听端口（模拟「启动中被强杀」）
+ *   STUB_NO_LISTEN=1          完全不监听（模拟卡住不响应 shutdown 的 daemon）
+ *   STUB_EXIT_AFTER_MS        N ms 后自行退出（模拟 daemon 崩溃）
+ *
+ * 所有目录都在仓库 tmp/ 下；进程只按本测试记录的 PID 清理。
+ */
+const fs = require('fs');
+const http = require('http');
+const net = require('net');
+const path = require('path');
+const { spawn, spawnSync } = require('child_process');
+
+const repo = path.join(__dirname, '..', '..');
+const scriptsSrc = path.join(repo, 'scripts');
+const tmpBase = path.join(repo, 'tmp');
+
+const SHARED_FILES = ['watchdog.js', 'profiles.js', 'platform.js', 'workbuddy-target.js', 'ui-port.js', 'lifecycle-child.js'];
+
+const STUB_DAEMON = `'use strict';
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { installChildLifecycle } = require('./lifecycle-child.js');
+
+const outDir = path.resolve(__dirname, '..', '..', 'out');
+fs.mkdirSync(outDir, { recursive: true });
+const profile = process.env.WBSWITCH_PROFILE || '';
+const dataDir = process.env.WBSWITCH_DATA_DIR || '';
+const port = Number(process.env.WBSWITCH_PORT || 0);
+const mode = process.env.STUB_MODE || 'ok';
+const delay = Number(process.env.STUB_STARTUP_DELAY_MS || 0);
+const noListen = process.env.STUB_NO_LISTEN === '1';
+const exitAfter = Number(process.env.STUB_EXIT_AFTER_MS || 0);
+const record = (name, payload) => {
+  try { fs.writeFileSync(path.join(outDir, name), JSON.stringify(payload, null, 2)); } catch (_) {}
+};
+
+record('daemon-' + process.pid + '.json', {
+  pid: process.pid, ppid: process.ppid, profile, dataDir, port, mode,
+  startedAt: new Date().toISOString(),
+});
+
+const life = installChildLifecycle({
+  log: () => {},
+  onShutdown: () => {},
+  onState: (snapshot) => {
+    try { record('state-' + process.pid + '-' + snapshot.state + '.json', snapshot); } catch (_) {}
+    try {
+      if (process.send && process.connected) process.send({ type: 'state', state: snapshot.state, pid: process.pid, reason: snapshot.reason });
+    } catch (_) {}
+  },
+});
+
+process.on('exit', (code) => {
+  record('exit-' + process.pid + '.json', { pid: process.pid, code, at: new Date().toISOString(), lifecycle: life.snapshot() });
+});
+
+if (mode === 'fail') { process.exit(7); }
+if (exitAfter > 0) setTimeout(() => process.exit(0), exitAfter);
+
+const startListening = () => {
+  if (noListen) return;
+  const server = http.createServer((req, res) => {
+    const p = String(req.url || '').split('?')[0];
+    if (p === '/api/status') {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: true, version: 'stub', profile: { id: profile }, dataDir, appDir: path.resolve(__dirname, '..') }));
+      return;
+    }
+    res.statusCode = 404;
+    res.end('{}');
+  });
+  server.listen(port, '127.0.0.1', () => { record('listening-' + process.pid + '.json', { pid: process.pid, port }); life.markRunning(); });
+};
+
+if (delay > 0) setTimeout(startListening, delay); else startListening();
+setInterval(() => {}, 1000);
+`;
+
+let counter = 0;
+const created = [];
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function tmpRoot(tag) {
+  fs.mkdirSync(tmpBase, { recursive: true });
+  const dir = path.join(tmpBase, `bfx-${tag}-${process.pid}-${counter++}`);
+  fs.mkdirSync(dir, { recursive: true });
+  created.push(dir);
+  return dir;
+}
+
+function freePort() {
+  const r = spawnSync(process.execPath, ['-e',
+    "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{console.log(s.address().port);s.close()})",
+  ], { encoding: 'utf8', timeout: 10000 });
+  const port = Number(String(r.stdout || '').trim());
+  if (!port) throw new Error('无法分配空闲端口：' + (r.stderr || ''));
+  return port;
+}
+
+function makeInstall(options) {
+  const opts = options || {};
+  const profile = opts.profile || 'workbuddy-cn';
+  const root = tmpRoot(opts.tag || profile);
+  const appDir = path.join(root, 'app');
+  const scripts = path.join(appDir, 'scripts');
+  fs.mkdirSync(scripts, { recursive: true });
+  for (const name of SHARED_FILES) {
+    fs.copyFileSync(path.join(scriptsSrc, name), path.join(scripts, name));
+  }
+  fs.writeFileSync(path.join(scripts, 'daemon.js'), STUB_DAEMON, 'utf8');
+  const dataDir = path.join(root, 'data');
+  const outDir = path.join(root, 'out');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.mkdirSync(path.join(root, 'tmp'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'appdata'), { recursive: true });
+  return {
+    root,
+    appDir,
+    scripts,
+    dataDir,
+    outDir,
+    profile,
+    lockPort: opts.lockPort || freePort(),
+    uiPort: opts.uiPort || freePort(),
+    watchdogPid: 0,
+    daemonPids: [],
+  };
+}
+
+function baseEnv(ctx, extra) {
+  return Object.assign({}, process.env, {
+    WBSWITCH_PROFILE: ctx.profile,
+    WBSWITCH_DATA_DIR: ctx.dataDir,
+    WBSWITCH_PORT: String(ctx.uiPort),
+    WORKDADDY_LOCK_PORT: String(ctx.lockPort),
+    WORKDADDY_ORPHAN_WAIT_MS: '4000',
+    WORKDADDY_DAEMON_EXIT_WAIT_MS: '4000',
+    TEMP: path.join(ctx.root, 'tmp'),
+    TMP: path.join(ctx.root, 'tmp'),
+    APPDATA: path.join(ctx.root, 'appdata'),
+  }, extra || {});
+}
+
+function startWatchdog(ctx, extraEnv) {
+  // detached：与生产一致（托盘用 Process.Start 起 watchdog，托盘退出不带走服务），
+  // 同时让 watchdog 的生死只由本测试决定。非 detached 时，沙箱会在父进程退出后
+  // 连带杀死整棵子树，那样「daemon 是否自己退出」就永远测不出来。
+  const child = spawn(process.execPath, [path.join(ctx.scripts, 'watchdog.js')], {
+    env: baseEnv(ctx, extraEnv),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    detached: true,
+  });
+  ctx.watchdogPid = child.pid;
+  const record = { ctx, pid: child.pid, code: null, signal: null, out: '' };
+  child.stdout.on('data', (chunk) => { record.out += String(chunk); });
+  child.stderr.on('data', (chunk) => { record.out += String(chunk); });
+  child.on('exit', (code, signal) => { record.code = code; record.signal = signal; });
+  try { child.unref(); } catch (_) {}
+  return record;
+}
+
+function runTray(ctx, args, extraEnv) {
+  const trayExe = path.join(repo, 'tray', 'WorkDaddyTray.exe');
+  const cliFile = path.join(ctx.root, 'tmp', 'WorkDaddyTray-cli.txt');
+  try { fs.rmSync(cliFile, { force: true }); } catch (_) {}
+  const r = spawnSync(trayExe, args, {
+    encoding: 'utf8', timeout: 60000, windowsHide: true,
+    // WORKDADDY_SCRIPTS 决定托盘的 installRoot：--stop 的归属校验就是拿它比 appDir。
+    env: baseEnv(ctx, Object.assign({ WORKDADDY_SCRIPTS: path.join(ctx.appDir, 'scripts') }, extraEnv || {})),
+    cwd: ctx.root,
+  });
+  let cli = '';
+  for (let i = 0; i < 40 && !fs.existsSync(cliFile); i += 1) sleepSync(100);
+  if (fs.existsSync(cliFile)) {
+    for (let i = 0; i < 20; i += 1) {
+      try { cli = fs.readFileSync(cliFile, 'utf8'); break; } catch (_) { sleepSync(50); }
+    }
+  }
+  return { code: r.status, cli, stderr: r.stderr || '' };
+}
+
+function daemonRecords(ctx) {
+  try {
+    return fs.readdirSync(ctx.outDir)
+      .filter((f) => /^daemon-\d+\.json$/.test(f))
+      .map((f) => JSON.parse(fs.readFileSync(path.join(ctx.outDir, f), 'utf8')));
+  } catch (_) { return []; }
+}
+
+function daemonPids(ctx) {
+  return daemonRecords(ctx).map((r) => r.pid);
+}
+
+function readStateFile(ctx) {
+  try { return JSON.parse(fs.readFileSync(path.join(ctx.dataDir, 'watchdog-state.json'), 'utf8')); } catch (_) { return null; }
+}
+
+function readLog(ctx) {
+  try { return fs.readFileSync(path.join(ctx.dataDir, 'watchdog.log'), 'utf8'); } catch (_) { return ''; }
+}
+
+function alive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch (_) { return false; }
+}
+
+function listeningDaemonPids(ctx) {
+  return daemonPids(ctx).filter((pid) => alive(pid));
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor(fn, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await fn()) return true;
+    await delay(100);
+  }
+  throw new Error('等待超时：' + label);
+}
+
+async function waitExit(record, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (record.code !== null) return record.code;
+    await delay(100);
+  }
+  return null;
+}
+
+function statusOf(port) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+    let req;
+    try {
+      req = http.get({ host: '127.0.0.1', port, path: '/api/status', timeout: 500 }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => {
+          try { done(JSON.parse(body)); } catch (_) { done(null); }
+        });
+      });
+    } catch (_) { done(null); return; }
+    req.on('timeout', () => { try { req.destroy(); } catch (_) {} done(null); });
+    req.on('error', () => done(null));
+  });
+}
+
+function portFree(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    const done = (value) => { try { socket.destroy(); } catch (_) {} resolve(value); };
+    socket.setTimeout(300);
+    socket.once('connect', () => done(false));
+    socket.once('timeout', () => done(true));
+    socket.once('error', () => done(true));
+  });
+}
+
+function killPids(pids) {
+  for (const pid of pids) {
+    if (!pid) continue;
+    try { process.kill(pid); } catch (_) {}
+  }
+}
+
+function cleanup(records) {
+  for (const record of records || []) {
+    if (record && record.pid) { try { process.kill(record.pid); } catch (_) {} }
+  }
+  for (const ctx of collectContexts) {
+    killPids(daemonPids(ctx));
+    killPids([ctx.watchdogPid, ctx.extraPid]);
+  }
+}
+
+const collectContexts = [];
+
+module.exports = {
+  repo,
+  freePort,
+  makeInstall,
+  startWatchdog,
+  runTray,
+  daemonRecords,
+  daemonPids,
+  listeningDaemonPids,
+  readStateFile,
+  readLog,
+  alive,
+  waitFor,
+  waitExit,
+  delay,
+  statusOf,
+  portFree,
+  killPids,
+  cleanup,
+  track(ctx) { collectContexts.push(ctx); return ctx; },
+  tmpRoot,
+};
