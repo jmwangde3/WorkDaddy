@@ -227,8 +227,10 @@ jobs:
       - name: 打包（含 Setup 编译）
         shell: pwsh
         run: |
-          ./installer/build-package.ps1 -OutputDirectory tmp/dist -Setup -Json tmp/dist/report.json
-          Get-Content tmp/dist/report.json -Raw -Encoding UTF8
+          # 报告写到 dist 外面：dist 里只放要发的资产，检验脚本会把多余的
+          # 文件当成「混进来的东西」直接报错。
+          ./installer/build-package.ps1 -OutputDirectory tmp/dist -Setup -Json tmp/report.json
+          Get-Content tmp/report.json -Raw -Encoding UTF8
 
       - name: 真机安装 / 卸载 / 数据保留
         shell: pwsh
@@ -237,6 +239,17 @@ jobs:
           if (-not $setup) { throw '没有产出 setup.exe' }
           ./installer/setup/verify-setup.ps1 -SetupExe $setup.FullName -IAmOnAThrowawayMachine -Json tmp/setup-verify.json
           Get-Content tmp/setup-verify.json -Raw -Encoding UTF8
+
+      - name: 发布资产预演校验（只校验，不发布）
+        shell: pwsh
+        run: |
+          # 和 release.yml 用的是同一份校验逻辑：版本三方一致、三件套齐全、
+          # 体积合理、SHA256SUMS 全覆盖并逐条重算。这里跑通不代表已发布 ——
+          # 发布仍然只能在 tag 上由 release.yml 做。
+          node tools/verify-release-assets.js --dir tmp/dist --require-setup `
+            --report tmp/report.json --json tmp/release-assets.json
+          if ($LASTEXITCODE -ne 0) { throw "发布资产预演校验失败：$LASTEXITCODE" }
+          Get-Content tmp/release-assets.json -Raw -Encoding UTF8
 
       - name: 留档产物与验证报告
         if: always()
@@ -247,8 +260,9 @@ jobs:
             tmp/dist/*.exe
             tmp/dist/*.zip
             tmp/dist/SHA256SUMS.txt
-            tmp/dist/report.json
+            tmp/report.json
             tmp/setup-verify.json
+            tmp/release-assets.json
           if-no-files-found: warn
 
   supply-chain:

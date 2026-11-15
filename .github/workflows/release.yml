@@ -2,14 +2,24 @@ name: Release (tag → 正式资产)
 
 # 1.3.x 唯一的正式发布入口。
 #
-# 触发：推形如 `1.3.0` 的 tag（不带 v 前缀，沿用 1.2.x 惯例），或手动指定已有 tag。
-# 旧的 build-win.yml 已降级为手动 legacy 流程，不再挂 Release。
+# 触发：
+#   - 推形如 `1.3.1` 的 tag（不带 v 前缀，沿用 1.2.x 惯例）；
+#   - 手动指定已有 tag（workflow_dispatch）。
+# 旧的 build-win.yml 已降级为手动 legacy 流程，不再挂 Release，也不产出正式资产。
 #
-# 这里不重复实现打包逻辑 —— 只调用 installer/build-package.ps1，
-# 那套逻辑在 test.yml 的「打包产物内容检查」作业里已经被验证过。
-# 发布前额外守两道闸：
-#   1. tag 名必须等于 daemon.js 里的 DAEMON_VERSION（防止 tag 与程序版本脱节）；
-#   2. SHA256SUMS.txt 必须覆盖全部资产，且每条哈希当场重算一遍。
+# 手动触发有两个开关：
+#   build_only=true      只构建 + 校验 + 留档 Artifact，不创建/修改任何 Release —— 发布预演。
+#   allow_overwrite=true  允许覆盖已存在的 Release。默认拒绝，且默认不给 --clobber。
+#
+# 不重复实现打包逻辑：只调用 installer/build-package.ps1（同一套逻辑在 test.yml
+# 的「Setup 编译 / 静默安装 / 卸载保留数据」作业里每次 push 都会真跑一遍）。
+#
+# 发布前守五道闸：
+#   1. 检出的 HEAD 必须就是 tag 指向的提交（手动触发时 checkout 默认检出分支，会错版）；
+#   2. tag 名 = DAEMON_VERSION = package.json version（防止 tag 与程序脱节）；
+#   3. 三个资产齐全、文件名带版本、体积合理；
+#   4. SHA256SUMS 覆盖全部资产，且每条哈希当场重算一遍；
+#   5. Release 已存在就停（除非显式 allow_overwrite）。
 on:
   push:
     tags:
@@ -18,35 +28,73 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布的现有 tag（如 1.3.0）'
+        description: '要发布的现有 tag（如 1.3.1）'
         required: true
+      build_only:
+        description: '只构建校验，不发布'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      allow_overwrite:
+        description: '允许覆盖已存在的 Release'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
 
 permissions:
   contents: write
+
+# 同一个 tag 不允许两条流水线同时跑：并发上传会留下半套资产。
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  WD_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  WD_BUILD_ONLY: ${{ github.event.inputs.build_only || 'false' }}
+  WD_ALLOW_OVERWRITE: ${{ github.event.inputs.allow_overwrite || 'false' }}
 
 jobs:
   release:
     name: 构建资产并发布
     runs-on: windows-latest
     steps:
-      - name: Checkout
+      - name: Checkout（检出 tag 指向的提交）
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 手动触发时 github.ref 是分支，必须显式换成 tag，否则打出来的包是分支头。
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
 
-      - name: 确定版本号并校验与程序一致
+      - name: 校验 tag 存在且与检出 HEAD 一致
+        shell: pwsh
+        run: |
+          $tag = $env:WD_TAG
+          if (-not $tag) { throw '拿不到 tag 名' }
+          if ($tag -match '^v') { throw "tag 不应带 v 前缀（本项目惯例是 1.3.1 这种形式）：$tag" }
+          git fetch --tags --force origin 2>$null | Out-Null
+          $tagCommit = ((& git rev-list -n 1 "refs/tags/$tag") 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $tagCommit) { throw "tag 不存在或不是提交：$tag" }
+          $head = ((& git rev-parse HEAD) 2>&1 | Out-String).Trim()
+          if ($head -ne $tagCommit) {
+            throw "检出的 HEAD 不是 tag 指向的提交：HEAD=$head tag=$tagCommit。发布必须严格对应 tag。"
+          }
+          Write-Output "tag=$tag commit=$head"
+          Write-Output "mode=$(if ($env:WD_BUILD_ONLY -eq 'true') { 'build-only' } else { 'publish' })"
+
+      - name: 版本一致性（tag = DAEMON_VERSION = package.json）
         id: ver
         shell: pwsh
         run: |
-          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ github.event.inputs.tag }}' } else { '${{ github.ref_name }}' }
-          if (-not $tag) { throw '拿不到 tag 名' }
-          if ($tag -match '^v') { throw "tag 不应带 v 前缀（本项目惯例是 1.3.0 这种形式）：$tag" }
+          $tag = $env:WD_TAG
           $m = Select-String -Path scripts\daemon.js -Pattern "const DAEMON_VERSION = '([^']+)'" | Select-Object -First 1
           if (-not $m) { throw '在 scripts/daemon.js 里找不到 DAEMON_VERSION' }
-          $ver = $m.Matches[0].Groups[1].Value
-          if ($tag -ne $ver) { throw "tag 与程序版本不一致：tag=$tag daemon=$ver。先改 DAEMON_VERSION 再打 tag。" }
+          $daemon = $m.Matches[0].Groups[1].Value
+          $pkg = Get-Content -LiteralPath package.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($daemon -ne $tag) { throw "tag 与 DAEMON_VERSION 不一致：tag=$tag daemon=$daemon" }
+          if ($pkg.version -ne $tag) { throw "tag 与 package.json 版本不一致：tag=$tag package=$($pkg.version)" }
           Write-Output "version=$tag" >> $env:GITHUB_OUTPUT
-          Write-Output "版本: $tag （与 daemon.js 一致）"
+          Write-Output "版本三方一致：$tag"
 
       - name: 安装 Inno Setup
         shell: pwsh
@@ -59,58 +107,42 @@ jobs:
         run: |
           $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
           if (-not (Test-Path -LiteralPath $iscc)) { throw "找不到 ISCC.exe：$iscc" }
+          # 每次从空目录开始：混进上一次的产物就等于发布来源不明的东西。
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'release\dist'
+          if (Test-Path -LiteralPath $dist) { Remove-Item -LiteralPath $dist -Recurse -Force }
           powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File .\installer\build-package.ps1 `
             -Version '${{ steps.ver.outputs.version }}' -Setup -IsccPath $iscc `
             -Json (Join-Path $env:GITHUB_WORKSPACE 'release-report.json')
           if ($LASTEXITCODE -ne 0) { throw "打包失败：$LASTEXITCODE" }
 
-      - name: 校验资产清单完整且哈希可复现
+      - name: 校验资产（版本、齐全、体积、SHA256）
         shell: pwsh
         run: |
-          $dist = 'release\dist'
-          $sumsPath = Join-Path $dist 'SHA256SUMS.txt'
-          if (-not (Test-Path -LiteralPath $sumsPath)) { throw '没有 SHA256SUMS.txt' }
-          $lines = @(Get-Content -LiteralPath $sumsPath -Encoding UTF8 | Where-Object { $_.Trim() })
-          if (-not $lines.Count) { throw 'SHA256SUMS.txt 是空的' }
-
-          $listed = @()
-          foreach ($line in $lines) {
-            # 标准 sha256sum 格式："<64位hex>  <文件名>"
-            $parts = $line -split '\s+', 2
-            if ($parts.Count -ne 2) { throw "SHA256SUMS 行格式不对：$line" }
-            $expect = $parts[0].Trim().ToLowerInvariant()
-            $name = $parts[1].Trim()
-            $listed += $name
-            $p = Join-Path $dist $name
-            if (-not (Test-Path -LiteralPath $p)) { throw "SHA256SUMS 列了不存在的文件：$name" }
-            $actual = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actual -ne $expect) { throw "哈希不符：$name（清单 $expect / 实算 $actual）" }
-            Write-Output "  ✓ $name"
-          }
-
-          # 反向检查：目录里的资产必须都被清单覆盖，否则「校验和」形同虚设
-          $assets = @(Get-ChildItem -LiteralPath $dist -File |
-            Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object Name)
-          $missing = @($assets | Where-Object { $listed -notcontains $_ })
-          if ($missing.Count) { throw "这些资产没被 SHA256SUMS 覆盖：$($missing -join ', ')" }
-          Write-Output "资产 $($assets.Count) 个，清单覆盖 $($listed.Count) 条，逐条哈希一致"
+          node tools/verify-release-assets.js --dir release\dist --version $env:WD_TAG `
+            --require-setup --report release-report.json --json release-assets.json
+          if ($LASTEXITCODE -ne 0) { throw "资产校验失败：$LASTEXITCODE" }
 
       - name: 列出产物
         shell: pwsh
         run: Get-ChildItem -LiteralPath release\dist -File | Select-Object Name, Length | Format-Table -AutoSize
 
-      - name: 创建或更新 Release
+      - name: 创建 Release
+        if: ${{ env.WD_BUILD_ONLY != 'true' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = '${{ steps.ver.outputs.version }}'
+          $tag = $env:WD_TAG
           $repo = '${{ github.repository }}'
           $files = @(Get-ChildItem -LiteralPath release\dist -File | ForEach-Object FullName)
+
           $existing = gh release view $tag --repo $repo --json tagName 2>$null
           if ($LASTEXITCODE -eq 0 -and $existing) {
-            Write-Output "Release $tag 已存在，改为覆盖上传"
+            if ($env:WD_ALLOW_OVERWRITE -ne 'true') {
+              throw "Release $tag 已存在。默认拒绝覆盖：重复发布会让已发出去的资产换掉内容。确认要覆盖请用 workflow_dispatch 并显式把 allow_overwrite 设为 true。"
+            }
+            Write-Output "Release $tag 已存在，按显式授权覆盖上传"
             gh release upload $tag @files --repo $repo --clobber
             if ($LASTEXITCODE -ne 0) { throw "上传失败：$LASTEXITCODE" }
           } else {
@@ -119,11 +151,18 @@ jobs:
           }
           Write-Output "Release: https://github.com/$repo/releases/tag/$tag"
 
+      - name: 发布预演结束（未创建 Release）
+        if: ${{ env.WD_BUILD_ONLY == 'true' }}
+        shell: pwsh
+        run: |
+          Write-Output "build-only：本次只构建并校验，没有创建 tag，也没有创建/修改 Release。"
+          Write-Output "资产清单见 Artifact release-$env:WD_TAG。"
+
       - name: 留档报告与产物
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ steps.ver.outputs.version }}
+          name: release-${{ env.WD_TAG }}
           path: |
             release/dist/*
             release-report.json
