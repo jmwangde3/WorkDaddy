@@ -84,7 +84,12 @@ function verify(opts) {
         if (report.ok !== true) fail('打包报告 ok != true');
         if (version && report.version !== version) fail(`打包报告版本 ${report.version} 与期望 ${version} 不一致`);
         if (opts.requireSetup && report.setup !== 'built') fail(`Setup 没有编译成功：${report.setup}`);
-        if (report.dirty) fail('打包时工作区不干净：发布资产必须来自干净提交');
+        if (report.dirty) {
+          const detail = Array.isArray(report.dirtyPaths) && report.dirtyPaths.length
+            ? `（${report.dirtyPaths.slice(0, 5).join(' | ')}）`
+            : '';
+          fail(`打包时工作区不干净${detail}：发布资产必须来自干净提交`);
+        }
       }
     }
   }

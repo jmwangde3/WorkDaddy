@@ -121,16 +121,26 @@ try {
 $sourceZip = Join-Path $OutputDirectory ('WorkDaddy-' + $Version + '-source.zip')
 $commit = ''
 $dirty = $false
+$statusLines = @()
+$statusCode = 0
 try {
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $commit = ((& git -C $repoRoot rev-parse HEAD) 2>&1 | Out-String).Trim()
-    $status = ((& git -C $repoRoot status --porcelain) 2>&1 | Out-String).Trim()
+    $commit = ((& git -C $repoRoot rev-parse HEAD 2>$null) | Out-String).Trim()
+    # stderr 必须单独丢弃：GitHub runner 上 git 可能往 stderr 写 safe.directory /
+    # 目录权限之类的提示，用 2>&1 合并进来就会被当成「有未提交改动」，
+    # 于是发布闸门在干净的 checkout 上也会红。
+    $statusText = ((& git -C $repoRoot status --porcelain 2>$null) | Out-String).Trim()
+    $statusCode = $LASTEXITCODE
     $ErrorActionPreference = $prevEap
-    $dirty = [bool]$status
+    $dirty = [bool]$statusText
+    if ($statusText) { $statusLines = @($statusText -split "`r?`n" | Where-Object { $_ } | Select-Object -First 20) }
 } catch { $dirty = $false }
 $report.sourceCommit = $commit
 $report.dirty = $dirty
+$report['dirtyPaths'] = $statusLines
+$report['gitStatusExitCode'] = $statusCode
+if ($statusCode -ne 0) { $report.warnings += ('无法确认工作区状态（git status 退出码 ' + $statusCode + '）') }
 if ($dirty) { $report.warnings += '工作区有未提交改动：源码包内容来自最后一次提交，不包含这些改动' }
 
 if (Test-Path -LiteralPath $sourceZip) { Remove-Item -LiteralPath $sourceZip -Force }
