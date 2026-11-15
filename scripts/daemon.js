@@ -199,7 +199,7 @@ const {
   telemetryEnvironmentOverride,
 } = require('./sentry-report.js');
 const { createUsageReporter } = require('./usage-report.js');
-const { getProfile, profileDataDir, listInstalledModelSources, sharedDataDir } = require('./profiles.js');
+const { getProfile, profileDataDir, listInstalledModelSources, sharedDataDir, isFullWindowsPath, isCodeBuddyBinary } = require('./profiles.js');
 const plat = require('./platform.js');
 const { readWorkBuddyTarget } = require('./workbuddy-target.js');
 const { BINDING, createRendererApiBridge, rendererBridgeSource } = require('./renderer-api-bridge.js');
@@ -756,6 +756,12 @@ const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
 const IS_LINUX = process.platform === 'linux';
+// 数据目录必须是完整绝对路径。Windows 上 "C:foo" / "\foo" / "relative" 都会被
+// path.join 接受，然后 daemon 就写到「当前盘符工作目录」里去了 —— 用户看不到，
+// 备份/账号也跟着分裂。入口（托盘、watchdog、安装器）已经拦了，这里再兜一次底。
+if (IS_WIN && process.env.WBSWITCH_DATA_DIR && !isFullWindowsPath(process.env.WBSWITCH_DATA_DIR)) {
+  throw new Error('WBSWITCH_DATA_DIR 不是完整的绝对路径：' + process.env.WBSWITCH_DATA_DIR);
+}
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
 const WORKDADDY_INSTALL_NAME = PROFILE.appName || (PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy AI' : 'WorkDaddy');
 const sessionExportJobs = createSessionExportJobs({
@@ -3259,20 +3265,31 @@ function queryWindowsWorkBuddyProcessEnumeration() {
 function resolveWorkBuddyBinary() {
   if (!IS_WIN) return WORKBUDDY_BINARY;
   if (wbBinaryCache) return wbBinaryCache;
+  const isCodeBuddyProfile = PROFILE.kind === 'codebuddy';
   const tryFile = (p) => {
     try {
       const candidate = String(p || '').trim().replace(/^"(.*)"(?:,\d+)?$/, '$1').replace(/,\d+$/, '');
       if (!candidate || !fs.existsSync(candidate)) return null;
       const resolved = resolveWindowsExecutable(candidate);
       const name = path.win32.basename(resolved).toLowerCase();
-      return PROFILE_BINARY_NAMES.has(name) ? resolved : null;
+      if (!PROFILE_BINARY_NAMES.has(name)) return null;
+      // CodeBuddy CN 与国际版可能共用 CodeBuddy.exe（老版本 CN 就是这个名字），
+      // 文件名本身证明不了身份。必须读安装目录里的 resources/app/product.json：
+      //   CN  → applicationName = buddycn
+      //   国际 → applicationName = buddy
+      // 证明不了就当作「不是我的」：认错会去结束/接管另一个客户端的进程。
+      if (isCodeBuddyProfile && !isCodeBuddyBinary(resolved, PROFILE.id)) return null;
+      return resolved;
     } catch (_) {
       return null;
     }
   };
   const { execFileSync } = require('child_process');
   const psCmd = (cmd) => execFileSync('powershell', ['-NoProfile', '-Command', cmd], { encoding: 'utf8', timeout: 8000, windowsHide: true });
-  const runningBin = selectRunningProfileBinary(PROFILE_BINARY_NAMES, queryWindowsWorkBuddyProcesses());
+  const runningBin = selectRunningProfileBinary(PROFILE_BINARY_NAMES, queryWindowsWorkBuddyProcesses(),
+    fs.realpathSync.native,
+    // 运行进程同样要过身份校验：CN 的进程列表里会同时出现国际版的 CodeBuddy.exe
+    (bin) => !isCodeBuddyProfile || isCodeBuddyBinary(bin, PROFILE.id));
   const configuredTarget = readWorkBuddyTarget({ dataDir: DATA_DIR, profileId: PROFILE.id });
   const configuredBin = tryFile(configuredTarget.binary);
   if (configuredTarget.configured && !configuredBin) {

@@ -435,7 +435,9 @@ test('Windows launcher keeps local port probing and profile CDP candidates defin
   assert.match(launcher, /function daemonRunning\(\)\s*\{\s*return portOpen\(UI_PORT\);/);
   assert.match(launcher, /'workbuddy-cn': \[9222/);
   assert.match(launcher, /'workbuddy-ai': \[9223/);
-  assert.match(launcher, /isTargetForProfile\(target, PROFILE\)/);
+  // 诊断必须与 daemon 用同一套判据：调用时带上安装目录证据（第二个参数之后），
+  // 只认 (target, PROFILE) 两个参数会把「实际能连、诊断说不是」重新引回来。
+  assert.match(launcher, /isTargetForProfile\(target, PROFILE[,)]/);
 });
 
 test('Windows launcher has an OS-assigned CDP fallback when profile ports are unavailable', async () => {

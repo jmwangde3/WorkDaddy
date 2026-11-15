@@ -116,8 +116,27 @@ const PROFILES = {
   },
 };
 
-function applyWorkBuddyTarget(profile, target) {
-  if (!target || !target.configured || !target.binary) return profile;
+// 四个合法 profile 的权威列表。托盘（C#）与安装器（PowerShell）各有一份同样的
+// 白名单 —— 跨语言没法共享常量，改这里就要同步改那两处，test/profile-whitelist
+// 会用三条实现互相校验。
+const PROFILE_IDS = Object.freeze(Object.keys(PROFILES));
+
+function isValidProfileId(id) {
+  return PROFILE_IDS.includes(String(id == null ? '' : id).trim().toLowerCase());
+}
+
+// Windows 完整绝对路径。Path.isAbsolute / path.isAbsolute 对 "C:foo" 也返回 true，
+// 但它相对当前盘符的工作目录；这种值当数据目录传给守护进程会写到不可预期的位置。
+function isFullWindowsPath(value) {
+  const v = String(value == null ? '' : value).trim();
+  if (!v) return false;
+  if (/^[A-Za-z]:(?![\\/])/.test(v)) return false;   // C:relative
+  if (/^[\\/](?![\\/])/.test(v)) return false;       // \relative
+  if (/^\\\\[^\\/]+[\\/][^\\/]+/.test(v)) return true; // \\server\share
+  return /^[A-Za-z]:[\\/]/.test(v);
+}
+
+function applyWorkBuddyTarget(profile, target) {  if (!target || !target.configured || !target.binary) return profile;
   if (target.clientType === 'official') {
     return {
       ...profile,
@@ -194,4 +213,4 @@ function profileDataDir(profile, configured) {
   return path.join(sharedDataDir(), 'profiles', profile.id);
 }
 
-module.exports = { isCodeBuddyBinary, PROFILES, applyWorkBuddyTarget, getProfile, listProfiles, listInstalledModelSources, profileDataDir, sharedDataDir };
+module.exports = { isCodeBuddyBinary, PROFILES, PROFILE_IDS, isValidProfileId, isFullWindowsPath, applyWorkBuddyTarget, getProfile, listProfiles, listInstalledModelSources, profileDataDir, sharedDataDir };

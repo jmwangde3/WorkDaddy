@@ -75,6 +75,26 @@ test('路径证据：大小写与斜杠形态不影响判定', () => {
   assert.equal(fileTargetInsideDir('file:///H:/Program Files/WorkBuddyX/resources/app.asar/i.html', ROOT_ON_H), false);
 });
 
+test('强身份信号优先：路径证据不能覆盖明确的兄弟 profile', () => {
+  const INTL = PROFILES['codebuddy-intl'];
+  // 证据目录取成了父目录（安装根解析异常、共用父目录）时，旧实现会把它当成
+  // 「我自己的安装目录」，于是兄弟客户端的页面也被认领 —— 接着就会去清理对方
+  // 注入好的组件。顺序必须是：先看强身份信号，明确属于别人就立刻拒绝。
+  const cbPage = { type: 'page', url: 'file:///Applications/CodeBuddy.app/Contents/Resources/app.asar/renderer/agentManager.html', title: 'CodeBuddy' };
+  const aiPage = { type: 'page', url: 'file:///Applications/WorkBuddy%20AI.app/Contents/Resources/app.asar/renderer/index.html', title: 'WorkBuddy' };
+  const cnPage = { type: 'page', url: 'file:///Applications/WorkBuddy.app/Contents/Resources/app.asar/renderer/index.html', title: 'WorkBuddy' };
+  withoutBoundProfile(() => {
+    assert.equal(isTargetForProfile(cbPage, CN, { installRoot: '/Applications' }), false,
+      'CodeBuddy 的页面不能被 CN 认领');
+    assert.equal(isTargetForProfile(aiPage, CN, { installRoot: '/Applications' }), false,
+      'AI 的页面不能被 CN 认领');
+    assert.equal(isTargetForProfile(cnPage, CN, { installRoot: '/Applications' }), true,
+      '自己的页面仍要认领（不能因为收紧顺序而误拒）');
+    assert.equal(isTargetForProfile(cbPage, INTL, { installRoot: '/Applications' }), true,
+      'CodeBuddy 的页面应归国际版');
+  });
+});
+
 test('权限探测：第一条成功即返回，不重复探测', () => {
   let secondCalled = false;
   const result = resolveWindowsPrivilege([

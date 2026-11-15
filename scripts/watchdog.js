@@ -12,11 +12,37 @@ const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const { spawn } = require('child_process');
-const { getProfile, profileDataDir } = require('./profiles.js');
+const { getProfile, profileDataDir, isValidProfileId, isFullWindowsPath } = require('./profiles.js');
 
-const PROFILE_ID = process.env.WBSWITCH_PROFILE || 'workbuddy-cn';
-const PROFILE = getProfile(PROFILE_ID);
-const DATA_DIR = process.env.WBSWITCH_DATA_DIR || profileDataDir(PROFILE);
+// 启动前的硬校验：watchdog 是「托盘 / 快捷方式 → 后台服务」这条链的最后一环，
+// 走到这里还带着非法 profile 或相对数据目录，就说明上游传错了。宁可这里退出并
+// 写清楚原因，也不能让 daemon 落到默认 profile 或某个相对路径下去写用户数据。
+function failFast(message) {
+  const line = `[${new Date().toISOString()}] ${message}\n`;
+  try { process.stderr.write(line); } catch (_) {}
+  process.exit(2);
+}
+
+const RAW_PROFILE = String(process.env.WBSWITCH_PROFILE || '').trim();
+if (RAW_PROFILE && !isValidProfileId(RAW_PROFILE)) {
+  failFast(`WBSWITCH_PROFILE 非法：${RAW_PROFILE}（只接受 workbuddy-cn / workbuddy-ai / codebuddy-cn / codebuddy-intl）`);
+}
+const RAW_DATA_DIR = String(process.env.WBSWITCH_DATA_DIR || '').trim();
+if (RAW_DATA_DIR) {
+  // Windows 判完整绝对路径（C:foo / \foo 都算相对）；POSIX 用 path.isAbsolute
+  const ok = process.platform === 'win32'
+    ? isFullWindowsPath(RAW_DATA_DIR)
+    : path.isAbsolute(RAW_DATA_DIR);
+  if (!ok) failFast(`WBSWITCH_DATA_DIR 不是完整的绝对路径：${RAW_DATA_DIR}`);
+}
+
+let PROFILE;
+try {
+  PROFILE = getProfile(RAW_PROFILE || 'workbuddy-cn');
+} catch (error) {
+  failFast(error && error.message ? error.message : String(error));
+}
+const DATA_DIR = RAW_DATA_DIR || profileDataDir(PROFILE);
 const PID_FILE = path.join(DATA_DIR, 'watchdog.pid');
 const LOG_FILE = path.join(DATA_DIR, 'watchdog.log');
 const DAEMON_FILE = path.join(__dirname, 'daemon.js');

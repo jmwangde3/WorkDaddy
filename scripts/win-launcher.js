@@ -372,7 +372,11 @@ async function isWorkBuddyCdpAt(port, binary = null) {
   } catch (_) {
     return false;
   }
-  if (Array.isArray(list) && list.some((target) => isTargetForProfile(target, PROFILE))) return true;
+  // 归属判定必须与 daemon 用同一套证据：只看 URL/标题会漏掉「安装目录可证明、
+  // 但没有强信号」的通用 Windows 安装路径，诊断就会一直显示 profileTarget=false，
+  // 而 daemon 实际上能连上 —— 两边判据不一致等于没有诊断。
+  const evidence = binary ? { installRoot: path.win32.dirname(binary) } : {};
+  if (Array.isArray(list) && list.some((target) => isTargetForProfile(target, PROFILE, evidence))) return true;
   // 某些版本隐藏页面强信号；只有同安装目录进程的精确参数带着该端口时才允许兜底。
   // CIM 查询错误由共享边界直接抛出，不能伪装成“没有目标进程”。
   return Boolean(binary && workBuddyProcesses(binary).some((p) => processCdpPort(p) === Number(port)));
@@ -646,7 +650,9 @@ function findWorkBuddy() {
   };
   const runningBin = selectRunningProfileBinary(
     [...PROFILE_BINARY_NAMES],
-    getWorkBuddyProcesses().filter((process) => !isPrewarmProcess(process))
+    getWorkBuddyProcesses().filter((process) => !isPrewarmProcess(process)),
+    fs.realpathSync.native,
+    (bin) => PROFILE.kind !== 'codebuddy' || isCodeBuddyBinary(bin, PROFILE.id)
   );
   const envBin = tryFile(process.env.WBSWITCH_WORKBUDDY_BIN);
   if (process.env.WBSWITCH_WORKBUDDY_BIN && !envBin) {
@@ -1577,6 +1583,12 @@ async function nativeDaemonDiagnostics() {
 }
 
 async function nativeCdpDiagnostics() {
+  // 与 daemon / isWorkBuddyCdpAt 共用同一份路径证据，避免「实际能连、诊断说不是」。
+  let evidence = {};
+  try {
+    const binary = wbBinaryCache || findWorkBuddy();
+    if (binary) evidence = { installRoot: path.win32.dirname(binary) };
+  } catch (_) { evidence = {}; }
   const ports = await Promise.all(cdpPortCandidates().map(async (port) => {
     const [version, targets] = await Promise.all([httpGet(port, '/json/version'), httpGet(port, '/json/list')]);
     let targetCount = null;
@@ -1586,7 +1598,7 @@ async function nativeCdpDiagnostics() {
         const rows = JSON.parse(targets.body || '[]');
         if (Array.isArray(rows)) {
           targetCount = rows.length;
-          profileTarget = rows.some((target) => isTargetForProfile(target, PROFILE));
+          profileTarget = rows.some((target) => isTargetForProfile(target, PROFILE, evidence));
         }
       } catch (_) {}
     }

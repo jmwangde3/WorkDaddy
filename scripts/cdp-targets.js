@@ -183,6 +183,12 @@ function isTargetForProfile(target, profile, evidence = {}) {
     return signals.some((signal) => lower.includes(signal));
   }
 
+  // 强身份信号优先。顺序不能反：路径证据只能回答「页面来自我自己的安装目录」，
+  // 回答不了「这个页面到底是哪个客户端」。当 URL/域名已经明确指向别的 profile 时，
+  // 安装目录证据必须让位 —— 否则一个被共用/复制过的目录就能让 daemon 认领
+  // 兄弟客户端的页面，进而把对方注入好的组件清理掉。
+  if (cls) return cls === profile.id;
+
   // 页面来自本 profile 已验证的客户端安装目录 → 归属成立。这是路径证据，与 Linux
   // 的 targetsBelongToProfile 走同一条链：
   //   - 不依赖 WBSWITCH_PROFILE：托盘 / 桌面快捷方式启动的 daemon 环境里没有这个
@@ -190,8 +196,6 @@ function isTargetForProfile(target, profile, evidence = {}) {
   //   - 也不放松隔离：目录取自本 profile 自己的可执行文件（运行进程 / 显式配置 /
   //     唯一磁盘候选），兄弟 profile 的安装目录不同，互相不匹配。
   if (fileTargetInsideDir(url, evidence.installRoot)) return true;
-
-  if (cls) return cls === profile.id;
 
   // CodeBuddy：Editor 模式的 target URL 通常是 vscode-file://，不包含产品名；
   // profile 已由启动器绑定到独立 CDP 端口，因此选第一个普通页面即可覆盖 Agents/Editor。

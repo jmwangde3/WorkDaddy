@@ -40,7 +40,9 @@ function buildTranslator() {
 }
 
 // ---- 白名单：这些是 console 日志 / 断句残留（运行时被整句模板覆盖）/ 内部模块，不属 UI 文案 ----
-const LOG_LIKE = /^(WorkBuddy 兼容层未加载|\[WBS\]|注入组件已销毁|收到 SIGTERM|当前 Node 运行时没有 WebSocket|daemon 使用临时目录锁|picker-internal\.js 注入锚点不存在)|^\[[a-z][^\]]*\]/;
+// WBSWITCH_* 开头的是启动期配置错误：daemon 在模块加载阶段直接 throw，只写进启动日志，
+// 不是面板文案，也没有对应的界面位置可以翻译。
+const LOG_LIKE = /^(WorkBuddy 兼容层未加载|\[WBS\]|注入组件已销毁|收到 SIGTERM|当前 Node 运行时没有 WebSocket|daemon 使用临时目录锁|picker-internal\.js 注入锚点不存在)|^WBSWITCH_[A-Z_]+\s|^\[[a-z][^\]]*\]/;
 const FRAGMENT_LIKE = /^[」「，、。；：]|^已发送「|^已登录「|的自动继续|项）|」的备份|」的本地备份|」，请刷新|已发送「|已登录「|^\s*(个|条)$|^快捷短语吗|^这条$/;
 
 // 还原运行时真实文本：字面量常内嵌 HTML 标签/属性，运行时按文本节点拆分后翻译，
