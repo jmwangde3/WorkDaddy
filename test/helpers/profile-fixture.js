@@ -30,60 +30,125 @@ const STUB_DAEMON = `'use strict';
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const { installChildLifecycle } = require('./lifecycle-child.js');
 
-const outDir = path.resolve(__dirname, '..', '..', 'out');
+const outDir = process.env.STUB_OUT_DIR || path.resolve(__dirname, '..', '..', 'out');
 fs.mkdirSync(outDir, { recursive: true });
 const profile = process.env.WBSWITCH_PROFILE || '';
 const dataDir = process.env.WBSWITCH_DATA_DIR || '';
 const port = Number(process.env.WBSWITCH_PORT || 0);
 const mode = process.env.STUB_MODE || 'ok';
 const delay = Number(process.env.STUB_STARTUP_DELAY_MS || 0);
-const noListen = process.env.STUB_NO_LISTEN === '1';
 const exitAfter = Number(process.env.STUB_EXIT_AFTER_MS || 0);
+const shutdownDelay = Number(process.env.STUB_SHUTDOWN_DELAY_MS || 0);
+const ignoreShutdown = process.env.STUB_IGNORE_SHUTDOWN === '1';
+const grandchild = process.env.STUB_GRANDCHILD === '1';
+const surviveKill = process.env.STUB_SURVIVE_KILL === '1';
+const noListen = process.env.STUB_NO_LISTEN === '1';
+const lockFile = path.join(dataDir, '.daemon.lock');
 const record = (name, payload) => {
   try { fs.writeFileSync(path.join(outDir, name), JSON.stringify(payload, null, 2)); } catch (_) {}
 };
 
 record('daemon-' + process.pid + '.json', {
-  pid: process.pid, ppid: process.ppid, profile, dataDir, port, mode,
+  pid: process.pid, ppid: process.ppid, profile, dataDir, port, mode, grandchild,
   startedAt: new Date().toISOString(),
 });
 
-const life = installChildLifecycle({
-  log: () => {},
-  onShutdown: () => {},
-  onState: (snapshot) => {
-    try { record('state-' + process.pid + '-' + snapshot.state + '.json', snapshot); } catch (_) {}
-    try {
-      if (process.send && process.connected) process.send({ type: 'state', state: snapshot.state, pid: process.pid, reason: snapshot.reason });
-    } catch (_) {}
-  },
-});
+// 生产 daemon 在数据目录写的单实例锁：托盘 StopWd 靠它证明「这个 pid 就是本目录
+// 的那个 daemon」。替身必须照做，否则「有归属证明才允许强杀」这条规则测不出来。
+if (!grandchild) {
+  try { fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), version: 'stub' })); } catch (_) {}
+}
+const releaseLock = () => {
+  try {
+    const owner = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+    if (Number(owner.pid) === process.pid) fs.unlinkSync(lockFile);
+  } catch (_) {}
+};
+
+// STUB_IGNORE_SHUTDOWN：模拟「不响应 shutdown / IPC 断开」的 daemon（旧版没有 IPC
+// 托管时就是这样）。只吞掉停止信号，RUNNING 状态照常上报 —— 否则 watchdog 永远
+// 不知道它起来了，测的就不是「停不下来」而是「起不来」。
+const life = ignoreShutdown
+  ? {
+      managed: false,
+      markRunning() {
+        record('state-' + process.pid + '-RUNNING.json', { managed: false, state: 'RUNNING', pid: process.pid });
+        try { if (process.send && process.connected) process.send({ type: 'state', state: 'RUNNING', pid: process.pid, reason: '' }); } catch (_) {}
+      },
+      stop() {},
+      snapshot() { return { managed: false, state: 'RUNNING', pid: process.pid }; },
+    }
+  : installChildLifecycle({
+      log: () => {},
+      onShutdown: () => {
+        releaseLock();
+        // 模拟「清理需要时间」：异步 onShutdown 必须被等到，否则 50ms 就会被截断。
+        return shutdownDelay > 0 ? new Promise((resolve) => setTimeout(resolve, shutdownDelay)) : undefined;
+      },
+      onState: (snapshot) => {
+        try { record('state-' + process.pid + '-' + snapshot.state + '.json', snapshot); } catch (_) {}
+        try {
+          if (process.send && process.connected) process.send({ type: 'state', state: snapshot.state, pid: process.pid, reason: snapshot.reason });
+        } catch (_) {}
+      },
+    });
 
 process.on('exit', (code) => {
+  if (!grandchild) releaseLock();
   record('exit-' + process.pid + '.json', { pid: process.pid, code, at: new Date().toISOString(), lifecycle: life.snapshot() });
 });
 
 if (mode === 'fail') { process.exit(7); }
 if (exitAfter > 0) setTimeout(() => process.exit(0), exitAfter);
 
-const startListening = () => {
-  if (noListen) return;
-  const server = http.createServer((req, res) => {
-    const p = String(req.url || '').split('?')[0];
-    if (p === '/api/status') {
-      res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, version: 'stub', profile: { id: profile }, dataDir, appDir: path.resolve(__dirname, '..') }));
-      return;
-    }
-    res.statusCode = 404;
-    res.end('{}');
+// 「daemon 被杀但服务还在」：父进程先正常监听，再留一个抢端口的孙进程。
+function spawnSurvivor() {
+  const g = spawn(process.execPath, [__filename], {
+    env: Object.assign({}, process.env, { STUB_GRANDCHILD: '1', STUB_IGNORE_SHUTDOWN: '1', STUB_SURVIVE_KILL: '0' }),
+    stdio: 'ignore',
+    windowsHide: true,
+    detached: true,
   });
-  server.listen(port, '127.0.0.1', () => { record('listening-' + process.pid + '.json', { pid: process.pid, port }); life.markRunning(); });
+  g.unref();
+  record('grandchild-' + g.pid + '.json', { pid: g.pid, parent: process.pid });
+}
+
+const statusPayload = () => JSON.stringify({ ok: true, version: 'stub', profile: { id: profile }, dataDir, appDir: path.resolve(__dirname, '..') });
+const handler = (req, res) => {
+  const p = String(req.url || '').split('?')[0];
+  if (p === '/api/status') {
+    res.setHeader('content-type', 'application/json');
+    res.end(statusPayload());
+    return;
+  }
+  res.statusCode = 404;
+  res.end('{}');
 };
 
-if (delay > 0) setTimeout(startListening, delay); else startListening();
+// 孙进程：一直重试直到抢到端口 —— 父进程死后它接管，模拟「daemon 被杀但服务还在」。
+if (grandchild) {
+  const attempt = () => {
+    const s = http.createServer(handler);
+    s.once('error', () => setTimeout(attempt, 100));
+    s.listen(port, '127.0.0.1', () => record('listening-' + process.pid + '.json', { pid: process.pid, port, grandchild: true }));
+  };
+  attempt();
+} else {
+  const startListening = () => {
+    if (noListen) return;
+    const server = http.createServer(handler);
+    server.listen(port, '127.0.0.1', () => {
+      record('listening-' + process.pid + '.json', { pid: process.pid, port });
+      life.markRunning();
+      // 必须先由自己占住端口，孙进程才可能在父进程死后接管（否则两个进程抢绑定）。
+      if (surviveKill) spawnSurvivor();
+    });
+  };
+  if (delay > 0) setTimeout(startListening, delay); else startListening();
+}
 setInterval(() => {}, 1000);
 `;
 
@@ -115,7 +180,9 @@ function makeInstall(options) {
   const opts = options || {};
   const profile = opts.profile || 'workbuddy-cn';
   const root = tmpRoot(opts.tag || profile);
-  const appDir = path.join(root, 'app');
+  // 允许两份「安装」共用同一个 appDir：CN 与 AI 装在一起是真实存在的布局，
+  // 也是「只按目录枚举 daemon.js 会误杀」那个漏洞的前提。
+  const appDir = opts.appDir ? path.resolve(opts.appDir) : path.join(root, 'app');
   const scripts = path.join(appDir, 'scripts');
   fs.mkdirSync(scripts, { recursive: true });
   for (const name of SHARED_FILES) {
@@ -150,17 +217,22 @@ function baseEnv(ctx, extra) {
     WORKDADDY_LOCK_PORT: String(ctx.lockPort),
     WORKDADDY_ORPHAN_WAIT_MS: '4000',
     WORKDADDY_DAEMON_EXIT_WAIT_MS: '4000',
+    // 两份安装共用同一个 appDir 时，替身 daemon 不能靠「脚本位置的上一级」猜输出
+    // 目录，否则两个 profile 的记录会写进同一份 out/。
+    STUB_OUT_DIR: ctx.outDir,
     TEMP: path.join(ctx.root, 'tmp'),
     TMP: path.join(ctx.root, 'tmp'),
     APPDATA: path.join(ctx.root, 'appdata'),
   }, extra || {});
 }
 
-function startWatchdog(ctx, extraEnv) {
+function startWatchdog(ctx, extraEnv, nodeArgs) {
   // detached：与生产一致（托盘用 Process.Start 起 watchdog，托盘退出不带走服务），
   // 同时让 watchdog 的生死只由本测试决定。非 detached 时，沙箱会在父进程退出后
   // 连带杀死整棵子树，那样「daemon 是否自己退出」就永远测不出来。
-  const child = spawn(process.execPath, [path.join(ctx.scripts, 'watchdog.js')], {
+  const args = (nodeArgs || []).slice();
+  args.push(path.join(ctx.scripts, 'watchdog.js'));
+  const child = spawn(process.execPath, args, {
     env: baseEnv(ctx, extraEnv),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
@@ -173,6 +245,25 @@ function startWatchdog(ctx, extraEnv) {
   child.on('exit', (code, signal) => { record.code = code; record.signal = signal; });
   try { child.unref(); } catch (_) {}
   return record;
+}
+
+// 直接拉起一个「没有 IPC 托管」的 daemon：旧版 watchdog 拉起的 daemon 就是这样，
+// 也正是「watchdog 没了、daemon 还在」那个需要超时兜底的场景。
+function startDetachedDaemon(ctx, extraEnv) {
+  const child = spawn(process.execPath, [path.join(ctx.scripts, 'daemon.js')], {
+    env: baseEnv(ctx, extraEnv),
+    stdio: 'ignore',
+    windowsHide: true,
+    detached: true,
+  });
+  try { child.unref(); } catch (_) {}
+  return { pid: child.pid };
+}
+
+async function waitListening(ctx, pid, timeoutMs) {
+  await waitFor(() => {
+    try { return fs.existsSync(path.join(ctx.outDir, 'listening-' + pid + '.json')); } catch (_) { return false; }
+  }, timeoutMs || 20000, 'daemon ' + pid + ' 监听');
 }
 
 function runTray(ctx, args, extraEnv) {
@@ -284,12 +375,22 @@ function killPids(pids) {
   }
 }
 
+// 孙进程（STUB_SURVIVE_KILL 造出来的「僵尸服务」）单独记录一份，必须一起清掉。
+function grandchildPids(ctx) {
+  try {
+    return fs.readdirSync(ctx.outDir)
+      .filter((f) => /^grandchild-\d+\.json$/.test(f))
+      .map((f) => JSON.parse(fs.readFileSync(path.join(ctx.outDir, f), 'utf8')).pid);
+  } catch (_) { return []; }
+}
+
 function cleanup(records) {
   for (const record of records || []) {
     if (record && record.pid) { try { process.kill(record.pid); } catch (_) {} }
   }
   for (const ctx of collectContexts) {
     killPids(daemonPids(ctx));
+    killPids(grandchildPids(ctx));
     killPids([ctx.watchdogPid, ctx.extraPid]);
   }
 }
@@ -301,9 +402,12 @@ module.exports = {
   freePort,
   makeInstall,
   startWatchdog,
+  startDetachedDaemon,
+  waitListening,
   runTray,
   daemonRecords,
   daemonPids,
+  grandchildPids,
   listeningDaemonPids,
   readStateFile,
   readLog,
