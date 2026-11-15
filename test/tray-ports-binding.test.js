@@ -510,15 +510,20 @@ function main() {
     assert(/Process\.Start\(DaemonUri \+ "\/"\)/.test(cs), '打开管理页应使用 DaemonUri');
   });
 
-  test('多实例边界：单运行实例（全局 Mutex + 与安装目录无关的进程匹配）', () => {
+  test('多实例边界：托盘 Mutex 按 profile 隔离，StopWd 只认自己的实例', () => {
     const cs = fs.readFileSync(path.join(repo, 'tray', 'WorkDaddyTray.cs'), 'utf8');
-    // 这两条一起构成「A：多份安装但只允许一个运行实例」。改任何一条都等于改成 B，
-    // 必须先补并发隔离测试（StopWd 按安装目录过滤、端口互不干扰），不能只改这里。
-    assert(cs.includes('Local\\WorkDaddyTraySingleton'), '托盘应使用全局单实例 Mutex');
-    assert(cs.includes('WorkDaddy[\\\\/]scripts[\\\\/](watchdog|daemon)'),
-      'StopWd 的进程匹配应覆盖任意安装目录（切换实例时旧服务必须被停掉）');
+    // B 架构：不同 profile 可以同时运行，所以托盘的 Mutex 也必须按 profile 分。
+    // 名字只由白名单里的 profile 拼出来，不接受任意环境变量。
+    assert(/Local\\WorkDaddyTraySingleton_" \+ s_profile/.test(cs), '托盘 Mutex 应按 profile 生成');
+    assert(!/@"Local\\WorkDaddyTraySingleton"/.test(cs), '不应再使用全局 Mutex 名');
+    // StopWd 先做归属校验（profile + appDir + 命令行），再动手。
+    assert(/private static string ReadOwnership\(out int watchdogPid, out int daemonPid\)/.test(cs),
+      'StopWd 应先做归属校验');
+    assert(/属于另一个安装/.test(cs), 'StopWd 应拒绝停止别的安装的服务');
+    assert(/拒绝停止/.test(cs), 'StopWd 应在身份不明时拒绝');
     const readme = fs.readFileSync(path.join(repo, 'README.md'), 'utf8');
-    assert(/单运行实例/.test(readme), 'README 必须写明单运行实例限制');
+    assert(/同一 ?Profile/.test(readme), 'README 必须写明同一 profile 单实例');
+    assert(/可以同时运行/.test(readme), 'README 必须写明不同 profile 可以同时运行');
   });
 }
 

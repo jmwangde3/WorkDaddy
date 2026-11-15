@@ -50,7 +50,16 @@ namespace WorkDaddyTray
 
     internal static class Program
     {
-        private const string MutexName = @"Local\WorkDaddyTraySingleton";
+        // 每个 profile 一个托盘实例。
+        // 旧的全局 Mutex 会让「WorkBuddy CN 的托盘」挡住「WorkBuddy AI 的托盘」——
+        // B 架构下四个 profile 可以同时运行，托盘也必须能同时存在。
+        // 名字里的 profile 一定来自白名单（ResolveLaunchBinding 只接受四个 id），
+        // 不会把未经验证的环境变量拼进内核对象名。
+        private static string TrayMutexName()
+        {
+            return @"Local\WorkDaddyTraySingleton_" + s_profile;
+        }
+
         private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValueName = "WorkDaddyTray";
         // 端口与 node 路径可在测试里覆盖：隔离目录里要验证「真实的启动链到底传了什么
@@ -96,6 +105,7 @@ namespace WorkDaddyTray
         private static string s_bindingError = "";
         private static string s_installRoot = "";
         private static string s_startError = "";
+        private static string s_stopError = "";
         private static NotifyIcon s_notify;
         private static ContextMenuStrip s_menu;
         private static System.Windows.Forms.Timer s_timer;
@@ -143,12 +153,22 @@ namespace WorkDaddyTray
                     RunCheckBinding(args.Length > 1 ? args[1] : "");
                     return;
                 }
+                if (string.Equals(args[0], "--mutex-check", StringComparison.OrdinalIgnoreCase))
+                {
+                    RunMutexCheck();
+                    return;
+                }
+                if (string.Equals(args[0], "--mutex-hold", StringComparison.OrdinalIgnoreCase))
+                {
+                    RunMutexHold(args.Length > 1 ? args[1] : "");
+                    return;
+                }
                 RunCli(args[0]);
                 return;
             }
 
             bool createdNew;
-            using (Mutex mutex = new Mutex(true, MutexName, out createdNew))
+            using (Mutex mutex = new Mutex(true, TrayMutexName(), out createdNew))
             {
                 if (!createdNew)
                 {
@@ -973,33 +993,271 @@ namespace WorkDaddyTray
             catch { return ""; }
         }
 
+        // 停止只针对「本安装 + 本 profile」这一份服务。
+        //
+        // 旧实现按命令行正则匹配任意安装目录下的 watchdog/daemon，B 架构下会直接
+        // 杀掉另一份安装的服务。身份证据现在来自 watchdog 写的 watchdog-state.json
+        // （profile / appDir / dataDir / 两个 PID），并再用命令行核对一次；对没有
+        // 状态文件的旧版（<=1.3.1）退回 watchdog.pid + 脚本路径核对。任何一项无法
+        // 证明归属都拒绝结束进程 —— 宁可不做事，也不能误杀别人的服务。
         private static bool StopWd()
         {
-            for (int round = 0; round < 4; round++)
+            s_stopError = "";
+            int watchdogPid;
+            int daemonPid;
+            string ownershipError = ReadOwnership(out watchdogPid, out daemonPid);
+            if (!string.IsNullOrEmpty(ownershipError))
             {
-                List<WdProc> procs = GetWdProcesses();
-                if (procs.Count == 0) return true;
-                foreach (WdProc p in procs.OrderBy(x => x.Role))
-                {
-                    try
-                    {
-                        using (Process proc = Process.GetProcessById(p.Pid))
-                        {
-                            proc.Kill();
-                        }
-                    }
-                    catch { }
-                }
-                Thread.Sleep(400);
+                s_stopError = ownershipError;
+                return false;
             }
-            return GetWdProcesses().Count == 0;
+            if (watchdogPid <= 0)
+            {
+                // 既没有状态文件也没有 pid 文件：本实例本来就没有在跑。
+                return true;
+            }
+            if (!ProcessAlive(watchdogPid))
+            {
+                CleanupStaleRuntimeFiles();
+                return true;
+            }
+            string reason;
+            if (!KillOwnedProcess(watchdogPid, "watchdog", out reason))
+            {
+                s_stopError = reason;
+                return false;
+            }
+            // 新 daemon 会因 IPC 断开自己退出；这里等它真的没了再返回。
+            if (!WaitForDaemonExit(daemonPid, 12000))
+            {
+                // 旧版 daemon（没有 IPC 托管）只能按路径精确结束；仍然要求路径属于本安装。
+                List<WdProc> leftovers = OwnedDaemonProcesses();
+                foreach (WdProc left in leftovers)
+                {
+                    string why;
+                    KillOwnedProcess(left.Pid, "daemon", out why);
+                }
+                if (!WaitForDaemonExit(daemonPid, 5000))
+                {
+                    s_stopError = "watchdog 已结束，但 daemon 仍未退出";
+                    return false;
+                }
+            }
+            CleanupStaleRuntimeFiles();
+            return true;
         }
 
         private static bool RestartWd()
         {
-            StopWd();
-            Thread.Sleep(900);
+            if (!StopWd()) return false;
+            Thread.Sleep(400);
             return StartWd();
+        }
+
+        // ------------------------------------------------------------ 归属
+        private static string RuntimeDataDir()
+        {
+            if (!string.IsNullOrEmpty(s_dataDir)) return s_dataDir;
+            return DefaultDataDir();
+        }
+
+        private static string StateFile()
+        {
+            string dir = RuntimeDataDir();
+            return string.IsNullOrEmpty(dir) ? "" : Path.Combine(dir, "watchdog-state.json");
+        }
+
+        private static string PidFile()
+        {
+            string dir = RuntimeDataDir();
+            return string.IsNullOrEmpty(dir) ? "" : Path.Combine(dir, "watchdog.pid");
+        }
+
+        // 返回空串表示「可以停（pid>0）」或「没在跑（pid==0）」；否则是拒绝原因。
+        private static string ReadOwnership(out int watchdogPid, out int daemonPid)
+        {
+            watchdogPid = 0;
+            daemonPid = 0;
+            string stateFile = StateFile();
+            bool hasState = !string.IsNullOrEmpty(stateFile) && File.Exists(stateFile);
+            if (hasState)
+            {
+                Dictionary<string, object> o;
+                try { o = SimpleJson.ParseObject(File.ReadAllText(stateFile)); }
+                catch (Exception ex) { return "状态文件不可解析：" + ex.Message; }
+                object v;
+                if (!o.TryGetValue("profile", out v) || !(v is string)) return "状态文件缺 profile";
+                if (!string.Equals((string)v, s_profile, StringComparison.Ordinal))
+                {
+                    return "该服务属于另一个 Profile（" + (string)v + "），拒绝停止";
+                }
+                if (!o.TryGetValue("appDir", out v) || !(v is string)) return "状态文件缺 appDir";
+                string gotApp = NormalizeIdentityPath(((string)v).Trim());
+                string ownApp = NormalizeIdentityPath(s_installRoot ?? "");
+                if (gotApp.Length == 0 || ownApp.Length == 0) return "状态文件的 appDir 不合法";
+                if (!string.Equals(gotApp, ownApp, StringComparison.OrdinalIgnoreCase))
+                {
+                    return "该服务属于另一个安装（" + gotApp + "），拒绝停止";
+                }
+                if (!o.TryGetValue("pid", out v) || !(v is double)) return "状态文件缺 pid";
+                watchdogPid = (int)(double)v;
+                if (o.TryGetValue("daemonPid", out v) && v is double) daemonPid = (int)(double)v;
+                return "";
+            }
+
+            // 旧版兼容：只有 watchdog.pid，没有状态文件。归属靠「pid 文件的命令行
+            // 指向本安装的 scripts\watchdog.js」证明；证明不了就不动它。
+            string pidFile = PidFile();
+            if (string.IsNullOrEmpty(pidFile) || !File.Exists(pidFile)) return "";
+            string text;
+            try { text = File.ReadAllText(pidFile).Trim(); }
+            catch (Exception ex) { return "无法读取 watchdog.pid：" + ex.Message; }
+            int pid;
+            if (!int.TryParse(text, out pid) || pid <= 0) return "watchdog.pid 内容无效";
+            if (!ProcessAlive(pid))
+            {
+                // 陈旧记录：可以清理，但不必报告失败
+                return "";
+            }
+            string commandLine = CommandLineOf(pid);
+            string expected = Path.Combine(s_scripts, "watchdog.js");
+            if (string.IsNullOrEmpty(commandLine) || !PathMatches(commandLine, expected))
+            {
+                return "watchdog.pid 指向的进程不属于本安装，拒绝停止";
+            }
+            watchdogPid = pid;
+            return "";
+        }
+
+        private static bool PathMatches(string commandLine, string expectedPath)
+        {
+            if (string.IsNullOrEmpty(commandLine) || string.IsNullOrEmpty(expectedPath)) return false;
+            string normalized = commandLine.Replace('/', '\\');
+            return normalized.IndexOf(expectedPath.Replace('/', '\\'), StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static string CommandLineOf(int pid)
+        {
+            try
+            {
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine FROM Win32_Process WHERE ProcessId = " + pid))
+                using (ManagementObjectCollection rows = searcher.Get())
+                {
+                    foreach (ManagementObject mo in rows)
+                    {
+                        string cmd = mo["CommandLine"] as string;
+                        if (!string.IsNullOrEmpty(cmd)) return cmd;
+                    }
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        private static bool ProcessAlive(int pid)
+        {
+            if (pid <= 0) return false;
+            try
+            {
+                using (Process proc = Process.GetProcessById(pid))
+                {
+                    return !proc.HasExited;
+                }
+            }
+            catch { return false; }
+        }
+
+        // 结束前再核对一次命令行：PID 可能已经被系统复用，或者状态文件被搬过来。
+        private static bool KillOwnedProcess(int pid, string role, out string error)
+        {
+            error = "";
+            if (!ProcessAlive(pid)) return true;
+            string expected = Path.Combine(s_scripts, role == "watchdog" ? "watchdog.js" : "daemon.js");
+            string commandLine = CommandLineOf(pid);
+            if (string.IsNullOrEmpty(commandLine))
+            {
+                error = "无法读取 pid=" + pid + " 的命令行，拒绝结束";
+                return false;
+            }
+            if (!PathMatches(commandLine, expected))
+            {
+                error = "pid=" + pid + " 的命令行不像本安装的 " + role + "，拒绝结束";
+                return false;
+            }
+            try
+            {
+                using (Process proc = Process.GetProcessById(pid)) { proc.Kill(); }
+            }
+            catch (Exception ex)
+            {
+                error = "结束 pid=" + pid + " 失败：" + ex.Message;
+                return false;
+            }
+            for (int i = 0; i < 40 && ProcessAlive(pid); i += 1) Thread.Sleep(50);
+            return true;
+        }
+
+        private static bool WaitForDaemonExit(int daemonPid, int timeoutMs)
+        {
+            int waited = 0;
+            while (waited < timeoutMs)
+            {
+                if (daemonPid > 0)
+                {
+                    if (!ProcessAlive(daemonPid)) return true;
+                }
+                else if (FindDaemonPort() <= 0)
+                {
+                    return true;
+                }
+                Thread.Sleep(200);
+                waited += 200;
+            }
+            return daemonPid > 0 ? !ProcessAlive(daemonPid) : FindDaemonPort() <= 0;
+        }
+
+        // 只认「本安装 scripts 目录下的 daemon.js」，用于兜底结束没有 IPC 的旧版 daemon。
+        private static List<WdProc> OwnedDaemonProcesses()
+        {
+            List<WdProc> owned = new List<WdProc>();
+            string expected = Path.Combine(s_scripts, "daemon.js");
+            foreach (WdProc proc in GetWdProcesses())
+            {
+                if (proc.Role != 1) continue;
+                if (PathMatches(CommandLineOf(proc.Pid), expected)) owned.Add(proc);
+            }
+            return owned;
+        }
+
+        private static void CleanupStaleRuntimeFiles()
+        {
+            try
+            {
+                string pidFile = PidFile();
+                if (!string.IsNullOrEmpty(pidFile) && File.Exists(pidFile))
+                {
+                    int pid;
+                    if (!int.TryParse(File.ReadAllText(pidFile).Trim(), out pid) || !ProcessAlive(pid))
+                    {
+                        File.Delete(pidFile);
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                string stateFile = StateFile();
+                if (!string.IsNullOrEmpty(stateFile) && File.Exists(stateFile))
+                {
+                    Dictionary<string, object> o = SimpleJson.ParseObject(File.ReadAllText(stateFile));
+                    object v;
+                    int pid = 0;
+                    if (o.TryGetValue("pid", out v) && v is double) pid = (int)(double)v;
+                    if (pid <= 0 || !ProcessAlive(pid)) File.Delete(stateFile);
+                }
+            }
+            catch { }
         }
 
         // daemon 的 /api/client/relaunch 要「逐个结束 WorkBuddy 进程 → 带
@@ -1089,8 +1347,8 @@ namespace WorkDaddyTray
             ToolStripMenuItem exitItem = AddItem("退出托盘", "只关闭托盘程序，不影响 WorkDaddy 后台服务");
 
             s_start.Click += delegate { RunBusy(StartWd, StartOkText, delegate { return s_startError; }); };
-            s_stop.Click += delegate { RunBusy(StopWd, "WorkDaddy 已关闭"); };
-            s_restart.Click += delegate { RunBusy(RestartWd, "WorkDaddy 已重启"); };
+            s_stop.Click += delegate { RunBusy(StopWd, "WorkDaddy 已关闭", delegate { return s_stopError; }); };
+            s_restart.Click += delegate { RunBusy(RestartWd, "WorkDaddy 已重启", delegate { return s_stopError; }); };
             s_cdp.Click += delegate
             {
                 s_waitingCdp = true;
@@ -1188,6 +1446,11 @@ namespace WorkDaddyTray
         private static void RunBusy(Func<bool> work, string okText)
         {
             RunBusy(work, delegate { return okText; }, null);
+        }
+
+        private static void RunBusy(Func<bool> work, string okText, Func<string> errorText)
+        {
+            RunBusy(work, delegate { return okText; }, errorText);
         }
 
         private static void RunBusy(Func<bool> work, Func<string> okText)
@@ -1352,6 +1615,61 @@ namespace WorkDaddyTray
             Emit(sb.ToString());
         }
 
+        // 托盘 Mutex 的自动化探针：--mutex-check 立刻试一次并退出，
+        // --mutex-hold <ms> 拿着不放（用来验证「同 profile 第二个托盘被拒」）。
+        // --status 用：本实例归属记录的可观测摘要（谁在跑、状态、两个 PID）。
+        private static string DescribeOwnership()
+        {
+            string stateFile = StateFile();
+            if (string.IsNullOrEmpty(stateFile) || !File.Exists(stateFile)) return "no-state-file";
+            try
+            {
+                Dictionary<string, object> o = SimpleJson.ParseObject(File.ReadAllText(stateFile));
+                object v;
+                string profile = o.TryGetValue("profile", out v) ? Convert.ToString(v) : "";
+                string state = o.TryGetValue("state", out v) ? Convert.ToString(v) : "";
+                string pid = o.TryGetValue("pid", out v) ? Convert.ToString(v) : "";
+                string daemonPid = o.TryGetValue("daemonPid", out v) && v != null ? Convert.ToString(v) : "(none)";
+                return "profile=" + profile + " state=" + state + " watchdog=" + pid + " daemon=" + daemonPid;
+            }
+            catch (Exception ex) { return "state-unreadable:" + ex.Message; }
+        }
+
+        private static void RunMutexCheck()
+        {
+            StringBuilder sb = new StringBuilder();
+            bool createdNew;
+            using (Mutex mutex = new Mutex(true, TrayMutexName(), out createdNew))
+            {
+                sb.AppendLine("mutex = " + (createdNew ? "acquired" : "busy"));
+                sb.AppendLine("mutexName : " + TrayMutexName());
+                sb.AppendLine("profile : " + s_profile);
+                if (createdNew) mutex.ReleaseMutex();
+            }
+            Emit(sb.ToString());
+        }
+
+        private static void RunMutexHold(string holdMs)
+        {
+            int ms;
+            if (!int.TryParse(holdMs, out ms) || ms <= 0 || ms > 120000) ms = 5000;
+            StringBuilder sb = new StringBuilder();
+            bool createdNew;
+            using (Mutex mutex = new Mutex(true, TrayMutexName(), out createdNew))
+            {
+                sb.AppendLine("mutex = " + (createdNew ? "held" : "busy"));
+                sb.AppendLine("mutexName : " + TrayMutexName());
+                sb.AppendLine("profile : " + s_profile);
+                sb.AppendLine("holdMs : " + ms);
+                Emit(sb.ToString());
+                if (createdNew)
+                {
+                    Thread.Sleep(ms);
+                    try { mutex.ReleaseMutex(); } catch { }
+                }
+            }
+        }
+
         private static void RunCli(string action)
         {            StringBuilder sb = new StringBuilder();
             switch (action.ToLowerInvariant())
@@ -1368,6 +1686,8 @@ namespace WorkDaddyTray
                         " uiCandidates=" + string.Join(",", s_uiPorts) +
                         " cdpCandidates=" + string.Join(",", s_cdpPorts));
                     if (!string.IsNullOrEmpty(s_bindingError)) sb.AppendLine("bindingErr : " + s_bindingError);
+                    sb.AppendLine("mutex      : " + TrayMutexName());
+                    sb.AppendLine("own        : " + DescribeOwnership());
                     sb.AppendLine("wd scripts : " + s_scripts);
                     break;
 
@@ -1415,9 +1735,12 @@ namespace WorkDaddyTray
                     break;
                 case "--stop":
                     sb.AppendLine("stop = " + StopWd());
+                    if (!string.IsNullOrEmpty(s_stopError)) sb.AppendLine("stopError : " + s_stopError);
                     break;
                 case "--restart":
                     sb.AppendLine("restart = " + RestartWd());
+                    if (!string.IsNullOrEmpty(s_stopError)) sb.AppendLine("stopError : " + s_stopError);
+                    if (!string.IsNullOrEmpty(s_startError)) sb.AppendLine("startError : " + s_startError);
                     break;
                 case "--autoon":
                     sb.AppendLine("autostart = " + SetAutoStart(true));
