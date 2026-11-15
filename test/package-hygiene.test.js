@@ -21,6 +21,10 @@ const { spawnSync } = require('child_process');
 const isWin = process.platform === 'win32';
 const repo = path.join(__dirname, '..');
 const packager = path.join(repo, 'installer', 'build-package.ps1');
+// 不写死版本：打包器不传 -Version 时用的是 DAEMON_VERSION，这里跟着源码走。
+// 硬编码会让每次升版都得改测试，而「改了测试才算过」正是漏掉版本不一致的地方。
+const version = (fs.readFileSync(path.join(repo, 'scripts', 'daemon.js'), 'utf8')
+  .match(/DAEMON_VERSION\s*=\s*'([^']+)'/) || [])[1] || '';
 const tmpBase = path.join(repo, 'tmp');
 const roots = [];
 
@@ -137,10 +141,11 @@ function main() {
   assert.ok(report, '打包器没写报告：' + (res.stderr || ''));
   assert.equal(res.status, 0, '打包失败：' + (report && report.error));
   assert.equal(report.ok, true);
-  assert.equal(report.version, '1.3.0');
+  assert.ok(version, '读不到 DAEMON_VERSION，无法校验产物版本');
+  assert.equal(report.version, version);
 
-  const portable = path.join(out, 'WorkDaddy-1.3.0-portable-win-x64.zip');
-  const source = path.join(out, 'WorkDaddy-1.3.0-source.zip');
+  const portable = path.join(out, `WorkDaddy-${version}-portable-win-x64.zip`);
+  const source = path.join(out, `WorkDaddy-${version}-source.zip`);
   const sums = path.join(out, 'SHA256SUMS.txt');
   for (const f of [portable, source, sums]) assert.ok(fs.existsSync(f), '缺产物：' + path.basename(f));
 
@@ -151,7 +156,7 @@ function main() {
     assert.equal(fs.statSync(file).size, a.size, a.path + ' 的大小与报告不符');
   }
   const sumsText = fs.readFileSync(sums, 'utf8');
-  for (const name of ['WorkDaddy-1.3.0-portable-win-x64.zip', 'WorkDaddy-1.3.0-source.zip']) {
+  for (const name of [`WorkDaddy-${version}-portable-win-x64.zip`, `WorkDaddy-${version}-source.zip`]) {
     assert.ok(sumsText.includes(sha256(path.join(out, name))), 'SHA256SUMS.txt 缺 ' + name + ' 的哈希');
   }
 
@@ -203,11 +208,11 @@ function main() {
   // ---- 源码包内容 ----
   const sourceZip = zipIndex(source);
   const srcNames = sourceZip.entries.map((e) => e.name);
-  assert.ok(srcNames.every((n) => n.startsWith('WorkDaddy-1.3.0-source/')), '源码包缺少统一前缀');
+  assert.ok(srcNames.every((n) => n.startsWith(`WorkDaddy-${version}-source/`)), '源码包缺少统一前缀');
   for (const must of [
-    'WorkDaddy-1.3.0-source/test/run-ci.js',
-    'WorkDaddy-1.3.0-source/docs/migration/01-repository-inventory.md',
-    'WorkDaddy-1.3.0-source/scripts/daemon.js',
+    `WorkDaddy-${version}-source/test/run-ci.js`,
+    `WorkDaddy-${version}-source/docs/migration/01-repository-inventory.md`,
+    `WorkDaddy-${version}-source/scripts/daemon.js`,
   ]) {
     assert.ok(srcNames.includes(must), '源码包缺文件：' + must);
   }

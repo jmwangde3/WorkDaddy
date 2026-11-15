@@ -713,8 +713,10 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.81：在共享目标分支加入视频壁纸及失败重试、主题路径边界修复。
 // 1.3.0：本 fork 独立版本线。上游 DAEMON_VERSION 走 1.2.x 递增，本仓库自 1.2.80
 //        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
-const DAEMON_VERSION = '1.3.0';
-const DAEMON_BUILD_ID = 'release-1.3.0-full-fork';
+// 1.3.1：可靠性 + 安全加固（不新增功能）。tag、本常量、package.json 三者必须一致，
+//        release.yml 会当场比对，不一致就拒绝发布。
+const DAEMON_VERSION = '1.3.1';
+const DAEMON_BUILD_ID = 'release-1.3.1-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({

@@ -80,16 +80,43 @@
 - 只读路径（`/api/status`、`/api/about`、`/api/update-check`）继续免认证，否则本地 CLI
   与状态页自检全部退化。
 
+**RC1 审查后的四处修正（同属 1.3.1）**
+
+- **launcher 的枚举完整性不能丢在第二次 `filter()` 里**：`getWorkBuddyProcesses()` 返回的
+  数组带 `complete`/`skipped`/`errors` 非枚举属性，`workBuddyProcesses()` 再 `filter()` 一次
+  就变成了裸数组 —— 「有进程没验证成」于是退化成「没有进程」。现在两层筛选用
+  `carryProcessEnumeration()` 显式接回元信息；退出 / 重启 / 启动新实例 / 结束进程走
+  `workBuddyProcessesForAction()`，`complete === false` 直接中止并给出可照做的处置说明。
+  「客户端是否已停止」改用 `clientProcessesStopped()`：枚举不完整或查询失败一律按
+  「无法确认已停止」处理，宁可推迟清理也不动还开着的客户端。
+- **去重恢复的状态必须真的写进磁盘**：`resumeDedupe()` 原来只改内存对象，进程退出后
+  日志仍停在 `APPLYING`。现在支持显式 `journalPath`，以磁盘那份为准，状态经
+  `writeJsonAtomic` 写回并**回读确认**才算成功；写不进去返回 `persist-failed`，不会
+  出现「报告恢复完成、磁盘还是 APPLYING」。恢复前校验 journal 格式、`opId` 一致性和
+  每行写入值，缺 `after` 的旧日志直接拒绝判定。`runRollback()` 不再 `catch (_) {}`
+  吞掉写入错误，改成如实报告「已回滚但日志没写回去，重跑安全」。
+- **卸载器的两个归属证明**：`-PurgeData` 要求 `install-state.json` 里存在有效 `dataDir`
+  （缺失 / 为空 / 不是安全目录 / 与清理目标不一致都拒绝）；快捷方式不再「记录里写了就删」，
+  必须是 `.lnk` 普通文件、位于桌面或开始菜单、且目标指向本次安装目录（`wscript.exe` 带
+  AppDir 参数的形式也认）。`-Force` 的删除范围没有被扩大。
+- **发布流程拆成「构建预演」与「发布」两段**：`release.yml` 用 `build_only` 输入只构建、
+  校验、上传 Artifact，不建 tag / Release；发布路径先校验 tag 实际存在、检出的 HEAD 就是
+  tag 指向的提交（手动触发原来会检出分支头，等于用错版本打包），再校验
+  「tag = `DAEMON_VERSION` = `package.json`」三方一致；已存在同名 Release 默认拒绝覆盖，
+  不再默认 `--clobber`。资产校验抽成 `tools/verify-release-assets.js`，`test.yml` 的
+  Setup 作业每次 push 都跑一遍同一份逻辑。
+
 ### 变更
 
-- **Tag 规则统一为不带 `v` 前缀**（`1.3.0` 这种，沿用 1.2.x 惯例）。
+- **Tag 规则统一为不带 `v` 前缀**（`1.3.1` 这种，沿用 1.2.x 惯例）。
 - `build-win.yml` 降级为 **LEGACY**：去掉 `push tags: v*` 触发与 Release 挂载，只留手动
   `workflow_dispatch`。它产出的是旧补丁版资产（`WorkDaddy-Setup-*.exe` + `WorkDaddyLauncher.exe`
   那套），与 1.3.x 的 `build-package.ps1` 产物完全不相容。之前因为只匹配 `v*` 而从未跑过，
   但按 `v*` 打 tag 会往 Release 上挂一套来源不同的资产。
 - 新增 `release.yml`：唯一发布入口。tag 触发，调用 `installer/build-package.ps1`，
-  发布前两道闸 —— tag 名必须等于 `DAEMON_VERSION`；`SHA256SUMS.txt` 必须覆盖全部资产
-  且每条哈希当场重算。
+  发布前五道闸 —— 检出的 HEAD 必须等于 tag 提交；tag 名必须等于 `DAEMON_VERSION` 和
+  `package.json` 版本；三件资产齐全且文件名带版本；`SHA256SUMS.txt` 必须覆盖全部资产
+  且每条哈希当场重算；已存在同名 Release 默认拒绝覆盖。
 - `scripts/upstream.json` 的 `localFileHashes` 随 `daemon.js` / `win-launcher.js` / `inject.js`
   改动重算（台账过期会让 `deploy-safety` 与 `fork-sync-contract` 红）。
 

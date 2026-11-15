@@ -6,7 +6,7 @@
 
 > ## ⚠️ 这是个人改版（fork），不是上游发行版
 >
-> - 本仓库是 [babygoton/WorkDaddy](https://github.com/babygoton/WorkDaddy) 的**个人 fork**，当前版本 `1.3.0`（已并入上游 `1.2.22`），按 **AGPL-3.0** 分发，保留上游全部版权与许可声明。
+> - 本仓库是 [babygoton/WorkDaddy](https://github.com/babygoton/WorkDaddy) 的**个人 fork**，当前版本 `1.3.1`（已并入上游 `1.2.22`），按 **AGPL-3.0** 分发，保留上游全部版权与许可声明。
 > - **与 WorkBuddy 官方没有任何关系**：WorkDaddy 不是腾讯 / WorkBuddy 的产品，也未获其背书；它不修改官方客户端的安装包、签名或数据，只通过本机回环 CDP 与已安装的客户端交互。
 > - 与上游的差别：上游是「补丁式部署」（把脚本覆盖进 WorkBuddy 安装目录），本 fork 改成**独立程序 + 独立数据目录**，自己安装、更新、回滚、卸载，并保留旧补丁版的配置迁移路径。差异逐文件记录在 [`docs/migration/`](docs/migration/)，同步流程见 [`docs/upstream-tracking.md`](docs/upstream-tracking.md)。
 > - 下面的「它能做什么」等章节继承自上游文档，功能在本 fork 中同样可用。
@@ -91,7 +91,7 @@ powershell -ExecutionPolicy Bypass -File installer\uninstall-workdaddy.ps1
 - 仓库里有 47 条**历史测试失败**（`test/known-failures.json` 逐条登记了文件、用例名与错误指纹），不是迁移引入的；CI 只对「新增失败」报警。其中约 7 条是 macOS / Linux 专属用例在 Windows 上必然跑不过，其余是上游注入面板与会话列表的 UI 行为断言在本 fork 的实现下不成立。
 - `WorkDaddy-<版本>-setup.exe` 已在 **CI 的一次性 Windows VM** 上完成编译与真机安装/卸载验证，但**开发机从未运行过**，且没有代码签名；首次发布前仍建议在一台干净机器上手动走一遍。
 - **没有在线下载与签名校验**：不自动检查新版本，也不校验安装包来源；请只使用自己构建或自己核对过 `SHA256SUMS.txt` 的包。
-- **正式发布走 `.github/workflows/release.yml`**：tag 形如 `1.3.0`（不带 `v` 前缀），发布前会校验 tag 与 `scripts/daemon.js` 的 `DAEMON_VERSION` 一致，并对 `SHA256SUMS.txt` 里每条哈希当场重算。旧的 `build-win.yml` 已降级为手动 legacy 流程，只产出旧补丁版资产、不再挂 Release。
+- **正式发布走 `.github/workflows/release.yml`**：tag 形如 `1.3.1`（不带 `v` 前缀），发布前会校验「tag = `DAEMON_VERSION` = `package.json` 版本」三方一致、检出的 HEAD 就是 tag 指向的提交，并对 `SHA256SUMS.txt` 里每条哈希当场重算；已存在同名 Release 默认拒绝覆盖。要只构建不发布，用 `workflow_dispatch` 的 `build_only`。旧的 `build-win.yml` 已降级为手动 legacy 流程，只产出旧补丁版资产、不再挂 Release。
 - 状态页的「恢复 CDP」与 `scripts\fix-cdp.cmd` 现在都要带本地 API token（`%APPDATA%\WorkDaddy\.api-token`，由 daemon 首次启动时生成）。这是有副作用的操作，不再对任意本机网页开放。
 - 仓库里仍提交着 `tray/WorkDaddyTray.exe`（可用 `tray\build.cmd` 或 `installer\build-tray.ps1` 复现，CI 每次现编比对）。等 CI 构建稳定后再评估是否移出 Git。
 - `deploy.ps1` 已标为 **LEGACY**：只用于旧补丁版用户迁出配置、或上游大版本升级后临时救急。新安装 / 更新 / 卸载都走 `installer\`，不会再改 WorkBuddy 安装目录。
