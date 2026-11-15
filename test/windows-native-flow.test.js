@@ -78,7 +78,10 @@ test('WorkBuddy GUI startup stays visible while the watchdog stays hidden', () =
   const launchBlock = launcher.slice(start, end);
   assert.match(launchBlock, /stdio: 'ignore', windowsHide: false, env/);
   assert.doesNotMatch(launchBlock, /stdio: 'ignore', windowsHide: true, env/);
-  assert.match(watchdog, /spawn\(process\.execPath, args, \{ stdio: 'ignore', windowsHide: true/);
+  // daemon 必须被隐藏启动，同时带上 IPC 通道：通道断开是「watchdog 已消失」的唯一
+  // 可靠信号（Windows 强杀不投递信号），没有它就会留下孤儿 daemon。
+  assert.match(watchdog, /spawn\(process\.execPath, args, \{\s*stdio: \['ignore', 'ignore', 'ignore', 'ipc'\],\s*windowsHide: true,/);
+  assert.doesNotMatch(watchdog, /stdio: 'ignore', windowsHide: true/);
 });
 
 test('installer keeps default lifecycle standard-only and gates the elevated session exception', () => {

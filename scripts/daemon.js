@@ -33,6 +33,7 @@ const net = require('net');
 const { inspectPersona, copyPersona, readPersonaSettings, listPersonaSources, configurePersona, dismissPersonaNotice, syncSharedPersonaForSwitch } = require('./persona.js');
 let sessionSync = require('./session-sync.js');
 const { createSessionPinSync, readPinsInRenderer, applyPinsInRenderer } = require('./session-pin-sync');
+const { installChildLifecycle } = require('./lifecycle-child.js');
 const {createCodeBuddyFiles} = require('./codebuddy-files.js');
 const { createAccountCreditCache } = require('./account-credit-cache.js');
 const { spawn, spawnSync, execFile } = require('child_process');
@@ -1955,6 +1956,30 @@ function log(...args) {
     /* 忽略日志错误 */
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * 父进程（watchdog）生命周期绑定。
+ *
+ * 必须尽早安装：watchdog 可能在 daemon 完成初始化之前就被强杀，那时也得能收到
+ * IPC 断开并退出。这里只注册监听，不做重活；真正被调用时 log/DATA_DIR/PROFILE
+ * 都已就绪（log 定义在上面几行）。
+ * ------------------------------------------------------------------------- */
+const DAEMON_LIFECYCLE = installChildLifecycle({
+  log,
+  graceMs: 4000,
+  onState: function (snapshot) {
+    try {
+      if (process.send && process.connected) {
+        process.send({ type: 'state', state: snapshot.state, pid: process.pid, reason: snapshot.reason });
+      }
+    } catch (_) {}
+  },
+  onShutdown: function () {
+    try { releaseDaemonLock(); } catch (_) {}
+    try { stopCaffeinate(); } catch (_) {}
+    try { if (AUTH_FILE) fs.unwatchFile(AUTH_FILE); } catch (_) {}
+  },
+});
 
 function isLockPermissionError(error) {
   return !!error && ['EACCES', 'EPERM', 'EROFS'].includes(error.code);
@@ -14297,6 +14322,7 @@ if (PROFILE.capabilities.builtinAutomations === false) {
 }
 restoreSleepMode();
 startServer();
+DAEMON_LIFECYCLE.markRunning();
 cdpLoop();
 if (codeBuddyNative) setInterval(() => { if (!accountSwitchInProgress) scheduleBackup('native-auth'); }, 15000);
 // Migrate legacy target row baselines off the switch hot path. This is a
@@ -14319,17 +14345,14 @@ if (!IS_PORTABLE_WIN) {
   updateTimer.unref && updateTimer.unref();
 }
 
+// 停止统一走生命周期模块：IPC 断开 / watchdog 的 shutdown 消息 / SIGTERM 三条路径
+// 都会进同一个幂等实现，清理（释放 daemon 锁、CDP、定时器）只执行一次。
+// Windows 上被强杀时 SIGTERM 处理不会执行，能兜住孤儿的是 IPC 断开那条。
 process.on('SIGTERM', () => {
   log('收到 SIGTERM，退出');
-  releaseDaemonLock();
-  try { stopCaffeinate(); } catch (_) {}
-  try {
-    if (AUTH_FILE) fs.unwatchFile(AUTH_FILE);
-  } catch (_) {}
-  process.exit(0);
+  DAEMON_LIFECYCLE.stop('SIGTERM');
 });
 process.on('SIGINT', () => {
-  releaseDaemonLock();
-  process.exit(0);
+  DAEMON_LIFECYCLE.stop('SIGINT');
 });
 process.on('exit', releaseDaemonLock);

@@ -1,0 +1,225 @@
+'use strict';
+/**
+ * watchdog ↔ daemon 生命周期可靠性。
+ *
+ *   node test/watchdog-daemon-lifecycle.test.js
+ *
+ * 要证明的核心不是「锁端口释放了」，而是「watchdog 消失后 daemon 真的没了、
+ * 而且不会在同一 profile 上冒出第二个」。所以每个用例都统计**存活 daemon 数量**。
+ *
+ * Windows 上没有可投递的优雅信号：托盘 StopWd、任务管理器、崩溃都是
+ * TerminateProcess，watchdog 的 SIGTERM 处理不会执行。所以「正常停止」和
+ * 「强杀」在进程层面是同一条路径，能兜住孤儿的只有 IPC 断开。
+ */
+const path = require('path');
+const { spawn } = require('child_process');
+const fixture = require('./helpers/profile-fixture');
+
+let failures = 0;
+const started = [];
+const directDaemons = [];
+
+function test(name, fn) {
+  return Promise.resolve()
+    .then(fn)
+    .then(() => console.log('ok - ' + name))
+    .catch((error) => {
+      failures += 1;
+      console.error('not ok - ' + name + '\n  ' + error.message);
+    });
+}
+
+function assert(cond, message) {
+  if (!cond) throw new Error(message);
+}
+
+function make(tag, profile, opts) {
+  const ctx = fixture.makeInstall(Object.assign({ tag, profile }, opts || {}));
+  fixture.track(ctx);
+  return ctx;
+}
+
+function start(ctx, extra) {
+  const record = fixture.startWatchdog(ctx, extra);
+  started.push(record);
+  return record;
+}
+
+async function waitRunning(ctx) {
+  await fixture.waitFor(() => {
+    const state = fixture.readStateFile(ctx);
+    return Boolean(state && state.state === 'RUNNING' && state.daemonPid);
+  }, 25000, ctx.profile + ' RUNNING');
+  await fixture.waitFor(() => fixture.listeningDaemonPids(ctx).length === 1, 25000, ctx.profile + ' daemon 监听');
+}
+
+function exitRecord(ctx, pid) {
+  try {
+    return JSON.parse(require('fs').readFileSync(path.join(ctx.outDir, 'exit-' + pid + '.json'), 'utf8'));
+  } catch (_) { return null; }
+}
+
+// 直接以 IPC 托管方式拉起替身 daemon：用来单独验证「关闭握手」这条路径。
+function startDirectDaemon(ctx, extra) {
+  const child = spawn(process.execPath, [path.join(ctx.scripts, 'daemon.js')], {
+    env: Object.assign({}, process.env, {
+      WBSWITCH_PROFILE: ctx.profile,
+      WBSWITCH_DATA_DIR: ctx.dataDir,
+      WBSWITCH_PORT: String(extra && extra.uiPort ? extra.uiPort : ctx.uiPort),
+      STUB_MODE: 'ok',
+    }, (extra && extra.env) || {}),
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    windowsHide: true,
+  });
+  const record = { child, pid: child.pid, code: null };
+  child.on('exit', (code) => { record.code = code; });
+  directDaemons.push(record);
+  return record;
+}
+
+async function main() {
+  await test('正常启动：状态文件 RUNNING，daemon 监听，锁被持有', async () => {
+    const ctx = make('life-ok', 'workbuddy-cn');
+    start(ctx);
+    await waitRunning(ctx);
+    const state = fixture.readStateFile(ctx);
+    assert(state.pid === ctx.watchdogPid, '状态文件应记录 watchdog pid：' + JSON.stringify(state));
+    assert(state.daemonPid > 0, '状态文件应记录 daemon pid');
+    assert(state.state === 'RUNNING', 'state 应为 RUNNING，实际 ' + state.state);
+    assert(await fixture.portFree(ctx.lockPort) === false, 'profile 锁应被占用');
+    ctx.keep = true;
+  });
+
+  await test('终止 watchdog：daemon 跟着退出，锁释放，不留孤儿', async () => {
+    const ctx = make('life-kill', 'workbuddy-ai');
+    const proc = start(ctx);
+    await waitRunning(ctx);
+    const daemonPid = fixture.readStateFile(ctx).daemonPid;
+    try { process.kill(proc.pid); } catch (_) {}
+    await fixture.waitFor(() => !fixture.alive(daemonPid), 8000, 'daemon 在 watchdog 消失后退出');
+    await fixture.waitFor(() => fixture.portFree(ctx.lockPort), 8000, '锁端口释放');
+    assert(fixture.listeningDaemonPids(ctx).length === 0, '不应有存活 daemon');
+    // 退出原因的证据：本机沙箱会在父进程被终止时连带回收整棵子树（daemon 连
+    // 'disconnect' 都收不到），所以这里只要求「真的没了 + 锁已释放」；IPC 通路本身
+    // 由下面两条直连用例（shutdown 消息 / 通道断开）逐条证明，那两条会留下 STOPPED。
+    const exit = exitRecord(ctx, daemonPid);
+    if (exit) {
+      assert(exit.lifecycle && exit.lifecycle.state === 'STOPPED', '若留下退出记录，必须是 STOPPED：' + JSON.stringify(exit.lifecycle));
+    }
+  });
+
+  await test('启动过程中终止 watchdog：daemon 仍然不会变成孤儿', async () => {
+    const ctx = make('life-startkill', 'workbuddy-cn');
+    const proc = start(ctx, { STUB_STARTUP_DELAY_MS: '4000' });
+    await fixture.waitFor(() => fixture.daemonRecords(ctx).length === 1, 20000, 'daemon 进程出现');
+    const daemonPid = fixture.daemonRecords(ctx)[0].pid;
+    await fixture.delay(300);            // 还在启动延迟里，端口尚未监听
+    try { process.kill(proc.pid); } catch (_) {}
+    await fixture.waitFor(() => !fixture.alive(daemonPid), 10000, '启动阶段被杀也要退出');
+  });
+
+  await test('关闭握手：显式 shutdown 消息让 daemon 走正常停止路径', async () => {
+    const ctx = make('life-shutdown', 'workbuddy-ai');
+    const direct = startDirectDaemon(ctx);
+    await fixture.waitFor(() => fixture.listeningDaemonPids(ctx).length === 1, 20000, 'direct daemon 监听');
+    direct.child.send({ type: 'shutdown' });
+    direct.child.send({ type: 'shutdown' });   // 重复消息必须幂等
+    const code = await fixture.waitExit(direct, 10000);
+    assert(code === 0, 'daemon 应正常退出，实际 ' + code);
+    const exit = exitRecord(ctx, direct.pid);
+    assert(exit && exit.lifecycle.state === 'STOPPED', '应记录 STOPPED：' + JSON.stringify(exit && exit.lifecycle));
+    assert(/watchdog 请求停止/.test(exit.lifecycle.reason), '原因应是 watchdog 请求：' + exit.lifecycle.reason);
+  });
+
+  await test('IPC 通道被断开（父进程侧主动断）→ daemon 退出', async () => {
+    const ctx = make('life-disconnect', 'codebuddy-cn');
+    const direct = startDirectDaemon(ctx);
+    await fixture.waitFor(() => fixture.listeningDaemonPids(ctx).length === 1, 20000, 'direct daemon 监听');
+    direct.child.disconnect();
+    await fixture.waitFor(() => !fixture.alive(direct.pid), 8000, 'disconnect 后退出');
+    const exit = exitRecord(ctx, direct.pid);
+    assert(exit && exit.lifecycle.state === 'STOPPED', '应记录 STOPPED');
+  });
+
+  await test('daemon 自行退出：watchdog 检测到并重新拉起', async () => {
+    const ctx = make('life-daemon-exit', 'workbuddy-cn');
+    start(ctx, { STUB_EXIT_AFTER_MS: '2500' });
+    await waitRunning(ctx);
+    const first = fixture.readStateFile(ctx).daemonPid;
+    await fixture.waitFor(() => !fixture.alive(first), 10000, '第一个 daemon 退出');
+    await fixture.waitFor(() => fixture.daemonRecords(ctx).length >= 2, 25000, 'watchdog 重新拉起 daemon');
+    await fixture.waitFor(() => fixture.listeningDaemonPids(ctx).length === 1, 25000, '新 daemon 恢复监听');
+  });
+
+  await test('daemon 启动失败：watchdog 不崩，记录退出原因并继续重试', async () => {
+    const ctx = make('life-daemon-fail', 'workbuddy-ai');
+    const proc = start(ctx, { STUB_MODE: 'fail' });
+    await fixture.waitFor(() => fixture.daemonRecords(ctx).length >= 1, 20000, '第一次 spawn');
+    await fixture.delay(1500);
+    assert(proc.code === null, 'watchdog 不应退出，实际 exit=' + proc.code);
+    const log = fixture.readLog(ctx);
+    assert(/daemon 退出 code=7/.test(log), '日志应记录 daemon 退出码：' + log.split('\n').slice(-3).join(' | '));
+  });
+
+  await test('已有同 profile 的 daemon 时，新 watchdog 不启动第二个（exit 4）', async () => {
+    const ctx = make('life-orphan', 'workbuddy-cn');
+    const orphan = startDirectDaemon(ctx);
+    await fixture.waitFor(() => fixture.listeningDaemonPids(ctx).length === 1, 20000, '孤儿 daemon 监听');
+    const proc = start(ctx, { WORKDADDY_ORPHAN_WAIT_MS: '1500' });
+    const code = await fixture.waitExit(proc, 25000);
+    assert(code === 4, '应 exit 4（同 profile 已有 daemon），实际 ' + code + '：' + proc.out);
+    assert(fixture.daemonRecords(ctx).length === 1, '不得再拉起第二个 daemon：' + fixture.daemonRecords(ctx).length);
+    assert(fixture.alive(orphan.pid), '已存在的 daemon 不应被杀掉');
+    const state = fixture.readStateFile(ctx);
+    assert(state && /profile-daemon-alive/.test(state.reason || ''), '状态文件应记录拒绝原因：' + JSON.stringify(state));
+  });
+
+  await test('杀掉 watchdog 后立即重启：最终只有一份 daemon，没有重复', async () => {
+    const ctx = make('life-restart', 'workbuddy-ai');
+    const first = start(ctx);
+    await waitRunning(ctx);
+    const oldDaemon = fixture.readStateFile(ctx).daemonPid;
+    try { process.kill(first.pid); } catch (_) {}
+    await fixture.waitFor(() => !fixture.alive(oldDaemon), 8000, '旧 daemon 退出');
+    const second = start(ctx, { WORKDADDY_ORPHAN_WAIT_MS: '6000' });
+    await waitRunning(ctx);
+    await fixture.delay(1200);
+    const live = fixture.listeningDaemonPids(ctx);
+    assert(live.length === 1, '应恰有一个存活 daemon，实际 ' + JSON.stringify(live));
+    assert(second.code === null, '新 watchdog 应保持运行');
+    assert(live[0] !== oldDaemon, '存活的应是新 daemon');
+  });
+
+  await test('CN 的 watchdog 被杀不影响 AI 的 daemon', async () => {
+    const cn = make('life-cn', 'workbuddy-cn');
+    const ai = make('life-ai', 'workbuddy-ai');
+    const cnProc = start(cn);
+    start(ai);
+    await waitRunning(cn);
+    await waitRunning(ai);
+    const cnDaemon = fixture.readStateFile(cn).daemonPid;
+    const aiDaemon = fixture.readStateFile(ai).daemonPid;
+    try { process.kill(cnProc.pid); } catch (_) {}
+    await fixture.waitFor(() => !fixture.alive(cnDaemon), 8000, 'CN daemon 退出');
+    await fixture.delay(800);
+    assert(fixture.alive(aiDaemon), 'AI daemon 不应受影响');
+    const status = await fixture.statusOf(ai.uiPort);
+    assert(status && status.profile.id === 'workbuddy-ai', 'AI 仍应正常应答');
+  });
+}
+
+(async () => {
+  try {
+    await main();
+  } finally {
+    for (const d of directDaemons) { try { d.child.kill(); } catch (_) {} }
+    fixture.cleanup(started.map((r) => ({ pid: r.pid })));
+    await fixture.delay(600);
+    fixture.cleanup(started.map((r) => ({ pid: r.pid })));
+  }
+  if (failures > 0) {
+    console.error('FAIL watchdog-daemon-lifecycle.test.js (' + failures + ' 项失败)');
+    process.exit(1);
+  }
+  console.log('PASS watchdog-daemon-lifecycle.test.js');
+})();
