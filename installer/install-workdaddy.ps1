@@ -99,6 +99,10 @@ $report = [ordered]@{
     }
     state          = [ordered]@{ previousSaved = ''; tmpPath = ''; validated = $false; committed = $false }
     fileCount      = 0
+    # shortcut：桌面快捷方式路径；shortcutEntry：这条快捷方式指向哪个入口
+    # （tray / launcher-hidden.vbs / launcher.cmd），便于安装后核对与测试断言。
+    shortcut       = ''
+    shortcutEntry  = ''
     warnings       = @()
     error          = ''
     exitCode       = 0
@@ -498,6 +502,12 @@ $report.fileCount = $files.Count
 # ---- 6. 快捷方式（先做，路径要写进安装记录，卸载时只认这一条）----
 Write-Stage 'shortcut'
 # 只在「用户没有同名快捷方式」时创建；已存在就不动 —— 那是用户自己的东西。
+#
+# 入口优先级：托盘 exe > launcher-hidden.vbs > launcher.cmd。
+# 托盘是唯一自足的入口：它自己 node watchdog.js 起服务（端口已开就跳过），
+# 不需要 launcher.cmd 先跑一遍。旧版把快捷方式指向 wscript + vbs，结果是
+# 「双击只起服务、托盘图标永不出现」—— 用户装了软件却看不到控制入口。
+# 源码树里没有预编译的托盘 exe 时，仍然退回 vbs/cmd，保证能启动。
 $shortcutPath = ''
 $script:createdShortcut = ''
 if (-not $NoShortcut -and -not $DryRun) {
@@ -509,25 +519,36 @@ if (-not $NoShortcut -and -not $DryRun) {
     } else {
         $desktop = Get-DesktopDir
     }
+    $trayExe = Join-Path $AppDir 'tray\WorkDaddyTray.exe'
     $launcher = Join-Path $AppDir 'scripts\launcher.cmd'
     $launcherVbs = Join-Path $AppDir 'scripts\launcher-hidden.vbs'
-    if ($desktop -and (Test-Path -LiteralPath $launcher)) {
+    $hasTray = Test-Path -LiteralPath $trayExe
+    $hasVbs = Test-Path -LiteralPath $launcherVbs
+    $hasCmd = Test-Path -LiteralPath $launcher
+    if ($desktop -and ($hasTray -or $hasVbs -or $hasCmd)) {
         $lnk = Join-Path $desktop 'WorkDaddy.lnk'
         if (Test-Path -LiteralPath $lnk) {
             $report.warnings += ('桌面已有同名快捷方式，未覆盖：' + $lnk)
         } else {
             $icon = Join-Path $AppDir 'release\WorkDaddy.ico'
             $okLnk = $false
-            if (Test-Path -LiteralPath $launcherVbs) {
+            if ($hasTray) {
+                # /start = 「确保服务在跑」：托盘起来约 6 秒后若 9222 没监听就
+                # 自己拉 watchdog，与 /autostart 同一套逻辑，只是名字更贴切。
+                $okLnk = New-Shortcut -LnkPath $lnk -Target $trayExe -Arguments '/start' -WorkDir (Join-Path $AppDir 'tray') -IconPath $icon
+                if ($okLnk) { $report.shortcutEntry = 'tray' }
+            } elseif ($hasVbs) {
                 $okLnk = New-Shortcut -LnkPath $lnk -Target (Join-Path $env:WINDIR 'System32\wscript.exe') -Arguments ('//nologo "' + $launcherVbs + '"') -WorkDir (Join-Path $AppDir 'scripts') -IconPath $icon
+                if ($okLnk) { $report.shortcutEntry = 'launcher-hidden.vbs' }
             } else {
                 $okLnk = New-Shortcut -LnkPath $lnk -Target $launcher -Arguments '' -WorkDir (Join-Path $AppDir 'scripts') -IconPath $icon
+                if ($okLnk) { $report.shortcutEntry = 'launcher.cmd' }
             }
             if ($okLnk) { $shortcutPath = $lnk; $script:createdShortcut = $lnk; $report.shortcut = $lnk }
             else { $report.warnings += '创建桌面快捷方式失败（不影响安装）' }
         }
     } else {
-        $report.warnings += '未创建快捷方式：缺少 launcher.cmd 或找不到桌面目录'
+        $report.warnings += '未创建快捷方式：缺少托盘 exe / launcher.cmd 或找不到桌面目录'
     }
 }
 

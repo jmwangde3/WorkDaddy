@@ -308,6 +308,9 @@ function main() {
     // 所以不把它当承诺；真正要看的「关掉之后读回是关的」。
     assert.equal(m[5], 'False', 'end 应读到已删除');
     assert.equal(m[6], m[1], '自启动项必须还原到测试前的值');
+    // 布尔为真不等于还原：值可能被换成别的 exe（跑仓库 exe 就把用户自启项
+    // 从安装目录改到开发树）。这一行比的是原文逐字一致。
+    assert.match(r.text, /autostart exe: same=True/, '自启动项必须逐字还原：' + r.text);
     assert.match(r.text, /SELF-TEST OK/);
   });
 

@@ -7,7 +7,9 @@
 // 功能：
 //   * 托盘图标（绿=运行中 / 灰=已停止 / 橙=切换中），运行时绘制，无外部 .ico
 //   * 右键菜单：状态 / 启动 / 关闭 / 重启 / 恢复 CDP / 开机自启动 / 打开管理页 / 退出托盘
-//   * 单实例 Mutex，避免重复托盘
+//   * 单实例 Mutex：已在运行时再启动一次静默退出（不弹「已在运行」模态框）
+//   * 桌面快捷方式 WorkDaddy.lnk 直接指向本 exe —— 托盘就是唯一入口；
+//     安装器不再生成 launcher-hidden.vbs 那条 wscript 链
 //   * 启动走 node watchdog.js（不经 cmd / launcher.cmd），不弹窗、不 pause、
 //     不重启 WorkBuddy 窗口；CDP/面板注入交给「恢复 CDP」菜单项
 //   * 停止逻辑：按命令行精确匹配 WorkDaddy\scripts\(watchdog|daemon).js，
@@ -15,6 +17,7 @@
 //   * 开机自启：HKCU\Software\Microsoft\Windows\CurrentVersion\Run 的 'WorkDaddyTray'
 //     指向本 exe + /autostart；名字避开上游清理的 'WorkDaddy' / 'WorkDaddy AI'
 //   * /autostart：登录自启触发，约 6 秒后若服务未运行则自动拉起一次
+//   * /start：桌面快捷方式用，语义同 /autostart（确保服务在跑），只是名字更贴切
 //   * 命令行动作（结果同时写入 %TEMP%\WorkDaddyTray-cli.txt，便于自动化验证）：
 //       --status / --selftest / --start / --stop / --restart / --autoon / --autooff
 //
@@ -115,8 +118,8 @@ namespace WorkDaddyTray
             {
                 if (!createdNew)
                 {
-                    MessageBox.Show("WorkDaddy 托盘已在运行", "WorkDaddy",
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    // 桌面快捷方式直接指向本 exe，托盘已在运行时再点一次是常态。
+                    // 弹「已在运行」模态框会让用户以为启动失败，静默退出即可。
                     return;
                 }
 
@@ -125,7 +128,8 @@ namespace WorkDaddyTray
                 BuildUi();
 
                 bool autoStart = args.Any(a =>
-                    string.Equals(a, "/autostart", StringComparison.OrdinalIgnoreCase));
+                    string.Equals(a, "/autostart", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(a, "/start", StringComparison.OrdinalIgnoreCase));
 
                 RunGui(autoStart);
                 mutex.ReleaseMutex();
@@ -253,14 +257,37 @@ namespace WorkDaddyTray
 
         private static bool GetAutoStart()
         {
+            return !string.IsNullOrEmpty(GetAutoStartRaw());
+        }
+
+        // 自启项的原文。--selftest 必须按原样还原它：用 bool 表示会退化成
+        // 「用当前进程的路径重新打开自启」—— 跑一次仓库里的 exe 就把用户自启项
+        // 从安装目录改到开发树，登录后托盘起不来且日志里看不出原因（真踩过）。
+        private static string GetAutoStartRaw()
+        {
             try
             {
                 using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, false))
                 {
-                    if (key == null) return false;
-                    string v = key.GetValue(RunValueName) as string;
-                    return !string.IsNullOrEmpty(v);
+                    if (key == null) return null;
+                    return key.GetValue(RunValueName) as string;
                 }
+            }
+            catch { return null; }
+        }
+
+        private static bool SetAutoStartRaw(string value)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, true)
+                    ?? Registry.CurrentUser.CreateSubKey(RunKeyPath))
+                {
+                    if (key == null) return false;
+                    if (string.IsNullOrEmpty(value)) key.DeleteValue(RunValueName, false);
+                    else key.SetValue(RunValueName, value, RegistryValueKind.String);
+                }
+                return true;
             }
             catch { return false; }
         }
@@ -654,15 +681,20 @@ namespace WorkDaddyTray
                     sb.AppendLine("cdp 9222     : " + TestPort(CdpPort));
                     sb.AppendLine("wd processes : " + GetWdProcesses().Count);
                     sb.AppendLine("autostart    : " + GetAutoStart());
-                    bool was = GetAutoStart();
+                    string before = GetAutoStartRaw();
+                    bool was = !string.IsNullOrEmpty(before);
                     bool on = SetAutoStart(true);
                     bool mid = GetAutoStart();
                     bool off = SetAutoStart(false);
                     bool end = GetAutoStart();
-                    SetAutoStart(was);
+                    SetAutoStartRaw(before);
                     sb.AppendLine(string.Format(
                         "autostart RT : was={0} on={1} mid={2} off={3} end={4} restored={5}",
                         was, on, mid, off, end, GetAutoStart()));
+                    // 逐字节还原才是真还原：was/restored 是布尔，路径被换成别的 exe
+                    // 也照样 True，正是这个盲点把用户自启项改到了开发树。
+                    sb.AppendLine("autostart exe: same=" +
+                        (string.Equals(GetAutoStartRaw(), before, StringComparison.Ordinal) ? "True" : "False"));
                     sb.AppendLine("SELF-TEST OK");
                     break;
 
