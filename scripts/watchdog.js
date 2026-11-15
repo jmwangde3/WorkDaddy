@@ -74,6 +74,14 @@ const PID_FILE = path.join(DATA_DIR, 'watchdog.pid');
 const STATE_FILE = path.join(DATA_DIR, 'watchdog-state.json');
 const LOG_FILE = path.join(DATA_DIR, 'watchdog.log');
 const DAEMON_FILE = path.join(__dirname, 'daemon.js');
+// daemon 自己写的单实例锁（JSON 里带 pid）：它是「这个 pid 就是本 profile 数据目录
+// 里那个 daemon」的唯一离线证据，CN / AI 共用同一个 AppDir 时命令行完全一样，
+// 只有这份按数据目录存放的记录能区分它们。
+const DAEMON_LOCK_FILE = path.join(DATA_DIR, '.daemon.lock');
+// 启动前先快照上一份状态文件：main() 一开始就会用本进程的 STARTING 覆盖它。
+const PREVIOUS_STATE = (() => {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (_) { return null; }
+})();
 // 一个 profile 一把锁，与 profile 一一对应。旧版（<=1.3.1）用同一张表，所以
 // 「新旧版本同 profile」天然互斥；不同 profile 是不同端口，可以同时跑。
 const PROFILE_LOCK_PORTS = ({'workbuddy-cn':47932,'workbuddy-ai':47933,'codebuddy-cn':47934,'codebuddy-intl':47935});
@@ -94,6 +102,8 @@ const UI_PROBE_PORTS = (() => {
 // 等上一个 daemon 退出的上限；测试可以调小（0 = 只探一次，不等）。
 const ORPHAN_WAIT_MS = envInt('WORKDADDY_ORPHAN_WAIT_MS', 8000, 0, 60000);
 const DAEMON_EXIT_WAIT_MS = envInt('WORKDADDY_DAEMON_EXIT_WAIT_MS', 6000, 0, 60000);
+// 强制结束后等它真的消失的时间（TerminateProcess 是异步生效的）。
+const FORCE_CONFIRM_MS = envInt('WORKDADDY_FORCE_CONFIRM_MS', 2000, 0, 60000);
 
 const STATE = {
   state: 'STARTING',
@@ -104,10 +114,12 @@ const STATE = {
 };
 
 let child = null;
+let lastDaemonPid = 0;
 let stopping = false;
 let restartDelay = 3000;
 let restartTimer = null;
-let shutdownTimer = null;
+// 停止未确认时保留 pid / 状态文件：下一次排查要知道「上一份是谁、pid 是多少」。
+let preserveEvidence = false;
 
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}\n`;
@@ -160,6 +172,7 @@ function writePidFile() {
 }
 
 function removePidFile() {
+  if (preserveEvidence) return;
   try {
     if (Number(fs.readFileSync(PID_FILE, 'utf8').trim()) === process.pid) fs.unlinkSync(PID_FILE);
   } catch (_) {}
@@ -223,6 +236,53 @@ async function waitForNoProfileDaemon(budgetMs) {
   return port;
 }
 
+// 停止之后的确认：连探几次，全都无人应答才算真的停了。
+// 只探一次会被「孙进程刚抢到端口」这种时序骗过去 —— 那一刻返回 0，下一秒服务又回来了。
+async function daemonStillServing() {
+  for (let i = 0; i < 3; i += 1) {
+    const port = await liveProfileDaemonPort();
+    if (port) return port;
+    if (i < 2) await delay(200);
+  }
+  return 0;
+}
+
+/* --------------------------- 上一个 daemon 的身份 --------------------------- */
+
+function errText(error) {
+  return error && error.message ? error.message : String(error);
+}
+
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (_) { return false; }
+}
+
+function readDaemonLockPid() {
+  try {
+    const owner = JSON.parse(fs.readFileSync(DAEMON_LOCK_FILE, 'utf8'));
+    const pid = Number(owner && owner.pid);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : 0;
+  } catch (_) { return 0; }
+}
+
+// 上一份状态文件里记的 daemonPid 还活着时，光靠 pid 不能说明它还是我们的 daemon
+// （PID 可能被复用）。判定顺序：
+//   1. 等它自己消失（新 daemon 靠 IPC 断开会在 4s 内退出，旧版可能要更久）；
+//   2. 仍在 → 只认「本 profile 数据目录里的 daemon 锁记着同一个 pid」；
+//      锁不匹配/缺失 = 身份不明 → 由调用方 fail closed，绝不再起第二个 daemon。
+async function waitForPreviousDaemon(budgetMs) {
+  const prevPid = Number(PREVIOUS_STATE && PREVIOUS_STATE.daemonPid);
+  if (!Number.isSafeInteger(prevPid) || prevPid <= 0 || prevPid === process.pid) return null;
+  const started = Date.now();
+  while (Date.now() - started < budgetMs) {
+    if (!pidAlive(prevPid)) return null;
+    await delay(250);
+  }
+  if (!pidAlive(prevPid)) return null;
+  return { pid: prevPid, proven: readDaemonLockPid() === prevPid };
+}
+
 /* -------------------------------- daemon -------------------------------- */
 
 function startDaemon() {
@@ -244,6 +304,7 @@ function startDaemon() {
     return;
   }
   const current = child;
+  lastDaemonPid = current.pid;
   writeState({ daemonPid: current.pid, state: 'STARTING' });
   log('daemon 已启动 pid=' + current.pid + '（IPC 托管）');
   current.on('message', (message) => {
@@ -271,9 +332,19 @@ function startDaemon() {
   setTimeout(() => { restartDelay = 3000; }, 60000);
 }
 
-function finishShutdown(reason) {
-  if (shutdownTimer) { clearInterval(shutdownTimer); shutdownTimer = null; }
+// 停止只有两条出口：确认 daemon 真的没了（exit 0 / STOPPED），或者确认不了
+// （exit 5 / FAILED）。绝不能在「daemon 可能还活着」的情况下写 STOPPED 走 0 ——
+// 那会让托盘以为结束成功，下一次启动又拿到锁，于是同 profile 出现两份服务。
+function finishShutdown(reason, ok) {
   if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+  if (ok === false) {
+    const message = 'watchdog 停止未确认：' + reason;
+    preserveEvidence = true;
+    log(message + '（exit 5；保留 pid/状态文件以便排查）');
+    writeState({ state: 'FAILED', reason: 'stop-unconfirmed: ' + reason, daemonPid: lastDaemonPid || null });
+    try { process.stderr.write(`[${new Date().toISOString()}] ${message}\n`); } catch (_) {}
+    process.exit(5);
+  }
   removePidFile();
   try { lockServer.close(); } catch (_) {}
   writeState({ state: 'STOPPED', daemonPid: null, reason: reason });
@@ -281,35 +352,58 @@ function finishShutdown(reason) {
   process.exit(0);
 }
 
+// 等自己 spawn 的那个子进程真的退出；返回 false 表示超时（它还在）。
+function waitChildExit(budgetMs) {
+  const target = child;
+  if (!target) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      try { clearTimeout(timer); } catch (_) {}
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(false), budgetMs);
+    if (timer.unref) timer.unref();
+    target.once('exit', () => done(true));
+  });
+}
+
 // 停止顺序很重要：先请 daemon 自己退出，等它真的没了再释放锁退出。
 // 反过来（先放手锁）新实例会立刻拿到锁，而旧 daemon 还占着 UI 端口。
-function shutdown() {
+async function shutdown() {
   if (stopping) return;
   stopping = true;
   writeState({ state: 'STOPPING', reason: 'signal' });
   log('watchdog 收到停止信号，结束 daemon');
   if (!child) {
-    finishShutdown('no-daemon');
+    finishShutdown('no-daemon', true);
     return;
   }
-  try { child.send({ type: 'shutdown' }); } catch (_) {}
-  const deadline = Date.now() + DAEMON_EXIT_WAIT_MS;
-  let forced = false;
-  shutdownTimer = setInterval(() => {
-    if (!child) {
-      finishShutdown('daemon-exited');
+  const pid = child.pid;
+  try { child.send({ type: 'shutdown' }); } catch (error) {
+    log('shutdown 消息发送失败（继续等进程退出）：' + errText(error));
+  }
+  if (!(await waitChildExit(DAEMON_EXIT_WAIT_MS))) {
+    log('daemon 未在 ' + DAEMON_EXIT_WAIT_MS + 'ms 内退出，强制结束 pid=' + pid);
+    let killError = '';
+    try { child.kill(); } catch (error) { killError = errText(error); }
+    if (killError) log('强制结束 pid=' + pid + ' 失败：' + killError);
+    if (!(await waitChildExit(FORCE_CONFIRM_MS))) {
+      finishShutdown('强制结束后 daemon（pid=' + pid + '）仍未退出' +
+        (killError ? '，kill 错误：' + killError : ''), false);
       return;
     }
-    if (!forced && Date.now() >= deadline) {
-      forced = true;
-      log('daemon 未在超时内退出，强制结束 pid=' + child.pid);
-      try { child.kill(); } catch (_) {}
-      return;
-    }
-    if (forced && Date.now() >= deadline + 2000) {
-      finishShutdown('forced');
-    }
-  }, 100);
+    log('daemon pid=' + pid + ' 已被强制结束');
+  }
+  // 进程没了不等于服务没了：旧版 daemon 可能留下孙进程继续应答端口。
+  const port = await daemonStillServing();
+  if (port) {
+    finishShutdown('daemon 进程已退出，但本 profile 仍有服务在 ui=' + port + ' 应答', false);
+    return;
+  }
+  finishShutdown('daemon-exited', true);
 }
 
 /* --------------------------------- main --------------------------------- */
@@ -337,6 +431,25 @@ async function main() {
   writePidFile();
   writeState({ state: 'STARTING', reason: '' });
   log('watchdog 已获取 profile 锁 port=' + LOCK_PORT + ' pid=' + process.pid + ' profile=' + PROFILE.id);
+
+  // 上一份 watchdog 的 daemon 记录还活着时，先确认它到底走了没有、是不是我们的。
+  // 「身份不明」也一律拒绝启动：宁可让用户看到 exit 4，也不能让同一个 profile
+  // 出现两份后台服务（它们会抢同一个 UI 端口、同一份数据目录）。
+  const previous = await waitForPreviousDaemon(ORPHAN_WAIT_MS);
+  if (previous) {
+    const why = previous.proven
+      ? '上一个 daemon 仍在运行（pid=' + previous.pid + '，daemon 锁一致）'
+      : '上一个 daemon（pid=' + previous.pid + '）身份无法确认（daemon 锁缺失或不是它）';
+    log(why + '，本实例不启动第二个 daemon');
+    writeState({
+      state: 'FAILED',
+      reason: 'previous-daemon:' + previous.pid + (previous.proven ? '' : ':unproven'),
+      daemonPid: previous.proven ? previous.pid : null,
+    });
+    try { process.stderr.write(`[${new Date().toISOString()}] ${why}，本实例退出（exit 4）\n`); } catch (_) {}
+    process.exit(4);
+  }
+
   const busyPort = await waitForNoProfileDaemon(ORPHAN_WAIT_MS);
   if (busyPort) {
     log('同 Profile 的后台服务仍在运行（ui=' + busyPort + '），本实例不启动第二个 daemon');

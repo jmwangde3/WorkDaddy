@@ -11,6 +11,7 @@
  * TerminateProcess，watchdog 的 SIGTERM 处理不会执行。所以「正常停止」和
  * 「强杀」在进程层面是同一条路径，能兜住孤儿的只有 IPC 断开。
  */
+const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const fixture = require('./helpers/profile-fixture');
@@ -55,8 +56,18 @@ async function waitRunning(ctx) {
 
 function exitRecord(ctx, pid) {
   try {
-    return JSON.parse(require('fs').readFileSync(path.join(ctx.outDir, 'exit-' + pid + '.json'), 'utf8'));
+    return JSON.parse(fs.readFileSync(path.join(ctx.outDir, 'exit-' + pid + '.json'), 'utf8'));
   } catch (_) { return null; }
+}
+
+// 用 -r 预加载一个「到点自己发 SIGTERM」的模块：Windows 上 process.kill 就是
+// TerminateProcess，watchdog 的优雅停止分支根本不会执行，只能用 process.emit
+// 触发它自己的 handler —— 走的是生产代码，不是测试替身。
+function sigtermPreload(delayMs) {
+  const dir = fixture.tmpRoot('life-preload');
+  const file = path.join(dir, 'emit-sigterm.js');
+  fs.writeFileSync(file, "'use strict';\nsetTimeout(function () { try { process.emit('SIGTERM'); } catch (_) {} }, " + delayMs + ");\n");
+  return file;
 }
 
 // 直接以 IPC 托管方式拉起替身 daemon：用来单独验证「关闭握手」这条路径。
@@ -205,6 +216,63 @@ async function main() {
     assert(fixture.alive(aiDaemon), 'AI daemon 不应受影响');
     const status = await fixture.statusOf(ai.uiPort);
     assert(status && status.profile.id === 'workbuddy-ai', 'AI 仍应正常应答');
+  });
+
+  await test('优雅停止：等 daemon 的异步清理真正跑完再放锁退出（exit 0 / STOPPED）', async () => {
+    const ctx = make('life-graceful', 'workbuddy-ai');
+    const preload = sigtermPreload(2000);
+    const proc = fixture.startWatchdog(ctx, {
+      STUB_SHUTDOWN_DELAY_MS: '1500',
+      WORKDADDY_DAEMON_EXIT_WAIT_MS: '8000',
+      WORKDADDY_FORCE_CONFIRM_MS: '2000',
+    }, ['-r', preload]);
+    started.push(proc);
+    await waitRunning(ctx);
+    const daemonPid = fixture.readStateFile(ctx).daemonPid;
+    const code = await fixture.waitExit(proc, 30000);
+    assert(code === 0, '优雅停止应 exit 0，实际 ' + code + '：' + proc.out);
+    await fixture.waitFor(() => !fixture.alive(daemonPid), 8000, 'daemon 退出');
+    const exit = exitRecord(ctx, daemonPid);
+    assert(exit && exit.lifecycle.state === 'STOPPED', 'daemon 应走完 STOPPED：' + JSON.stringify(exit && exit.lifecycle));
+    // 关键：异步清理（1500ms）必须真的跑完。旧实现 50ms 就 exit，这里会看到 exitVia=timeout。
+    assert(exit.lifecycle.exitVia === 'done',
+      '异步清理必须完成（exitVia=done），实际 ' + exit.lifecycle.exitVia + '：' + JSON.stringify(exit.lifecycle));
+    assert(!exit.lifecycle.reason || !/超时/.test(JSON.stringify(exit)), '不应出现清理超时：' + JSON.stringify(exit));
+    const log = fixture.readLog(ctx);
+    assert(/daemon 已退出|daemon-exited/.test(log), '日志应记录 daemon 已退出：' + log.split('\n').slice(-4).join(' | '));
+    assert(!/强制结束/.test(log), '不应走强制结束：' + log.split('\n').slice(-4).join(' | '));
+    const state = fixture.readStateFile(ctx);
+    assert(state && state.state === 'STOPPED' && !state.daemonPid,
+      '状态应是 STOPPED 且清空 daemonPid：' + JSON.stringify(state));
+  });
+
+  await test('强杀后仍有服务在应答：不得宣称停止成功（exit 5 / FAILED）', async () => {
+    const ctx = make('life-survive', 'workbuddy-cn');
+    const preload = sigtermPreload(2500);
+    const proc = fixture.startWatchdog(ctx, {
+      STUB_SURVIVE_KILL: '1',        // 父进程被结束后，孙进程接管端口
+      STUB_IGNORE_SHUTDOWN: '1',     // 父进程不理会 shutdown 消息 → 走强制结束
+      WORKDADDY_DAEMON_EXIT_WAIT_MS: '700',
+      WORKDADDY_FORCE_CONFIRM_MS: '1500',
+      WORKDADDY_ORPHAN_WAIT_MS: '6000',
+    }, ['-r', preload]);
+    started.push(proc);
+    await waitRunning(ctx);
+    const daemonPid = fixture.readStateFile(ctx).daemonPid;
+    const code = await fixture.waitExit(proc, 30000);
+    assert(code === 5, '必须 exit 5（停止未确认），实际 ' + code + '：' + proc.out);
+    assert(!fixture.alive(daemonPid), '被 watchdog 直接结束的 daemon 进程应已消失');
+    // 孙进程接管端口 = 服务其实还在；watchdog 不能因此写 STOPPED。
+    const status = await fixture.statusOf(ctx.uiPort);
+    assert(status && status.profile.id === 'workbuddy-cn', '端口应仍由残留服务应答：' + JSON.stringify(status));
+    await fixture.waitFor(() => fixture.grandchildPids(ctx).some((pid) => fixture.alive(pid)), 8000, '孙进程存活');
+    const state = fixture.readStateFile(ctx);
+    assert(state && state.state === 'FAILED', '状态必须是 FAILED，不得写 STOPPED：' + JSON.stringify(state));
+    assert(/stop-unconfirmed/.test(state.reason || ''), '状态原因应标明停止未确认：' + JSON.stringify(state));
+    const log = fixture.readLog(ctx);
+    assert(/强制结束/.test(log), '日志应记录强制结束：' + log.split('\n').slice(-5).join(' | '));
+    assert(/仍有服务/.test(log) && /停止未确认/.test(log), '日志应明确写出未确认的原因：' + log.split('\n').slice(-5).join(' | '));
+    assert(fs.existsSync(path.join(ctx.dataDir, 'watchdog.pid')), '停止未确认时应保留 pid 文件作为证据');
   });
 }
 
