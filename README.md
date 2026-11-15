@@ -132,16 +132,37 @@ UI 端口被占用时 daemon 会退到 `-30000 / -20000 / -10000` 三档并在�
 
 **同一 Profile 同一时间只允许一个后台服务；不同 Profile 可以同时运行。**
 换句话说：WorkBuddy CN 与 WorkBuddy AI 可以各自挂着面板，CodeBuddy CN 与 International 也一样；
-但同一个 profile 不能起两遍。旧版（1.3.1）是全局单实例，多客户端用户只能同时挂一个面板。
+但同一个 profile 不能起两遍。
+
+这里要说清版本差异，否则容易误读成「1.3.1 什么锁都没有」：
+
+| 能力 | 1.3.1 | 1.3.2（本分支） |
+|---|---|---|
+| 后台服务锁 | 已有，`watchdog.js` 按 profile 用 `47932`–`47935`（一 profile 一把） | 同一张表，语义不变 |
+| 不同 profile 并行 | **服务层可以**，但下面三条会互相踩 | 完整可用 |
+| 托盘 | 全局 Mutex `Local\WorkDaddyTraySingleton` —— 整台机器只能有一个托盘 | 每 profile 一个 Mutex |
+| 停止/重启 | 按命令行匹配任意安装目录下的 `watchdog/daemon` 并结束 —— 停一个会连带停掉别的 profile | 只停状态文件 + daemon 锁 + 命令行三方证明属于本实例的那一个 |
+| 生命周期 | 无 IPC 绑定：watchdog 被强杀后 daemon 可能留下，同一 profile 会出现两份 | watchdog ↔ daemon IPC 绑定，退出前等 daemon 真的没了 |
+
+所以 1.3.1 的「只能挂一个面板」来自托盘全局 Mutex 与停止策略，而不是服务锁；1.3.2 补齐的是后两项
+（以及生命周期的有界收尾）。
 
 | 层 | 机制 | 冲突/异常时的表现 |
 |---|---|---|
 | 后台服务 | `watchdog.js` profile 锁 `47932`–`47935`（一 profile 一把） | 同 profile 第二个 watchdog `exit 3`，日志写清 lock 端口 |
 | 旧版兼容 | 1.3.1 用同一张锁表 | 新旧版本同 profile 天然互斥；不同 profile 照常共存 |
-| 已有 daemon | 启动前探本 profile 的 `/api/status` | 上一份 daemon 还没退完 → 等最多 8s，仍在则 `exit 4`，绝不起第二个 |
-| 生命周期 | watchdog ↔ daemon 的 IPC 通道 | watchdog 消失（含被强杀）→ 通道断开 → daemon 自行退出，不留孤儿 |
+| 已有 daemon | 启动前探本 profile 的 `/api/status`，并核对上一份状态文件里的 `daemonPid` | 上一份 daemon 还没退完 → 等最多 8s，仍在则 `exit 4`；进程身份无法确认同样 `exit 4`，绝不起第二个 |
+| 生命周期 | watchdog ↔ daemon 的 IPC 通道 | watchdog 消失（含被强杀）→ 通道断开 → daemon 自行退出；停止时先等它真退出，确认不了 `exit 5` |
 | 托盘图标 | 每 profile 一个 Mutex `Local\WorkDaddyTraySingleton_<profile>` | 同 profile 第二个托盘静默退出；不同 profile 可各有一个托盘 |
-| 停止/重启 | 只认 `watchdog-state.json`（profile / appDir / 两个 PID）+ 命令行核对 | 别的 profile 或别的安装 → 拒绝并说明原因，不动别人的进程 |
+| 停止/重启 | 只认 `watchdog-state.json`（profile / appDir / dataDir / 两个 PID）+ daemon 的 `.daemon.lock` + 命令行 | 任一项对不上就拒绝并说明原因；超时兜底也只结束状态文件里那一个 pid，绝不按目录枚举 `daemon.js` |
+
+「停止」的判定标准是**服务真的不在了**：先请 daemon 自己退出，等它退出；超时后只允许结束
+`watchdog-state.json` 里那个 `daemonPid`，而且必须同时满足「该 profile 数据目录下的
+`.daemon.lock` 记着同一个 pid」与「该 pid 的命令行指向本安装的 `scripts/daemon.js`」。
+证明不齐（状态文件损坏、pid 被复用、锁文件缺失、dataDir 对不上）时一律返回失败并说明原因，
+不会再像旧版那样「按目录把所有 `daemon.js` 都结束一遍」。watchdog 自己的退出码：
+`3` = 同 profile 已有 watchdog，`4` = 同 profile 已有 daemon（含身份无法确认），
+`5` = 停止未被确认（daemon 可能还活着，状态写 `FAILED`，pid 文件保留供排查）。
 
 托盘判定「已启动」不只是看端口：必须拿到 `/api/status` 里与自己一致的 `profile.id`，绑定了
 数据目录时还要求 `dataDir`（以及 `appDir`，若 daemon 返回）逐项一致 —— `dataDir` 只在

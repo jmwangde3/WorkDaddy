@@ -202,6 +202,13 @@ Use this exact flow for a Windows release. The two client packages are built fro
    its daemon with it (IPC channel closes); if a daemon outlives its watchdog, the
    next watchdog must refuse to start (`exit 4`) rather than run a second one.
 
+   A stop that cannot be confirmed must fail loudly: the watchdog writes `FAILED` +
+   `stop-unconfirmed`, keeps its pid file, and exits `5`. The tray may only end the
+   `daemonPid` recorded in `watchdog-state.json`, and only when that profile's data
+   dir has a `.daemon.lock` naming the same pid and the pid's command line points at
+   this install's `scripts/daemon.js`. Never enumerate `daemon.js` by directory — CN
+   and AI can share one AppDir and their command lines are identical.
+
 7. When a PID file is missing during an install/update race, the launcher may reconstruct it only for one exact current-profile watchdog. Multiple matches, an unverified path, a foreign owner, an elevated target from a standard process, or an unbound daemon must fail closed with actionable logs. The old generic “请先完全退出 WorkBuddy” cold-start gate must not be used for a verified current-profile process; the launcher should restart that process precisely and wait for its expected CDP port.
 
 ## Change Workflow
