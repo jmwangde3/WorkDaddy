@@ -120,7 +120,7 @@ async function main() {
     assert(!/evil/.test((r.cli.match(/mutex\s+: .*/) || [''])[0]), 'Mutex 名不得包含非法输入');
   });
 
-  await test('StopWd 只停当前 profile：停 CN 不动 AI', async () => {
+  await test('StopWd 只停当前 profile：停 CN 不动 AI，停 AI 不动 CN', async () => {
     const a = make('stop-cn', 'workbuddy-cn');
     const b = make('stop-ai', 'workbuddy-ai');
     start(a);
@@ -129,12 +129,24 @@ async function main() {
     await waitRunning(b);
     const aDaemon = fixture.readStateFile(a).daemonPid;
     const bDaemon = fixture.readStateFile(b).daemonPid;
-    const r = fixture.runTray(a, ['--stop'], {});
-    assert(/stop = True/.test(r.cli), '停止应成功：' + r.cli);
+    const stopA = fixture.runTray(a, ['--stop'], {});
+    assert(/stop = True/.test(stopA.cli), '停止 CN 应成功：' + stopA.cli);
     await fixture.waitFor(() => !fixture.alive(aDaemon), 15000, 'CN daemon 退出');
-    const status = await fixture.statusOf(b.uiPort);
-    assert(status && status.profile.id === 'workbuddy-ai', 'AI 必须继续运行：' + JSON.stringify(status));
+    const aiStatus = await fixture.statusOf(b.uiPort);
+    assert(aiStatus && aiStatus.profile.id === 'workbuddy-ai', 'AI 必须继续运行：' + JSON.stringify(aiStatus));
     assert(fixture.alive(bDaemon), 'AI daemon 不得被杀');
+
+    // 反向：CN 重启后再停 AI，CN 不受影响
+    start(a);
+    await waitRunning(a);
+    const newCN = fixture.readStateFile(a).daemonPid;
+    const stopB = fixture.runTray(b, ['--stop'], {});
+    assert(/stop = True/.test(stopB.cli), '停止 AI 应成功：' + stopB.cli);
+    await fixture.waitFor(() => !fixture.alive(bDaemon), 15000, 'AI daemon 退出');
+    const cnStatus = await fixture.statusOf(a.uiPort);
+    assert(cnStatus && cnStatus.profile.id === 'workbuddy-cn', 'CN 必须继续运行：' + JSON.stringify(cnStatus));
+    assert(fixture.alive(newCN), 'CN daemon 不得被杀');
+    assert(newCN !== aDaemon, 'CN 应是重启后的新 daemon');
   });
 
   await test('StopWd 拒绝停止属于另一个安装的服务（状态文件 appDir 不符）', async () => {
