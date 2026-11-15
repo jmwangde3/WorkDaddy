@@ -141,6 +141,24 @@ foreach ($row in $state.files) {
 }
 
 if (-not $DryRun) {
+    # 绑定文件是安装时生成的（不在清单里），但它就是「这一份安装」的身份。
+    # 只删 appDir 指向本次安装的那一份：别的实例的、被改坏的，一律留着并说明。
+    $bindingPath = Get-BindingPath $AppDir
+    if (Test-Path -LiteralPath $bindingPath) {
+        $why = Test-BindingOwnership -Path $bindingPath -AppDir $AppDir
+        if ($why) {
+            $report['binding'] = [ordered]@{ path = $bindingPath; removed = $false; reason = $why }
+            Write-Line ('保留绑定文件（' + $why + '）')
+        } else {
+            try {
+                Remove-Item -LiteralPath $bindingPath -Force -ErrorAction Stop
+                $report.removed += [pscustomobject]@{ path = $bindingPath }
+                $report['binding'] = [ordered]@{ path = $bindingPath; removed = $true; reason = '' }
+            } catch {
+                $report['binding'] = [ordered]@{ path = $bindingPath; removed = $false; reason = $_.Exception.Message }
+            }
+        }
+    }
     Remove-EmptyDirs -Root $AppDir
     # 安装目录空了就删掉自己建的外壳
     if (Test-Path -LiteralPath $AppDir) {

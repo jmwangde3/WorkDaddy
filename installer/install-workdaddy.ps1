@@ -18,6 +18,9 @@ param(
     [string]$SourceDir = '',
     [string]$AppDir = '',
     [string]$DataDir = '',
+    # 只有这四个客户端 profile 存在。用 ValidateSet 在参数绑定阶段就拒绝，
+    # 而不是靠后面的正则“看起来像 id”放行 —— 未知 id 会被塞进守护进程环境。
+    [ValidateSet('workbuddy-cn', 'workbuddy-ai', 'codebuddy-cn', 'codebuddy-intl')]
     [string]$ClientProfile = 'workbuddy-cn',
     [string]$LegacyScriptsDir = '',
     # 仅测试用：把桌面目录指到临时目录，避免测试碰真实桌面
@@ -31,7 +34,7 @@ param(
     # 用途是查「脚本没有留下任何报告就消失了」这类问题 —— 报告只在成功和已处理的
     # 失败路径上写，进程被外部杀掉或直接崩掉时什么都不会留下，只能靠这个痕迹。
     [string]$Trace = '',
-    # 仅供故障注入测试：copy-mid / verify / state-write
+    # 仅供故障注入测试：copy-mid / verify / state-write / binding-commit
     [string]$InjectFault = ''
 )
 
@@ -103,6 +106,9 @@ $report = [ordered]@{
     # （tray / launcher-hidden.vbs / launcher.cmd），便于安装后核对与测试断言。
     shortcut       = ''
     shortcutEntry  = ''
+    # binding：每个安装实例自带的 <AppDir>\install-binding.json，托盘据此绑定
+    # profile / DataDir（install-state.json 在 DataDir 里，自定义路径时读不到）。
+    binding        = [ordered]@{ path = ''; written = $false; removed = $false; note = '' }
     warnings       = @()
     error          = ''
     exitCode       = 0
@@ -123,6 +129,14 @@ Write-Line '=============================================================='
 
 # ---- 0. 解析默认路径 ----
 if (-not $SourceDir) { $SourceDir = Split-Path -Parent $here }
+# 校验必须发生在 GetFullPath 之前：'C:WorkDaddy' / '\WorkDaddy' / 'relative'
+# 都会被 GetFullPath 规范化成看似合法的绝对路径，之后再也没法分辨。
+if ($AppDir -and -not (Test-FullWindowsPath $AppDir)) {
+    Fail-Install ('安装目录必须是完整绝对路径（如 C:\Users\me\AppData\Local\Programs\WorkDaddy）：' + $AppDir) 2
+}
+if ($DataDir -and -not (Test-FullWindowsPath $DataDir)) {
+    Fail-Install ('数据目录必须是完整绝对路径（如 E:\WorkDaddyData）：' + $DataDir) 2
+}
 if (-not $AppDir) { $AppDir = Join-Path $env:LOCALAPPDATA 'Programs\WorkDaddy' }
 if (-not $DataDir) { $DataDir = Join-Path $env:APPDATA 'WorkDaddy' }
 $SourceDir = [IO.Path]::GetFullPath($SourceDir).TrimEnd('\')
@@ -132,9 +146,10 @@ $report.sourceDir = $SourceDir
 $report.appDir = $AppDir
 $report.dataDir = $DataDir
 
-# 数据目录不得落在程序目录内（否则更新会覆盖用户配置）
-if ($DataDir.StartsWith($AppDir + '\', [StringComparison]::OrdinalIgnoreCase) -or $DataDir -eq $AppDir) {
-    Fail-Install '数据目录不能位于安装目录内：更新会覆盖用户配置。请改用 %APPDATA%\WorkDaddy。' 2
+# 数据目录不得落在程序目录内（否则更新会覆盖用户配置），也不能是盘根
+$badData = Test-DataDirSafe -DataDir $DataDir -AppDir $AppDir
+if ($badData) {
+    Fail-Install ('数据目录不可用：' + $badData + '。请改用 %APPDATA%\WorkDaddy 或独立的绝对路径。') 2
 }
 
 $unsafe = Test-SafeTargetDir $AppDir
@@ -374,6 +389,23 @@ function Invoke-InstallRollback {
         }
     }
 
+    # 绑定文件跟着程序走。新安装时它不在清单里（是生成的，不是复制的），
+    # 回滚必须单独删；已有安装由 Restore-AppBackup 整目录还原，天然覆盖。
+    try {
+        Get-ChildItem -LiteralPath $AppDir -Filter '.install-binding.tmp-*' -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        $bindingPath = Get-BindingPath $AppDir
+        if (-not $existingInstall -and (Test-Path -LiteralPath $bindingPath)) {
+            Remove-Item -LiteralPath $bindingPath -Force -ErrorAction Stop
+            $report.binding.removed = $true
+        }
+        if (Test-Path -LiteralPath ($bindingPath + '.bak')) {
+            Remove-Item -LiteralPath ($bindingPath + '.bak') -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        $report.binding.note = '绑定文件回滚失败：' + $_.Exception.Message
+    }
+
     if ($existingInstall -and $backupDir) {
         $report.rollback.programRestored = [bool](Restore-AppBackup -From $backupDir -To $AppDir)
         if (-not $report.rollback.programRestored) {
@@ -576,6 +608,8 @@ if (-not $DryRun) {
     # 卸载时按它删就会漏文件。
     $stateTmp = Join-Path $DataDir ('.install-state.tmp-' + $stamp + '.json')
     $report.state.tmpPath = $stateTmp
+    # 事务里有两个提交点，失败时要能说清是哪一个（状态 / 绑定）
+    $commitStage = '状态提交'
     try {
         Write-Stage ('state:hashing ' + $files.Count + ' files')
         $table = Get-InstalledFileTable -AppDir $AppDir -Files $files
@@ -609,12 +643,28 @@ if (-not $DryRun) {
         if ($err) { throw ('提交后校验失败：' + $err) }
         Write-Stage 'state:committed'
         $report.state.committed = $true
+
+        # 绑定文件最后写：它描述的是「已经装好的这一份」，前面的步骤都成功才有意义。
+        # 写失败同样走回滚 —— 不允许出现「程序换了、绑定还指着旧目录」。
+        $commitStage = '绑定文件写入'
+        Write-Stage 'binding:write'
+        $bindingFile = Write-InstallBinding -AppDir $AppDir -ClientProfile $ClientProfile -DataDir $DataDir -Stamp $stamp
+        $report.binding.path = $bindingFile
+        $report.binding.written = $true
+        # 故障注入点：绑定已经落盘，但事务还没算成功 —— 回滚必须把它撤掉
+        if ($InjectFault -eq 'binding-commit') { throw '故障注入：绑定写入后事务失败' }
+        Write-Stage 'binding:committed'
     } catch {
         if (Test-Path -LiteralPath $stateTmp) { Remove-Item -LiteralPath $stateTmp -Force -ErrorAction SilentlyContinue }
-        Invoke-InstallRollback -Why ('状态提交失败：' + $_.Exception.Message) -Code 7
+        if (-not $commitStage) { $commitStage = '状态提交' }
+        Invoke-InstallRollback -Why ($commitStage + '失败：' + $_.Exception.Message) -Code 7
     }
     if (Test-Path -LiteralPath ($statePath + '.bak')) {
         Remove-Item -LiteralPath ($statePath + '.bak') -Force -ErrorAction SilentlyContinue
+    }
+    if ($report.binding.written) {
+        $bindingBak = $report.binding.path + '.bak'
+        if (Test-Path -LiteralPath $bindingBak) { Remove-Item -LiteralPath $bindingBak -Force -ErrorAction SilentlyContinue }
     }
 }
 
