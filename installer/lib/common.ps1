@@ -356,7 +356,8 @@ function Test-DirOverlap {
 
 function Get-WorkDaddyProcesses {
     param([string]$AppDir)
-    $result = [pscustomobject]@{ ok = $false; processes = @(); unreadable = @(); error = '' }
+    # requeryErrors 必须在初始化时声明：PSCustomObject 之后再赋新属性会报错。
+    $result = [pscustomobject]@{ ok = $false; processes = @(); unreadable = @(); error = ''; requeryErrors = @() }
     if (-not $AppDir) { $result.error = 'AppDir 为空'; return $result }
     $d = [IO.Path]::GetFullPath($AppDir).TrimEnd('\')
     $patDaemon = [regex]::Escape($d + '\scripts\daemon.js')
@@ -396,10 +397,29 @@ function Get-WorkDaddyProcesses {
         # 所以先复读一次：进程已经没了就按「不在运行」处理，复读能读到就按正常规则判归属。
         Start-Sleep -Milliseconds 200
         $stillUnreadable = @()
+        $requeryErrors = @()
         foreach ($id in $unreadable) {
+            # 三种结果必须分开：查询成功但 PID 没了 / 查询本身失败 / 查询成功但字段还空。
+            # 旧写法用 try{}catch{} + if(-not $again) 把前两种都当成「PID 已消失」，
+            # 查询异常于是退化成「进程不存在」—— 那是 fail-open，不能接受。
+            $querySucceeded = $false
+            $queryError = ''
             $again = $null
-            try { $again = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$id) -ErrorAction Stop } catch { }
-            if (-not $again) { continue }
+            try {
+                $again = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$id) -ErrorAction Stop
+                $querySucceeded = $true
+            } catch {
+                $queryError = [string]$_.Exception.Message
+            }
+            if (-not $querySucceeded) {
+                $stillUnreadable += $id
+                $requeryErrors += ('PID ' + [int]$id + ': ' + $queryError)
+                continue
+            }
+            if ($null -eq $again) {
+                # 查询成功且没有记录：进程确实已经退出，不算未决。
+                continue
+            }
             $cmd2 = [string]$again.CommandLine
             $exe2 = [string]$again.ExecutablePath
             if ([string]::IsNullOrWhiteSpace($cmd2) -and [string]::IsNullOrWhiteSpace($exe2)) {
@@ -413,12 +433,17 @@ function Get-WorkDaddyProcesses {
             if ($role2) { $found += [pscustomobject]@{ pid = [int]$id; role = $role2 } }
         }
         $unreadable = @($stillUnreadable)
+        if ($requeryErrors.Count -gt 0) { $result.requeryErrors = @($requeryErrors) }
     }
 
     if ($unreadable.Count -gt 0) {
         $result.unreadable = $unreadable
+        $detail = ''
+        if ($requeryErrors -and @($requeryErrors).Count -gt 0) {
+            $detail = '；复读失败原因：' + (@($requeryErrors) -join ' | ')
+        }
         $result.error = ('有 ' + $unreadable.Count + ' 个同名进程读不到身份（PID=' + ($unreadable -join ',') +
-            '）；无法确认它们是否属于本安装，为避免替换到运行中的程序，已中止')
+            '）；无法确认它们是否属于本安装，为避免替换到运行中的程序，已中止' + $detail)
         return $result
     }
     $result.ok = $true
