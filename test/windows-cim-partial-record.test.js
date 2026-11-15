@@ -188,7 +188,65 @@ test('解析器：没有跳过标记时，普通查询错误仍按原样抛出',
   );
 });
 
-// 危险决策（结束进程、替换程序文件）读的是这个结构，而不是裸数组。
+// launcher 拿到的是数组，而数组一旦 .filter() 就会把 complete/skipped 丢掉。
+// 丢掉之后「有进程没验证成」会退化成「没有进程」，结束进程/替换文件就成了
+// 拿半份清单做危险决策。下面三组只覆盖这条传播链，不重复造 CIM 场景。
+function partialRows() {
+  const readable = {
+    ProcessId: 5001,
+    ParentProcessId: 1,
+    Name: 'WorkBuddy.exe',
+    ExecutablePath: 'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe',
+    CommandLine: '"C:\\Program Files\\WorkBuddy\\WorkBuddy.exe" --prewarm',
+    Owner: 'HOST\\tester',
+    OwnerIsCurrent: true,
+    Arguments: ['C:\\Program Files\\WorkBuddy\\WorkBuddy.exe', '--prewarm'],
+  };
+  return boundary.parseCimProcessResult({
+    status: 0,
+    stdout: JSON.stringify(readable),
+    stderr: 'WBD-PROCESS-SKIPPED 5002 ACCESS_DENIED 无法读取进程路径\r\n',
+  }, { requireCommandLine: true });
+}
+
+test('完整性：枚举完整时危险操作的准入检查直接放行', () => {
+  const complete = boundary.parseCimProcessResult({ status: 0, stdout: '[]', stderr: '' });
+  assert.equal(complete.complete, true);
+  assert.equal(boundary.assertCompleteProcessEnumeration(complete, '退出 WorkBuddy'), complete,
+    '完整枚举应原样返回，不做额外包装');
+});
+
+test('完整性：部分枚举在危险操作前被拒绝，并给出可读原因', () => {
+  const rows = partialRows();
+  assert.equal(rows.complete, false);
+  assert.throws(
+    () => boundary.assertCompleteProcessEnumeration(rows, '退出 WorkBuddy'),
+    (err) => {
+      assert.equal(err.code, 'PROCESS_ENUMERATION_INCOMPLETE');
+      assert.match(err.message, /退出 WorkBuddy/, '错误要指出是哪个操作被中止了');
+      assert.match(err.message, /已中止/, '要说清结果，不能只报个原因');
+      assert.match(err.message, /管理员权限/, 'ACCESS_DENIED 要给出可执行的处置办法');
+      assert.equal(err.skipped.length, 1);
+      return true;
+    }
+  );
+});
+
+test('完整性：筛掉 prewarm 进程后，枚举完整性状态原样保留', () => {
+  const rows = partialRows();
+  // 与 launcher 里 workBuddyProcesses() 相同的写法：filter 出裸数组再显式接回元信息。
+  const filtered = boundary.carryProcessEnumeration(
+    rows, rows.filter((process) => !/--prewarm/.test(String(process.CommandLine || '')))
+  );
+  assert.equal(filtered.length, 0, '唯一可读的那条是 prewarm，应被筛掉');
+  assert.equal(filtered.complete, false, '筛掉进程不等于读全了进程清单');
+  assert.equal(filtered.skipped.length, 1, '跳过记录不能被 filter 一起丢掉');
+  assert.equal(filtered.skipped[0].kind, 'ACCESS_DENIED');
+  assert.equal(filtered.errors.length, 1, 'errors 视图要跟着一起传下去');
+  assert.throws(() => boundary.assertCompleteProcessEnumeration(filtered, '启动新实例'),
+    /启动新实例/);
+});
+
 // 关键语义：processes 为空 + complete=false 意味着「有进程但一个都没验证成」，
 // 与「确实没有进程在跑」是两件事，混用会导致误启动或误杀。
 test('结构化枚举：部分成功时给出 processes/skipped/complete/errors 四件套', () => {

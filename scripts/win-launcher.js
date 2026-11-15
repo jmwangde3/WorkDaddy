@@ -22,9 +22,11 @@ const http = require('http');
 const { spawn, spawnSync } = require('child_process');
 const {
   assertAuthenticatedDaemonCapability,
+  assertCompleteProcessEnumeration,
   assertDaemonServiceIdentity,
   assertDaemonTerminationIdentity,
   assertSameProcessIdentity,
+  carryProcessEnumeration,
   detectWindowsPrivilege,
   detectNativeWindowsPrivilege,
   assertVerifiedNodeProcess,
@@ -32,6 +34,7 @@ const {
   filterVerifiedNodeProcesses,
   filterVerifiedWindowsProcesses,
   parseCimProcessResult,
+  readProcessEnumeration,
   resolveWindowsExecutable,
   sameWindowsPath,
   selectRunningProfileBinary,
@@ -450,9 +453,7 @@ function getWorkBuddyProcesses() {
   const filtered = rows.filter(row => PROFILE.kind !== 'codebuddy' || isCodeBuddyBinary(row.ExecutablePath,PROFILE.id));
   // filter 会产出新数组，把「枚举是否完整」的元信息一起带过去：
   // 调用方据此决定能不能拿这份结果去做结束进程之类的危险决策。
-  Object.defineProperty(filtered, 'skipped', { value: rows.skipped || [], enumerable: false });
-  Object.defineProperty(filtered, 'complete', { value: rows.complete !== false, enumerable: false });
-  return filtered;
+  return carryProcessEnumeration(rows, filtered);
 }
 
 // 仅保留为本地端口诊断；daemon 启动成功必须走 exactDaemonStatus 完整身份校验。
@@ -467,15 +468,35 @@ function isPrewarmProcess(process) {
 function workBuddyProcesses(binary = null) {
   // WorkBuddy AI keeps a headless prewarm helper alive between windows. It is
   // not the user-facing app and must not block a cold launch or be terminated.
-  const processes = getWorkBuddyProcesses().filter((process) => !isPrewarmProcess(process));
+  const rows = getWorkBuddyProcesses();
+  // 筛掉 prewarm 只是缩小集合，不改变「枚举有没有读全」这个事实，
+  // 所以两层 filter 都要把元信息接回来。
+  const processes = carryProcessEnumeration(rows, rows.filter((process) => !isPrewarmProcess(process)));
   if (!binary) return processes;
-  const verified = filterVerifiedWindowsProcesses(
+  const verified = carryProcessEnumeration(processes, filterVerifiedWindowsProcesses(
     binary, processes, fs.realpathSync.native, PROFILE.customTarget ? PROFILE_BINARY_NAMES : null
-  );
+  ));
   if (processes.length !== verified.length) {
     throw new Error('存在当前 profile 进程，但没有进程属于已验证安装目录，请先手动退出后重试');
   }
   return verified;
+}
+
+// 危险操作（结束进程、退出、重启、启动新实例）专用：枚举不完整时直接中止。
+// 只读诊断仍走 workBuddyProcesses()，它允许返回「已知的那部分」。
+function workBuddyProcessesForAction(binary, action) {
+  return assertCompleteProcessEnumeration(workBuddyProcesses(binary), action);
+}
+
+// 「客户端是不是已经不在了」这种判断不能由半份清单得出：
+// 枚举不完整、或者查询本身失败，一律按「无法确认已停止」处理。
+function clientProcessesStopped() {
+  try {
+    const rows = getWorkBuddyProcesses();
+    return readProcessEnumeration(rows).complete && rows.length === 0;
+  } catch (_) {
+    return false;
+  }
 }
 
 // 只读诊断：tasklist 结果仅写入失败快照，绝不进入任何 taskkill 参数或退出判定。
@@ -1056,6 +1077,8 @@ async function ensureDaemon(nodeBin) {
 }
 
 // ---------- 2/3. WorkBuddy CDP 处理 ----------
+// 只读查询：允许在枚举不完整时返回「已知的那部分」，不要拿它做退出/结束判断。
+// 危险路径用 workBuddyProcessesForAction()。
 function workBuddyRunning(binary = null) {
   return workBuddyProcesses(binary).length > 0;
 }
@@ -1080,10 +1103,11 @@ function runTaskkill(args) {
 async function waitForWorkBuddyExit(timeoutMs, binary = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!workBuddyRunning(binary)) return true;
+    // 用严格版本：枚举不完整时抛错，而不是把「没读到」当成「已退出」。
+    if (!workBuddyProcessesForAction(binary, '确认 WorkBuddy 是否已退出').length) return true;
     await sleep(200);
   }
-  return !workBuddyRunning(binary);
+  return !workBuddyProcessesForAction(binary, '确认 WorkBuddy 是否已退出').length;
 }
 
 function exitSnapshot(binary = null) {
@@ -1130,14 +1154,17 @@ async function killForExit(args, stage, verifyGone) {
 
 async function killVerifiedWorkBuddyProcess(binary, process, force, stage) {
   const pid = Number(process.ProcessId);
-  const current = workBuddyProcesses(binary).find((item) => Number(item.ProcessId) === pid);
+  const current = workBuddyProcessesForAction(binary, `结束进程 PID ${pid} 前的身份复核`)
+    .find((item) => Number(item.ProcessId) === pid);
   if (!current) return false;
   assertSameProcessIdentity(process, current);
   await killForExit(
     [...(force ? ['/F'] : []), '/PID', String(pid)],
     stage,
     async () => {
-      const after = workBuddyProcesses(binary).find((item) => Number(item.ProcessId) === pid);
+      // 找不到 = 目标已消失；但这只有在清单完整时才成立。
+      const after = workBuddyProcessesForAction(binary, `确认进程 PID ${pid} 是否已退出`)
+        .find((item) => Number(item.ProcessId) === pid);
       if (!after) return true;
       assertSameProcessIdentity(process, after);
       return false;
@@ -1147,12 +1174,10 @@ async function killVerifiedWorkBuddyProcess(binary, process, force, stage) {
 }
 
 async function quitWorkBuddy(binary) {
-  const initial = workBuddyProcesses(binary);
-  if (!initial.length && !workBuddyRunning(binary)) return true;
-
-  if (!initial.length) {
-    throw new Error(`${PROFILE.name} 正在运行，但无法验证其绝对可执行路径；为避免误杀，已停止重启`);
-  }
+  const initial = workBuddyProcessesForAction(binary, '退出 WorkBuddy');
+  // 严格版本已经保证：要么枚举不完整（上面就抛了），要么这份清单就是全部。
+  // 所以「空」等于「确实没有进程在跑」，不需要再查第二遍。
+  if (!initial.length) return true;
 
   log(`[exit] 开始确认退出 profile=${PROFILE.id} snapshot=${JSON.stringify(exitSnapshot(binary))}`);
   // 按实际 PID 精确结束安装目录中的进程树：每个成员都先经 CIM 路径验证，
@@ -1167,7 +1192,7 @@ async function quitWorkBuddy(binary) {
 
   // 单实例宿主可能在第一次 taskkill 后重新生成辅助进程；刷新并重新验证 PID 后强杀两轮。
   for (let round = 1; round <= 2; round++) {
-    const current = workBuddyProcesses(binary);
+    const current = workBuddyProcessesForAction(binary, `强制结束第 ${round} 轮前的进程清单`);
     log(`[exit] 强制结束第 ${round} 轮 snapshot=${JSON.stringify(exitSnapshot(binary))}`);
     for (const process of current) {
       await killVerifiedWorkBuddyProcess(binary, process, true, `强制结束第${round}轮`);
@@ -1213,7 +1238,7 @@ function launchWorkBuddy(wb) {
 
 async function waitForWorkBuddyCdp(binary) {
   await runPendingClientTempCleanup(DATA_DIR, PROFILE, {
-    isStopped: () => getWorkBuddyProcesses().length === 0,
+    isStopped: () => clientProcessesStopped(),
   });
   const deadline = Date.now() + CDP_STARTUP_TIMEOUT_MS;
   let retryWithoutCdpArg = false;
@@ -1681,7 +1706,7 @@ async function waitForWorkBuddyCdpNative(binary) {
   await runPendingClientTempCleanup(DATA_DIR, PROFILE, {
     // Cleanup is optional: if CIM cannot verify even a headless/prewarm process,
     // defer it rather than relying only on the native installation-path filter.
-    isStopped: () => !nativeWorkBuddyRunning() && getWorkBuddyProcesses().length === 0,
+    isStopped: () => !nativeWorkBuddyRunning() && clientProcessesStopped(),
   });
   let restartedAfterHandoff = false;
   let retriedAfterUpdate = false;

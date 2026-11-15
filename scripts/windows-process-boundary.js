@@ -132,6 +132,96 @@ function parseSkippedProcesses(stderr) {
   return skipped;
 }
 
+// 把「为什么有的进程没验证成」翻译成用户能照做的处置说明。
+function describeSkippedProcesses(skipped) {
+  const items = Array.isArray(skipped) ? skipped : [];
+  if (!items.length) return '';
+  const ids = items.map((item) => item.pid || '?').join(',');
+  const kindSummary = () => {
+    const counts = new Map();
+    for (const item of items) counts.set(item.kind, (counts.get(item.kind) || 0) + 1);
+    return [...counts.entries()].map(([kind, n]) => `${kind}×${n}`).join(',');
+  };
+  // 全部 ACCESS_DENIED：对端进程完整性级别更高。重试没有意义，得改权限。
+  if (items.every((item) => item.kind === 'ACCESS_DENIED')) {
+    return `检测到 ${items.length} 个客户端进程，但一个都读不到（PID=${ids}）。` +
+      '客户端多半是以管理员权限运行的，而 WorkDaddy 以普通权限运行 —— ' +
+      '这种情况下 Windows 不允许读取对方进程信息，也不允许结束它。' +
+      '请先完全退出客户端（主窗口和托盘一起），再双击 WorkDaddy 桌面图标，' +
+      '由 WorkDaddy 以普通权限重新启动它。';
+  }
+  // 全部是「瞬时读不到」：可能刚重启，重试有意义。
+  const transientKinds = new Set(['TRANSIENT_FIELD_MISSING', 'PATH_UNVERIFIED', 'COMMANDLINE_UNVERIFIED', 'OWNER_UNVERIFIED']);
+  if (items.every((item) => transientKinds.has(item.kind))) {
+    const first = items.find((item) => item.reason) || {};
+    const detail = first.reason ? `；首个原因：${String(first.reason).slice(0, 160)}` : '';
+    return `检测到 ${items.length} 个进程，但身份字段暂时读不全（PID=${ids}）${detail}；稍后重试即可。`;
+  }
+  // 其余组合（含 UNKNOWN_ERROR）：不猜，按失败处理，绝不当作「没有进程」。
+  const first = items.find((item) => item.reason) || {};
+  const detail = first.reason ? `；首个原因（${first.kind}）：${String(first.reason).slice(0, 160)}` : '';
+  return `检测到 ${items.length} 个进程，但无法确认身份（PID=${ids}；分类=${kindSummary()}）${detail}；` +
+    '为避免在信息不全时误操作，本次查询按失败处理。';
+}
+
+// 「枚举是否完整」是数组上的非枚举属性，任何 .filter()/.map() 都会把它丢掉。
+// 这不是纯粹的写法问题：丢掉之后「有进程但没验证成」会退化成「没有进程」，
+// 结束进程/替换文件就会拿着半份清单去执行。所有对结果二次筛选的地方都必须
+// 用 carryProcessEnumeration() 显式接上，危险操作前再用
+// assertCompleteProcessEnumeration() 拦一次。
+const ENUMERATION_META_KEYS = ['skipped', 'errors', 'complete'];
+
+function normalizeEnumerationMeta(meta = {}) {
+  const skipped = (Array.isArray(meta.skipped) ? meta.skipped : []).map((item) => ({
+    pid: Number.isSafeInteger(item && item.pid) ? item.pid : null,
+    kind: String((item && item.kind) || 'UNKNOWN_ERROR'),
+    reason: String((item && item.reason) || ''),
+  }));
+  return {
+    skipped,
+    errors: Array.isArray(meta.errors) ? meta.errors : skipped,
+    // 没有元信息的普通数组（测试替身、旧调用方）按完整处理；只有明确
+    // complete === false 才算不完整。
+    complete: !(meta.complete === false),
+  };
+}
+
+function readProcessEnumeration(rows) {
+  const source = Array.isArray(rows) ? rows : null;
+  return normalizeEnumerationMeta(source
+    ? { skipped: source.skipped, errors: source.errors, complete: source.complete }
+    : {});
+}
+
+function withProcessEnumeration(rows, meta = {}) {
+  if (!Array.isArray(rows)) throw new Error('Process enumeration metadata requires an array');
+  const { skipped, errors, complete } = normalizeEnumerationMeta(meta);
+  for (const key of ENUMERATION_META_KEYS) {
+    Object.defineProperty(rows, key, {
+      value: key === 'complete' ? complete : key === 'skipped' ? skipped : errors,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  return rows;
+}
+
+function carryProcessEnumeration(source, rows) {
+  return withProcessEnumeration(rows, readProcessEnumeration(source));
+}
+
+function assertCompleteProcessEnumeration(rows, action = '本次操作') {
+  const { skipped, complete } = readProcessEnumeration(rows);
+  if (complete) return rows;
+  const error = new Error(
+    `${action}需要完整的进程清单，但这次只验证出其中一部分，无法确认是否还有客户端进程在运行，已中止。` +
+    describeSkippedProcesses(skipped)
+  );
+  error.code = 'PROCESS_ENUMERATION_INCOMPLETE';
+  error.skipped = skipped;
+  throw error;
+}
+
 function parseCimProcessResult(result, options = {}) {
   if (!result || result.error) {
     throw (result && result.error) || new Error('CIM process query did not return a result');
@@ -142,44 +232,12 @@ function parseCimProcessResult(result, options = {}) {
     throw new Error(`CIM process query exited with status ${result.status}${detail ? ': ' + detail : ''}`);
   }
   const skipped = parseSkippedProcesses(result.stderr);
-  const kindSummary = () => {
-    const counts = new Map();
-    for (const item of skipped) counts.set(item.kind, (counts.get(item.kind) || 0) + 1);
-    return [...counts.entries()].map(([kind, n]) => `${kind}×${n}`).join(',');
-  };
-  const describeSkipped = () => {
-    const ids = skipped.map((item) => item.pid || '?').join(',');
-    // 全部 ACCESS_DENIED：对端进程完整性级别更高。重试没有意义，得改权限。
-    if (skipped.length > 0 && skipped.every((item) => item.kind === 'ACCESS_DENIED')) {
-      return `检测到 ${skipped.length} 个客户端进程，但一个都读不到（PID=${ids}）。` +
-        '客户端多半是以管理员权限运行的，而 WorkDaddy 以普通权限运行 —— ' +
-        '这种情况下 Windows 不允许读取对方进程信息，也不允许结束它。' +
-        '请先完全退出客户端（主窗口和托盘一起），再双击 WorkDaddy 桌面图标，' +
-        '由 WorkDaddy 以普通权限重新启动它。';
-    }
-    // 全部是「瞬时读不到」：可能刚重启，重试有意义。
-    const transientKinds = new Set(['TRANSIENT_FIELD_MISSING', 'PATH_UNVERIFIED', 'COMMANDLINE_UNVERIFIED', 'OWNER_UNVERIFIED']);
-    if (skipped.length > 0 && skipped.every((item) => transientKinds.has(item.kind))) {
-      const first = skipped.find((item) => item.reason) || {};
-      const detail = first.reason ? `；首个原因：${String(first.reason).slice(0, 160)}` : '';
-      return `检测到 ${skipped.length} 个进程，但身份字段暂时读不全（PID=${ids}）${detail}；稍后重试即可。`;
-    }
-    // 其余组合（含 UNKNOWN_ERROR）：不猜，按失败处理，绝不当作「没有进程」。
-    const first = skipped.find((item) => item.reason) || {};
-    const detail = first.reason ? `；首个原因（${first.kind}）：${String(first.reason).slice(0, 160)}` : '';
-    return `检测到 ${skipped.length} 个进程，但无法确认身份（PID=${ids}；分类=${kindSummary()}）${detail}；` +
-      '为避免在信息不全时误操作，本次查询按失败处理。';
-  };
-  const withMetadata = (rows) => {
-    // 非枚举属性：保持数组语义兼容现有调用方，同时把「枚举是否完整」带出去。
-    Object.defineProperty(rows, 'skipped', { value: skipped, enumerable: false });
-    Object.defineProperty(rows, 'complete', { value: skipped.length === 0, enumerable: false });
-    Object.defineProperty(rows, 'errors', {
-      value: skipped.map((item) => ({ pid: item.pid, kind: item.kind, reason: item.reason })),
-      enumerable: false,
-    });
-    return rows;
-  };
+  const describeSkipped = () => describeSkippedProcesses(skipped);
+  const withMetadata = (rows) => withProcessEnumeration(rows, {
+    skipped,
+    complete: skipped.length === 0,
+    errors: skipped.map((item) => ({ pid: item.pid, kind: item.kind, reason: item.reason })),
+  });
   const output = String(result.stdout || '').trim();
   if (!output) {
     if (skipped.length) throw new Error(describeSkipped());
@@ -485,9 +543,12 @@ function assertAuthenticatedDaemonCapability(options) {
 module.exports = {
   ALLOWED_WORKBUDDY_PROCESS_NAMES,
   assertAuthenticatedDaemonCapability,
+  assertCompleteProcessEnumeration,
   assertDaemonServiceIdentity,
   assertDaemonTerminationIdentity,
   assertSameProcessIdentity,
+  carryProcessEnumeration,
+  describeSkippedProcesses,
   detectWindowsPrivilege,
   detectNativeWindowsPrivilege,
   assertStandardWindowsPrivilege,
@@ -497,10 +558,12 @@ module.exports = {
   filterVerifiedNodeProcesses,
   filterVerifiedWindowsProcesses,
   parseCimProcessResult,
+  readProcessEnumeration,
   resolveWindowsExecutable,
   sameWindowsPath,
   selectRunningProfileBinary,
   selectPreferredDiscoveredBinary,
   selectUniqueDiscoveredBinary,
   selectVerifiedProcessPids,
+  withProcessEnumeration,
 };
