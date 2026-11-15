@@ -179,8 +179,17 @@ test('all Windows launch paths await cleanup before spawning and use a strict pr
   for (const name of ['waitForWorkBuddyCdp', 'waitForWorkBuddyCdpNative']) {
     const part = launcher.slice(launcher.indexOf(`async function ${name}(`));
     assert.ok(part.indexOf('await runPendingClientTempCleanup(') < part.indexOf('launchWorkBuddy(binary)'));
-    assert.match(part.slice(0, part.indexOf('launchWorkBuddy(binary)')), /getWorkBuddyProcesses\(\)\.length === 0/);
+    const beforeLaunch = part.slice(0, part.indexOf('launchWorkBuddy(binary)'));
+    // 清理前的「是否已停止」必须走严格判定（clientProcessesStopped），
+    // 不能只看 native 结果或裸数组长度 —— 枚举不完整时那两种都会说「没有进程」。
+    assert.match(beforeLaunch, /clientProcessesStopped\(\)/);
+    assert.ok(beforeLaunch.includes('isStopped:'), '清理必须带 isStopped 回调');
   }
+  // 严格判定本身要按完整枚举判断：complete === false 一律不算「已停止」。
+  const stopped = launcher.slice(launcher.indexOf('function clientProcessesStopped('));
+  const stoppedBody = stopped.slice(0, stopped.indexOf('\n}'));
+  assert.match(stoppedBody, /readProcessEnumeration\(rows\)\.complete/, '必须检查枚举完整性');
+  assert.match(stoppedBody, /rows\.length === 0/, '必须检查进程数量');
   const daemon = fs.readFileSync(path.join(__dirname, '../scripts/daemon.js'), 'utf8');
   const part = daemon.slice(daemon.indexOf('function relaunchWorkBuddy()'));
   assert.ok(part.indexOf('await runPendingClientTempCleanup(') < part.indexOf('spawn(command, args'));

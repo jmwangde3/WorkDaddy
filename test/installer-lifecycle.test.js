@@ -36,6 +36,23 @@ function test(name, fn) {
   console.log(`ok - ${name}`);
 }
 
+// 卸载器只删「有归属证明」的快捷方式：真 .lnk、在桌面/开始菜单、目标指向本次安装。
+// 这条断言需要真实快捷方式，光写个文件不行。
+const MK_LNK = [
+  'param([string]$Lnk = "", [string]$Target = "", [string]$Json = "")',
+  '$shell = New-Object -ComObject WScript.Shell',
+  '$sc = $shell.CreateShortcut($Lnk)',
+  '$sc.TargetPath = $Target',
+  '$sc.Save()',
+].join('\r\n');
+
+function makeShortcut(root, file, target) {
+  const maker = path.join(root, 'mk-lnk.ps1');
+  writeFile(maker, MK_LNK);
+  runPs(maker, ['-Lnk', file, '-Target', target], root);
+  assert.ok(fs.existsSync(file), '前置：快捷方式应已创建 ' + file);
+}
+
 function main() {
   assert.ok(fs.existsSync(installPs1), 'install-workdaddy.ps1 存在');
   assert.ok(fs.existsSync(updatePs1), 'update-workdaddy.ps1 存在');
@@ -540,21 +557,41 @@ function main() {
     assert.ok(fs.existsSync(path.join(outside, 'evil.txt')), '越界文件必须留着');
   });
 
-  test('卸载：只删安装记录里的那一条快捷方式', () => {
+  test('卸载：只删有归属证明的那一条快捷方式', () => {
     const root = tmpRoot('un-lnk');
     const src = makeSource(root, '1.3.0');
     const appDir = path.join(root, 'app');
     const dataDir = path.join(root, 'data');
-    const mine = path.join(root, 'mine.lnk');
+    const desktop = path.join(root, 'desktop');
+    fs.mkdirSync(desktop, { recursive: true });
+    const mine = path.join(desktop, 'WorkDaddy.lnk');
     const other = path.join(root, 'other.lnk');
-    writeFile(mine, 'LNK');
+    makeShortcut(root, mine, path.join(appDir, 'scripts', 'launcher.cmd'));
     writeFile(other, 'LNK');
     seedInstall(root, { version: '1.3.0', sourceDir: src, appDir, dataDir, shortcut: mine });
 
-    const r = runPs(uninstallPs1, ['-AppDir', appDir, '-DataDir', dataDir], root);
+    // -DesktopDir 只是给归属校验一个可信的「桌面」根，测试不进真实桌面。
+    const r = runPs(uninstallPs1, ['-AppDir', appDir, '-DataDir', dataDir, '-DesktopDir', desktop], root);
     assert.equal(r.code, 0, r.stdout);
-    assert.equal(fs.existsSync(mine), false, '记录里的快捷方式应删除');
+    assert.equal(fs.existsSync(mine), false, '记录里那条、目标也指向本次安装的快捷方式应删除');
     assert.equal(fs.existsSync(other), true, '没记录的快捷方式绝不能动');
+  });
+
+  test('卸载：记录里的快捷方式没有归属证明时保留', () => {
+    const root = tmpRoot('un-lnk-foreign');
+    const src = makeSource(root, '1.3.0');
+    const appDir = path.join(root, 'app');
+    const dataDir = path.join(root, 'data');
+    const desktop = path.join(root, 'desktop');
+    fs.mkdirSync(desktop, { recursive: true });
+    const foreign = path.join(desktop, 'WorkDaddy.lnk');
+    makeShortcut(root, foreign, path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'notepad.exe'));
+    seedInstall(root, { version: '1.3.0', sourceDir: src, appDir, dataDir, shortcut: foreign });
+
+    const r = runPs(uninstallPs1, ['-AppDir', appDir, '-DataDir', dataDir, '-DesktopDir', desktop], root);
+    assert.equal(r.code, 0, r.stdout);
+    assert.equal(fs.existsSync(foreign), true, '目标不是本次安装的快捷方式不能删');
+    assert.equal(r.report.shortcut.removed, false);
   });
 
   test('卸载：找不到安装记录 exit 1（不猜着删）', () => {
