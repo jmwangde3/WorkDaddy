@@ -193,6 +193,67 @@ function Get-DesktopDir {
     return ''
 }
 
+# 卸载时只删「安装时自己建的那条快捷方式」。
+#
+# install-state.json 是本地 JSON，可以被改成任意路径 —— 只要路径存在就
+# Remove-Item，等于把一个任意文件删除交给了这份记录。所以要求三件事同时成立：
+#   1. 确实是一个 .lnk 普通文件（不是目录、不是重解析点）；
+#   2. 位置在桌面或开始菜单（用户能自己建快捷方式的地方之外不认）；
+#   3. 目标指向本次安装目录内的启动器（直接指向，或 wscript 带 AppDir 参数）。
+# 返回空字符串表示可以删；否则返回人类可读的拒绝理由。
+function Test-WorkDaddyShortcut {
+    param([string]$Path, [string]$AppDir, [string[]]$ExtraRoots = @())
+    $raw = [string]$Path
+    if ([string]::IsNullOrWhiteSpace($raw)) { return '快捷方式路径为空' }
+    if ($raw.Contains('..')) { return '快捷方式路径含 ..：' + $raw }
+    if (-not [IO.Path]::IsPathRooted($raw)) { return '快捷方式路径不是绝对路径：' + $raw }
+    try { $full = [IO.Path]::GetFullPath($raw) } catch { return '快捷方式路径不合法：' + $raw }
+    if ([IO.Path]::GetExtension($full) -ine '.lnk') { return '不是 .lnk 文件：' + $full }
+    if (-not (Test-Path -LiteralPath $full)) { return '快捷方式不存在：' + $full }
+    $item = Get-Item -LiteralPath $full -Force
+    if ($item.PSIsContainer) { return '目标是目录，不是快捷方式：' + $full }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return '快捷方式本身是重解析点：' + $full }
+
+    # 位置白名单。用户可以在任何地方放 WorkDaddy.lnk，但不是我们建的就不归我们删。
+    $roots = @()
+    foreach ($r in @(Get-DesktopDir) + @($ExtraRoots) +
+            @([Environment]::GetFolderPath('Programs')) +
+            @((Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu'))) {
+        if (-not $r) { continue }
+        try { $roots += ([IO.Path]::GetFullPath([string]$r).TrimEnd('\') + '\') } catch { }
+    }
+    $inAllowed = $false
+    foreach ($r in $roots) {
+        if ($full.StartsWith($r, [StringComparison]::OrdinalIgnoreCase)) { $inAllowed = $true; break }
+    }
+    if (-not $inAllowed) { return '快捷方式不在桌面或开始菜单内：' + $full }
+
+    # 目标必须落在本次安装目录内，否则这就是指向别处的快捷方式。
+    $appFull = ''
+    try { $appFull = [IO.Path]::GetFullPath([string]$AppDir).TrimEnd('\') } catch { return '安装目录不合法，无法校验快捷方式归属' }
+    if (-not $appFull) { return '安装目录为空，无法校验快捷方式归属' }
+    $appPrefix = $appFull + '\'
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $sc = $shell.CreateShortcut($full)
+        $target = [string]$sc.TargetPath
+        $arguments = [string]$sc.Arguments
+    } catch {
+        return '无法读取快捷方式目标：' + $_.Exception.Message
+    }
+    if ([string]::IsNullOrWhiteSpace($target)) { return '快捷方式没有目标：' + $full }
+    try { $targetFull = [IO.Path]::GetFullPath($target) } catch { return '快捷方式目标不合法：' + $target }
+    if ($targetFull.StartsWith($appPrefix, [StringComparison]::OrdinalIgnoreCase)) { return '' }
+
+    # 安装器常把目标设成 wscript.exe + AppDir 内的 vbs；这种情况看参数。
+    $targetName = [IO.Path]::GetFileName($targetFull)
+    if ($targetName -ieq 'wscript.exe' -and $arguments) {
+        $unquoted = $arguments.Replace('"', '')
+        if ($unquoted.IndexOf($appPrefix, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return '' }
+    }
+    return ('快捷方式指向的不是本次安装（目标=' + $targetFull + '）')
+}
+
 function Write-Report {
     param([object]$Report, [string]$JsonPath)
     if ($JsonPath) {

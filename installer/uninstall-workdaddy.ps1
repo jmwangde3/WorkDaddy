@@ -16,7 +16,9 @@ param(
     [switch]$YesPurgeData,
     [switch]$Force,
     [switch]$DryRun,
-    [string]$Json = ''
+    [string]$Json = '',
+    # 仅用于测试注入：给快捷方式归属校验一个可信的「桌面」根。
+    [string]$DesktopDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -147,12 +149,22 @@ if (-not $DryRun) {
     }
     # 快捷方式只删「安装时记录下来的那一条」。不按名字猜：桌面上的 WorkDaddy.lnk
     # 可能是用户自己建的（指向别的安装、或旧补丁版），删掉就是毁用户环境。
+    # 记录本身不可信，所以还要校验类型、位置和目标；任一条不成立就保留并说明。
     $recordedLnk = [string]$state.shortcut
-    if ($recordedLnk -and (Test-Path -LiteralPath $recordedLnk)) {
-        try {
-            Remove-Item -LiteralPath $recordedLnk -Force
-            $report.removed += [pscustomobject]@{ path = $recordedLnk }
-        } catch { }
+    if ($recordedLnk) {
+        $why = Test-WorkDaddyShortcut -Path $recordedLnk -AppDir $AppDir -ExtraRoots @($DesktopDir)
+        if ($why) {
+            $report['shortcut'] = [ordered]@{ path = $recordedLnk; removed = $false; reason = $why }
+            Write-Line ('保留快捷方式（' + $why + '）')
+        } elseif (Test-Path -LiteralPath $recordedLnk) {
+            try {
+                Remove-Item -LiteralPath $recordedLnk -Force
+                $report.removed += [pscustomobject]@{ path = $recordedLnk }
+                $report['shortcut'] = [ordered]@{ path = $recordedLnk; removed = $true; reason = '' }
+            } catch {
+                $report['shortcut'] = [ordered]@{ path = $recordedLnk; removed = $false; reason = $_.Exception.Message }
+            }
+        }
     }
 }
 
@@ -161,14 +173,19 @@ if ($PurgeData) {
     # 这一步是「-PurgeData 只删自己的数据」的兑现方式 —— 记录被改过就拒绝。
     $guard = Test-SafeRootDir -Path $DataDir -Label 'DataDir（清理前复核）'
     if ($guard) { Fail-Uninstall $guard 3 }
+    # 清理必须有归属证明：install-state.json 里的 dataDir 要存在、要安全、要就是当前目标。
+    # 缺这一条时，任何被清空的 DataDir 都可能不是 WorkDaddy 的目录。
     $recordedData = [string]$state.dataDir
-    if ($recordedData) {
-        $recordedFull = [IO.Path]::GetFullPath($recordedData).TrimEnd('\')
-        $targetFull = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
-        if (-not $recordedFull.Equals($targetFull, [StringComparison]::OrdinalIgnoreCase)) {
-            Fail-Uninstall ('安装记录里的数据目录（' + $recordedFull + '）与当前清理目标（' + $targetFull +
-                '）不一致；无法确认归属，拒绝清理') 3
-        }
+    if ([string]::IsNullOrWhiteSpace($recordedData)) {
+        Fail-Uninstall ('安装记录里没有 dataDir，无法证明 ' + $DataDir + ' 属于本次安装；拒绝清理（用户数据未改动）') 3
+    }
+    $guard = Test-SafeRootDir -Path $recordedData -Label '安装记录里的 dataDir'
+    if ($guard) { Fail-Uninstall $guard 3 }
+    $recordedFull = [IO.Path]::GetFullPath($recordedData).TrimEnd('\')
+    $targetFull = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
+    if (-not $recordedFull.Equals($targetFull, [StringComparison]::OrdinalIgnoreCase)) {
+        Fail-Uninstall ('安装记录里的数据目录（' + $recordedFull + '）与当前清理目标（' + $targetFull +
+            '）不一致；无法确认归属，拒绝清理') 3
     }
     $report.purgeScope = @(
         '配置 config.json',

@@ -125,3 +125,101 @@ test('卸载：正常路径不受边界校验影响，照常删程序留数据',
     assert.ok(fs.existsSync(path.join(dataDir, 'config.json')), '默认必须保留用户数据');
   } finally { fx.cleanup(root); }
 });
+
+// ---- -PurgeData 的归属证明 ----
+// 清理会清空整个 DataDir。只要「记录里没写 dataDir」就跳过比对直接删，
+// 等于把清空哪个目录交给了缺失字段 —— 记录不完整时必须拒绝。
+test('卸载：-PurgeData 时记录里没有 dataDir 就拒绝清理', () => {
+  const root = fx.tmpRoot('purge-no-datadir');
+  try {
+    const appDir = path.join(root, 'app');
+    const dataDir = path.join(root, 'data');
+    fx.writeFile(path.join(appDir, 'scripts', 'daemon.js'), '// x');
+    fx.writeFile(path.join(dataDir, 'keep.txt'), 'user data');
+    fx.writeFile(path.join(dataDir, 'install-state.json'), JSON.stringify({
+      files: [{ path: 'scripts\\daemon.js', sha256: fx.sha256(path.join(appDir, 'scripts', 'daemon.js')) }],
+      appDir,
+      dataDir: '',
+    }));
+    const r = runUninstall(['-AppDir', appDir, '-DataDir', dataDir, '-PurgeData', '-YesPurgeData'], root);
+    assert.notEqual(r.code, 0, '没有归属证明就不能清理');
+    assert.match(errorText(r), /dataDir|归属|拒绝/, '应说明缺的是归属证明，实际：' + errorText(r));
+    assert.ok(fs.existsSync(path.join(dataDir, 'keep.txt')), '用户数据必须还在');
+  } finally { fx.cleanup(root); }
+});
+
+// ---- 快捷方式归属 ----
+// install-state.json 可以被改成任意路径。只要「路径存在」就 Remove-Item，
+// 这份记录就变成了一个任意文件删除入口。
+const MK_LNK = [
+  'param([string]$Lnk = "", [string]$Target = "", [string]$Arguments = "", [string]$Json = "")',
+  '$shell = New-Object -ComObject WScript.Shell',
+  '$sc = $shell.CreateShortcut($Lnk)',
+  '$sc.TargetPath = $Target',
+  'if ($Arguments) { $sc.Arguments = $Arguments }',
+  '$sc.Save()',
+].join('\r\n');
+
+function makeLnk(root, file, target) {
+  const maker = path.join(root, 'mk-lnk.ps1');
+  fx.writeFile(maker, MK_LNK);
+  fx.runPs(maker, ['-Lnk', file, '-Target', target], root);
+  assert.ok(fs.existsSync(file), '前置：快捷方式应已创建 ' + file);
+}
+
+test('卸载：记录里的快捷方式指向任意文件时保留，不执行删除', () => {
+  const root = fx.tmpRoot('lnk-arbitrary');
+  try {
+    const src = fx.makeSource(root, '1.3.1');
+    const appDir = path.join(root, 'app');
+    const dataDir = path.join(root, 'data');
+    const victim = path.join(root, 'important.txt');
+    fx.writeFile(victim, 'do not delete');
+    fx.seedInstall(root, { version: '1.3.1', sourceDir: src, appDir, dataDir, shortcut: victim });
+
+    const r = runUninstall(['-AppDir', appDir, '-DataDir', dataDir], root);
+    assert.equal(r.code, 0, '快捷方式被保留不该让卸载失败：' + r.out + r.err);
+    assert.ok(fs.existsSync(victim), '记录里写的路径不是我们建的快捷方式，不能删');
+    assert.equal(r.report.shortcut.removed, false);
+    assert.match(String(r.report.shortcut.reason), /\.lnk|桌面|开始菜单/, '要说明为什么不删');
+  } finally { fx.cleanup(root); }
+});
+
+test('卸载：只删目标指向本次安装的桌面快捷方式', () => {
+  const root = fx.tmpRoot('lnk-owned');
+  try {
+    const desktop = path.join(root, 'desktop');
+    fs.mkdirSync(desktop, { recursive: true });
+    const src = fx.makeSource(root, '1.3.1');
+
+    // 1) 桌面上的 .lnk，但目标是记事本 —— 不是我们建的，必须保留
+    const foreign = path.join(desktop, 'WorkDaddy.lnk');
+    makeLnk(root, foreign, path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'notepad.exe'));
+    const appDirA = path.join(root, 'app-a');
+    const dataDirA = path.join(root, 'data-a');
+    fx.seedInstall(root, { version: '1.3.1', sourceDir: src, appDir: appDirA, dataDir: dataDirA, shortcut: foreign });
+    const a = runUninstall(['-AppDir', appDirA, '-DataDir', dataDirA, '-DesktopDir', desktop], root);
+    assert.equal(a.code, 0, a.out + a.err);
+    assert.ok(fs.existsSync(foreign), '目标指向别处的快捷方式不能删');
+    assert.equal(a.report.shortcut.removed, false);
+    assert.match(String(a.report.shortcut.reason), /不是本次安装/);
+
+    // 2) 同一条记录，目标指向本次安装的启动器 —— 正常卸载要能删掉
+    const appDirB = path.join(root, 'app-b');
+    const dataDirB = path.join(root, 'data-b');
+    fx.seedInstall(root, { version: '1.3.1', sourceDir: src, appDir: appDirB, dataDir: dataDirB, shortcut: foreign });
+    const own = path.join(desktop, 'WorkDaddy-own.lnk');
+    makeLnk(root, own, path.join(appDirB, 'scripts', 'launcher.cmd'));
+    const stateFile = path.join(dataDirB, 'install-state.json');
+    const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    state.shortcut = own;
+    fx.writeFile(stateFile, JSON.stringify(state, null, 2));
+
+    const b = runUninstall(['-AppDir', appDirB, '-DataDir', dataDirB, '-DesktopDir', desktop], root);
+    assert.equal(b.code, 0, b.out + b.err);
+    assert.equal(b.report.shortcut.removed, true, '自己建的快捷方式要照常删掉');
+    assert.equal(fs.existsSync(own), false);
+    assert.ok(fs.existsSync(foreign), '不能顺手把别的快捷方式也删了');
+  } finally { fx.cleanup(root); }
+});
+
