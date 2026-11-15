@@ -114,6 +114,28 @@ powershell -ExecutionPolicy Bypass -File installer\build-tray.ps1 -Verify
 `WorkDaddyTray.exe.build.json`，`-Verify` 还会真的跑 `--selftest` / `--status`。
 CI 的 `tray-build` 作业每次现编一份，并与仓库里的 EXE 做行为与字面量比对。
 
+### 端口
+
+每个客户端 profile 有独立的 UI / CDP 端口，托盘按绑定到的 profile 选择，不再假定 47832/9222：
+
+| Profile | UI | CDP |
+|---|---:|---:|
+| WorkBuddy CN | 47832 | 9222（备用 9226–9232） |
+| WorkBuddy AI | 47833 | 9223（备用 9233–9239） |
+| CodeBuddy CN | 47834 | 9224 |
+| CodeBuddy International | 47835 | 9225 |
+
+UI 端口被占用时 daemon 会退到 `-30000 / -20000 / -10000` 三档并在数据目录写 `ui-port.json`；
+托盘读这个文件时要求 `profileId` 与自己一致，避免把兄弟 profile 的端口当成自己的。
+
+### 运行边界（单运行实例）
+
+托盘用全局单实例 Mutex，`关闭 / 重启` 按命令行匹配 `WorkDaddy\scripts\(watchdog|daemon).js`，
+因此**同一台机器上只支持一份 WorkDaddy 处于运行状态**：启动第二份安装前请先在第一份里
+点「关闭」。这是当前的明确限制，不是 bug。托盘判定「已启动」时会核对 `/api/status` 的
+`profile.id`（以及可取到时比对 `dataDir`），所以端口被另一份安装占用时不会误报为已启动，
+而是显示「已停止」并把服务交给新实例启动。
+
 ## 许可证
 
 [AGPL-3.0](LICENSE)，与上游一致。上游版权归其作者所有；本 fork 的修改同样以 AGPL-3.0 发布。二次分发请保留 `LICENSE` 与来源说明（见 [`docs/upstream-tracking.md`](docs/upstream-tracking.md)）。

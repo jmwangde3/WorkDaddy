@@ -366,7 +366,7 @@ function main() {
     const standalone = lits.filter((s) => !lits.some((o) => o !== s && o.includes(s)));
     const missingFresh = standalone.filter((s) => !hasLiteral(outExe, fresh, s));
     const missingRepo = standalone.filter((s) => !hasLiteral(committedExe, repoStrs, s));
-    assert.deepEqual(missingFresh.slice(0, 10), [], '现编产物缺源码字面量（编译器/编码问题）');
+    assert.deepEqual(missingFresh.slice(0, 10), [], '现编产物缺源码字面量：' + JSON.stringify(missingFresh.slice(0, 10)));
     assert.deepEqual(missingRepo.slice(0, 10), [], '仓库 EXE 缺当前源码里的字面量：' + missingRepo.slice(0, 10).join(' | '));
   });
 

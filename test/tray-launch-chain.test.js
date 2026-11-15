@@ -94,6 +94,7 @@ function makeInstall(root, opts = {}) {
   }
   fs.mkdirSync(path.join(root, 'data'), { recursive: true });
   fs.mkdirSync(path.join(root, 'tmp'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'appdata'), { recursive: true });
   return appDir;
 }
 
@@ -106,6 +107,7 @@ function runStart(root, env) {
     WORKDADDY_TRAY_PORT: String(port),
     TEMP: path.join(root, 'tmp'),
     TMP: path.join(root, 'tmp'),
+    APPDATA: path.join(root, 'appdata'),
     NODE_OPTIONS: '',
     WBSWITCH_PROFILE: '',
     WBSWITCH_DATA_DIR: '',
@@ -128,17 +130,27 @@ function runStart(root, env) {
 function main() {
   assert(fs.existsSync(trayExe), '托盘二进制不存在：' + trayExe);
 
-  test('默认 profile + 无绑定文件：走旧记录/默认，绝不凭空造数据目录', () => {
+  test('默认 profile + 无绑定文件：走默认，绝不凭空造数据目录', () => {
     const root = tmpRoot('default');
     makeInstall(root);
     const r = runStart(root, {});
     assert(r.env, '未拉起 watchdog：' + r.cli + r.stderr);
     assert(r.env.profile === 'workbuddy-cn', '默认 profile 应为 workbuddy-cn，实际 ' + r.env.profile);
-    // 本机若存在旧版 %APPDATA%\WorkDaddy\install-state.json，会按兼容规则给出
-    // 数据目录（这是设计内的）；不管哪种情况，传给子进程的都必须是完整绝对路径。
-    if (r.env.dataDir !== null) {
-      assert(/^[A-Za-z]:[\\/]/.test(r.env.dataDir), '数据目录必须是绝对路径，实际 ' + r.env.dataDir);
-    }
+    // APPDATA 已指向测试临时目录，那里没有 install-state.json，所以只能是默认值
+    assert(r.env.dataDir === null, '没有绑定也没有旧记录时不应传数据目录，实际 ' + r.env.dataDir);
+  });
+
+  test('旧记录兼容：只从测试自己的 APPDATA 读，不碰真实用户数据', () => {
+    const root = tmpRoot('legacy');
+    makeInstall(root);
+    writeFile(path.join(root, 'appdata', 'WorkDaddy', 'install-state.json'), JSON.stringify({
+      schema: 1, clientProfile: 'codebuddy-intl', dataDir: path.join(root, 'data'), appDir: path.join(root, 'app'),
+    }, null, 2));
+    const r = runStart(root, {});
+    assert(r.env, '未拉起 watchdog：' + r.cli + r.stderr);
+    assert(r.env.profile === 'codebuddy-intl', '旧记录应生效，实际 ' + r.env.profile);
+    assert(path.resolve(r.env.dataDir).toLowerCase() === path.resolve(path.join(root, 'data')).toLowerCase(),
+      '旧记录的数据目录应生效，实际 ' + r.env.dataDir);
   });
 
   test('绑定文件：profile 与自定义数据目录原样传给 watchdog', () => {
@@ -195,7 +207,7 @@ function main() {
     const r = runStart(root, { WBSWITCH_DATA_DIR: 'C:WorkDaddyData' });
     assert(r.env === null, '非法数据目录时不得启动 watchdog');
     assert(/start = False/.test(r.cli), '应报告启动失败：' + r.cli);
-    assert(/数据目录不是完整的绝对路径/.test(r.cli), '应说明原因：' + r.cli);
+    assert(/WBSWITCH_DATA_DIR 不是完整/.test(r.cli), '应说明原因：' + r.cli);
   });
 
   test('绑定文件损坏：拒绝启动，不静默退回默认 profile', () => {
@@ -236,6 +248,70 @@ function main() {
     const r = runStart(root, {});
     assert(r.env === null, '白名单外的 profile 不得启动 watchdog');
     assert(/clientProfile 非法/.test(r.cli), '应说明 profile 非法：' + r.cli);
+  });
+  test('只设 profile 且与绑定一致：profile 生效，数据目录仍用绑定的', () => {
+    const root = tmpRoot('env-profile-only');
+    makeInstall(root, {
+      binding: {
+        schema: 1,
+        clientProfile: 'workbuddy-ai',
+        dataDir: path.join(root, 'data'),
+        appDir: path.join(root, 'app'),
+        updatedAt: '2026-11-15T00:00:00Z',
+      },
+    });
+    const r = runStart(root, { WBSWITCH_PROFILE: 'workbuddy-ai' });
+    assert(r.env, '未拉起 watchdog：' + r.cli + r.stderr);
+    assert(r.env.profile === 'workbuddy-ai');
+    assert(path.resolve(r.env.dataDir).toLowerCase() === path.resolve(path.join(root, 'data')).toLowerCase(),
+      '数据目录应沿用绑定，实际 ' + r.env.dataDir);
+  });
+
+  test('只设 profile 且与绑定冲突：拒绝半覆盖，不启动', () => {
+    const root = tmpRoot('env-half-override');
+    makeInstall(root, {
+      binding: {
+        schema: 1,
+        clientProfile: 'workbuddy-ai',
+        dataDir: path.join(root, 'data'),
+        appDir: path.join(root, 'app'),
+        updatedAt: '2026-11-15T00:00:00Z',
+      },
+    });
+    const r = runStart(root, { WBSWITCH_PROFILE: 'codebuddy-cn' });
+    assert(r.env === null, '半覆盖不得启动 watchdog');
+    assert(/冲突/.test(r.cli), '应说明 profile 与绑定冲突：' + r.cli);
+  });
+
+  test('只设 DataDir：profile 取绑定，数据目录取显式值', () => {
+    const root = tmpRoot('env-datadir-only');
+    makeInstall(root, {
+      binding: {
+        schema: 1,
+        clientProfile: 'workbuddy-ai',
+        dataDir: path.join(root, 'data'),
+        appDir: path.join(root, 'app'),
+        updatedAt: '2026-11-15T00:00:00Z',
+      },
+    });
+    const custom = path.join(root, 'explicit-data');
+    fs.mkdirSync(custom, { recursive: true });
+    const r = runStart(root, { WBSWITCH_DATA_DIR: custom });
+    assert(r.env, '未拉起 watchdog：' + r.cli + r.stderr);
+    assert(r.env.profile === 'workbuddy-ai', 'profile 应来自绑定，实际 ' + r.env.profile);
+    assert(path.resolve(r.env.dataDir).toLowerCase() === path.resolve(custom).toLowerCase(),
+      '数据目录应取显式值，实际 ' + r.env.dataDir);
+  });
+
+  test('绑定损坏时，完整环境变量也不能绕过 fail-closed', () => {
+    const root = tmpRoot('broken-plus-env');
+    makeInstall(root, { binding: '{ "schema": 1, ' });
+    const r = runStart(root, {
+      WBSWITCH_PROFILE: 'workbuddy-cn',
+      WBSWITCH_DATA_DIR: path.join(root, 'data'),
+    });
+    assert(r.env === null, '绑定损坏时任何覆盖都不得启动 watchdog');
+    assert(/安装绑定文件不可用/.test(r.cli), '应说明绑定不可用：' + r.cli);
   });
 }
 

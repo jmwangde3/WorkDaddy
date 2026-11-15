@@ -143,9 +143,13 @@ test('托盘启动服务时显式传绑定，不靠继承', () => {
   // 不能用 ProcessStartInfo.EnvironmentVariables：.NET Framework 里它是大小写不敏感的
   // StringDictionary，环境同时含 HTTPS_PROXY / https_proxy 时一访问就抛异常。
   assert.equal(/psi\.EnvironmentVariables\[/.test(cs), false);
-  // 绑定值来自 install-state.json
-  assert.match(cs, /JsonStringField\(text, "clientProfile"\)/);
-  assert.match(cs, /JsonStringField\(text, "dataDir"\)/);
+  // 绑定值来自本实例的 install-binding.json，且必须整份 JSON 严格解析：
+  // 正则取字段会被截断、尾部垃圾、重复键骗过去（重复键两边取的还是不同的值）。
+  assert.match(cs, /private static string ReadBindingFile\(/);
+  assert.match(cs, /SimpleJson\.ParseObject\(text\)/);
+  assert.match(cs, /install-binding\.json/);
+  assert.equal(/JsonStringField\(text, "clientProfile"\)/.test(cs), false,
+    '不得再用正则从绑定文件里取字段');
 });
 
 test('daemon 的归属判定都带上路径证据', () => {
