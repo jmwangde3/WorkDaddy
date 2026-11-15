@@ -213,3 +213,47 @@ test('repair reporter requires a verified Sentry send when requested', () => {
   assert.match(reporterSource, /if \(args\.requireSent && result\.sent !== true\) process\.exitCode = 1/);
   assert.match(reporterSource, /process\.exitCode = 1/);
 });
+
+// 任务书 8.1：用指定假凭证构造完整事件，捕获最终 HTTP 请求，断言请求体里没有任何假凭证。
+// 这条不看源码、不看 makeEvent 的输出，只看真正写到 socket 上的字节 ——
+// 因为漏一个字段的后果是不可撤销的（东西已经发到外部服务了）。
+test('最终发出的 Sentry 请求体不含任何凭证', () => {
+  const sharedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-sentry-capture-'));
+  try {
+    const fixture = path.join(repoRoot, 'test', 'fixtures', 'sentry-capture.js');
+    const run = childProcess.spawnSync(process.execPath, [fixture, sharedDataDir], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: 60000,
+      env: { ...process.env, WBSWITCH_PROFILE: 'workbuddy-cn' },
+    });
+    assert.equal(run.status, 0, '捕获进程失败：' + (run.stderr || ''));
+
+    const payload = JSON.parse(run.stdout);
+    assert.ok(payload.captured && payload.captured.length > 100,
+      '没有捕获到任何请求体，说明根本没走到发送路径（测试本身失效）');
+    assert.equal(payload.result && payload.result.sent, true,
+      '事件应报告为已发送，实际：' + JSON.stringify(payload.result));
+
+    const sentinels = [
+      'FAKE_BEARER_SECRET_123',
+      'FAKE_API_KEY_456',
+      'FAKE_REFRESH_TOKEN_789',
+      'FAKE_SESSION_COOKIE_321',
+      'FAKE_PASSWORD_654',
+      'FAKE_BASIC_BLOB_987',
+      'FAKE_SIGNATURE_789',
+    ];
+    for (const secret of sentinels) {
+      assert.equal(payload.captured.includes(secret), false,
+        '凭证泄漏到最终请求体：' + secret + '\n请求体片段：' + payload.captured.slice(0, 1200));
+    }
+
+    // 脱敏不能把诊断信息一起抹掉，否则 Sentry 就没有意义了
+    assert.match(payload.captured, /capture-test/, 'stage 标签应保留');
+    assert.match(payload.captured, /failed to call upstream/, '非敏感 message 部分应保留');
+    assert.doesNotMatch(payload.captured, /eyJhbGciOiJIUzI1NiJ9/, 'JWT 必须被抹掉');
+  } finally {
+    fs.rmSync(sharedDataDir, { recursive: true, force: true });
+  }
+});

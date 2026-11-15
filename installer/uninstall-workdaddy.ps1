@@ -16,7 +16,9 @@ param(
     [switch]$YesPurgeData,
     [switch]$Force,
     [switch]$DryRun,
-    [string]$Json = ''
+    [string]$Json = '',
+    # 仅用于测试注入：给快捷方式归属校验一个可信的「桌面」根。
+    [string]$DesktopDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,9 +27,11 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 if (-not $AppDir) { $AppDir = Join-Path $env:LOCALAPPDATA 'Programs\WorkDaddy' }
 if (-not $DataDir) { $DataDir = Join-Path $env:APPDATA 'WorkDaddy' }
+# 先留住原始输入：GetFullPath 会把 .. 归一化掉，等检查时就看不出路径穿越了。
+$AppDirRaw = [string]$AppDir
+$DataDirRaw = [string]$DataDir
 $AppDir = [IO.Path]::GetFullPath($AppDir).TrimEnd('\')
 $DataDir = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
-
 $report = [ordered]@{
     schema    = 1
     action    = 'uninstall'
@@ -52,6 +56,17 @@ function Fail-Uninstall {
     exit $Code
 }
 
+# 动手之前先确认这两个目录不是「删了会出事」的那种。
+# 卸载器按清单拼路径删文件，AppDir 一旦被指到盘根或用户主目录，
+# 清单里的相对路径就会被拼到那种目录下 —— 拼出来的确实在它内部，
+# 所以只靠 StartsWith 是挡不住的。
+$guard = Test-SafeRootDir -Path $AppDirRaw -Label 'AppDir'
+if ($guard) { Fail-Uninstall $guard 2 }
+$guard = Test-SafeRootDir -Path $DataDirRaw -Label 'DataDir'
+if ($guard) { Fail-Uninstall $guard 2 }
+$overlap = Test-DirOverlap -A $AppDir -B $DataDir
+if ($overlap) { Fail-Uninstall ('安装目录与数据目录不能重叠：' + $overlap) 2 }
+
 Write-Line '=============================================================='
 Write-Line ' WorkDaddy 卸载'
 Write-Line '=============================================================='
@@ -68,7 +83,27 @@ if ($PurgeData -and -not $YesPurgeData) {
 
 # 状态文件里的 appDir 优先（用户可能用自定义目录装过）
 $recordedApp = [string]$state.appDir
-if ($recordedApp) { $AppDir = $recordedApp.TrimEnd('\') }
+if ($recordedApp) {
+    $AppDir = $recordedApp.TrimEnd('\')
+    # 安装记录是本地 JSON，可能被改过；覆盖后必须重新过一次边界检查
+    $guard = Test-SafeRootDir -Path $AppDir -Label '安装记录里的 AppDir'
+    if ($guard) { Fail-Uninstall $guard 2 }
+    $overlap = Test-DirOverlap -A $AppDir -B $DataDir
+    if ($overlap) { Fail-Uninstall ('安装目录与数据目录不能重叠：' + $overlap) 2 }
+}
+
+# 删文件前先停掉本安装的进程（托盘 / watchdog / daemon）。
+# 它们握着 AppDir 里的文件句柄，不停就删不掉，最后留下半套残留。
+if (-not $DryRun) {
+    $stopResult = Stop-WorkDaddyProcesses -AppDir $AppDir
+    $report['service'] = [ordered]@{ stopped = @($stopResult.stopped); error = [string]$stopResult.error }
+    if (-not $stopResult.ok) {
+        Fail-Uninstall ('无法停止运行中的 WorkDaddy 进程：' + $stopResult.error + '；未删除任何文件') 4
+    }
+    if (@($stopResult.stopped).Count -gt 0) {
+        Write-Line ('已停止运行中的进程：' + (@($stopResult.stopped) -join ','))
+    }
+}
 
 $removed = 0
 foreach ($row in $state.files) {
@@ -114,16 +149,44 @@ if (-not $DryRun) {
     }
     # 快捷方式只删「安装时记录下来的那一条」。不按名字猜：桌面上的 WorkDaddy.lnk
     # 可能是用户自己建的（指向别的安装、或旧补丁版），删掉就是毁用户环境。
+    # 记录本身不可信，所以还要校验类型、位置和目标；任一条不成立就保留并说明。
     $recordedLnk = [string]$state.shortcut
-    if ($recordedLnk -and (Test-Path -LiteralPath $recordedLnk)) {
-        try {
-            Remove-Item -LiteralPath $recordedLnk -Force
-            $report.removed += [pscustomobject]@{ path = $recordedLnk }
-        } catch { }
+    if ($recordedLnk) {
+        $why = Test-WorkDaddyShortcut -Path $recordedLnk -AppDir $AppDir -ExtraRoots @($DesktopDir)
+        if ($why) {
+            $report['shortcut'] = [ordered]@{ path = $recordedLnk; removed = $false; reason = $why }
+            Write-Line ('保留快捷方式（' + $why + '）')
+        } elseif (Test-Path -LiteralPath $recordedLnk) {
+            try {
+                Remove-Item -LiteralPath $recordedLnk -Force
+                $report.removed += [pscustomobject]@{ path = $recordedLnk }
+                $report['shortcut'] = [ordered]@{ path = $recordedLnk; removed = $true; reason = '' }
+            } catch {
+                $report['shortcut'] = [ordered]@{ path = $recordedLnk; removed = $false; reason = $_.Exception.Message }
+            }
+        }
     }
 }
 
 if ($PurgeData) {
+    # 清理前最后一道：目录必须仍然安全，且与安装记录登记的完全一致。
+    # 这一步是「-PurgeData 只删自己的数据」的兑现方式 —— 记录被改过就拒绝。
+    $guard = Test-SafeRootDir -Path $DataDir -Label 'DataDir（清理前复核）'
+    if ($guard) { Fail-Uninstall $guard 3 }
+    # 清理必须有归属证明：install-state.json 里的 dataDir 要存在、要安全、要就是当前目标。
+    # 缺这一条时，任何被清空的 DataDir 都可能不是 WorkDaddy 的目录。
+    $recordedData = [string]$state.dataDir
+    if ([string]::IsNullOrWhiteSpace($recordedData)) {
+        Fail-Uninstall ('安装记录里没有 dataDir，无法证明 ' + $DataDir + ' 属于本次安装；拒绝清理（用户数据未改动）') 3
+    }
+    $guard = Test-SafeRootDir -Path $recordedData -Label '安装记录里的 dataDir'
+    if ($guard) { Fail-Uninstall $guard 3 }
+    $recordedFull = [IO.Path]::GetFullPath($recordedData).TrimEnd('\')
+    $targetFull = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
+    if (-not $recordedFull.Equals($targetFull, [StringComparison]::OrdinalIgnoreCase)) {
+        Fail-Uninstall ('安装记录里的数据目录（' + $recordedFull + '）与当前清理目标（' + $targetFull +
+            '）不一致；无法确认归属，拒绝清理') 3
+    }
     $report.purgeScope = @(
         '配置 config.json',
         '安装记录 install-state.json',

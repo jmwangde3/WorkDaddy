@@ -140,20 +140,20 @@
     "upstreamFileHashesByVersionNote": "部署闸门把任一已知上游代际都判为 pristine-upstream：装 1.2.20 或 1.2.22 原版都说明「没打过我们的补丁」，覆盖都会丢上游修复，都该中止。只按最新代际判会漏掉旧安装。",
     "localFileHashes": {
       "daemon.js": {
-        "sha256": "e80482f99bd059cbd7dbc8ff8ffaa86147bf63fd4d4410e09e99a8df5d504cc3",
-        "size": 765191
+        "sha256": "46cb16d096d4c15c4892bfec59615561d0fce9997703ba45d83a2550794db4d8",
+        "size": 767990
       },
       "inject.js": {
-        "sha256": "da494c60ae3b1888e4bf5d7f6da924561dc9af2a72ba943b18041a671a77de00",
-        "size": 1386452
+        "sha256": "d1a0b997e4f9d0c95b26c30236039d6fc66075196825c49d57f335fbfd4d22de",
+        "size": 1386745
       },
       "lib.js": {
         "sha256": "05c065772a9f713687ee409105870512d16645548ed9d218eeda7b1ce9a782cb",
         "size": 97740
       },
       "win-launcher.js": {
-        "sha256": "f668f07b0b98b75f21f0014b92f0a749b9079a7307c0af2649ddd48f025d5e10",
-        "size": 86752
+        "sha256": "28fbb226c39b96195be4848714800cf6d6c890925d581c078a709d8fe618d35b",
+        "size": 88712
       }
     },
     "localFileHashesNote": "本仓库 scripts/ 下补丁文件在记录时刻的 SHA-256（合并上游 1.2.22 之后重算）。deploy.ps1 判定用运行时实际计算的哈希；这一组只用于发现元数据过期（patch-drift 提示）。改动补丁文件后必须重算，deploy-safety 测试会校验两者一致。",

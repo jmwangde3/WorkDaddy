@@ -5,6 +5,121 @@
 
 格式参考 Keep a Changelog；版本号沿用 `scripts/daemon.js` 里的 `DAEMON_VERSION`。
 
+## [1.3.1] — 未发布（分支 `fix/1.3.1-reliability-security`）
+
+可靠性 + 安全加固。不新增功能，六处都是「原本会在真实环境里出事」的地方。
+
+### 修复
+
+**进程枚举：一个读不到字段的进程不该让整条查询作废**
+
+- 异常分七类：`PROCESS_DISAPPEARED` / `TRANSIENT_FIELD_MISSING` / `ACCESS_DENIED` /
+  `OWNER_UNVERIFIED` / `PATH_UNVERIFIED` / `COMMANDLINE_UNVERIFIED` / `UNKNOWN_ERROR`。
+  **只有确认进程已消失才静默跳过**，其余写 stderr 标记并交给调用方判定。
+- 新增 `enumerateCimProcesses()` 返回 `{ processes, skipped, errors, complete }`。
+  危险操作（结束进程、替换程序文件）读这个结构；`complete !== true` 一律失败关闭，
+  因为「有进程但没验证成」和「没有进程在跑」是两件事。
+- `verifiedWindowsWorkBuddyProcesses()` 改用结构化枚举：部分枚举直接抛错，
+  不再可能因为漏掉一个进程而让新实例被单实例锁挡住（表现成「重启了但没生效」）。
+- 单 PID 精确验证路径（`ConvertTo-WorkDaddyProcessRecord`）**一字未改**，安全边界不放松。
+- 修 `cdp-targets.js` 的归属兜底：原来只要有 `WBSWITCH_PROFILE` 环境变量、标题像 WorkBuddy
+  就认领页面。环境变量任何人都能设，等于把「设置过变量」当成归属证据 ——
+  实测里留着 `WBSWITCH_PROFILE=workbuddy-cn` 就能让 AI profile 认领国内版页面，
+  同一条用例在本机红、在 CI（变量为空）绿。改为要求变量值**等于**当前 profile id。
+
+**安装器：不停托盘就会替换到一半失败，而且回滚不了**
+
+- 新增共享函数 `Stop-WorkDaddyProcesses`：按命令行精确匹配停掉 daemon / watchdog，
+  并**额外结束占用 `tray\WorkDaddyTray.exe` 的进程**（托盘会锁住自己被替换的文件）。
+  停不掉就拒绝继续，绝不带着未知锁状态替换文件。
+- `Test-SafeRootDir`：拒绝盘根、Windows 目录、`%APPDATA%`/`%LOCALAPPDATA%` 父目录、
+  用户主目录、`..` 路径穿越、目录重解析点（junction / symlink）。
+- `Test-DirOverlap`：AppDir 与 DataDir 相同或互相包含一律拒绝。
+  不用 `StartsWith` 判断归属（`C:\Program\WorkDaddy-evil` 会被误认成子目录）。
+- 卸载器在**归一化之前**保留原始参数检查穿越 —— `[IO.Path]::GetFullPath` 会把 `..`
+  吃掉，等归一化完再查就查不出来了。
+- 打包器修两处：`ExcludeNames` 加 `dist`（否则把上一次的产物打进这一次的包，
+  包里还带一份过期的 `SHA256SUMS.txt`）；`SHA256SUMS.txt` 改 LF 行尾
+  （`sha256sum -c` 在 Linux/macOS 上会把 `\r` 当文件名的一部分而全部失败）。
+
+**会话去重：只比 `deleted_at` 不够**
+
+- 执行前重读并逐字段比对**身份快照**（`id` / `user_id` / `cwd` / `title` / `transport` /
+  `deleted_at`）。切换账号、改工作目录都不会碰 `deleted_at`，CAS 会照样通过，
+  但那时删的已经不是计划里那一条了。
+- sidecar 复验：`inspectSidecars` 产出摘要（文件逐个 SHA-256，目录记 文件数 + 总量 + 哈希集）。
+  计划时没有、执行前冒出来 → 中止。这是真实时间窗（会话刚被打开、附件刚生成）。
+- journal 状态机七态：`PREPARED` → `APPLYING` → `DB_COMMITTED` → `COMPLETED`，
+  异常分支 `ROLLBACK_REQUIRED` → `ROLLED_BACK`，无法判定时 `RECOVERY_REQUIRED`。
+  journal 在**写库之前**落盘 —— 否则「改了库但没留记录」这件事无从发现。
+- 新增 `resumeDedupe()`：按数据库现状（每行 `deleted_at` 是否等于本次写入值）判断
+  「已提交 / 未写入 / 现场不一致」。混合状态、行丢失、被别人改过一律停下要人看，
+  绝不自动覆盖。默认 `dryRun`，重复调用幂等。
+- 补偿回滚是否真的到位，用数据库说话，不信「没抛错就是成功」。
+- `runRollback` 同时接受 v1（只有 rows）与 v2（含 state / identity）日志 —— 升级格式
+  不能让已写进去的记录变成不可读。
+
+**Sentry：脱敏要发生在最终发出去的那一刻**
+
+- `sendEvent` 与 `queueEvent` 都对完整事件再过一遍 `sanitize`，不再只依赖调用方记得脱敏。
+  outbox 落盘同样脱敏（它迟早会被 flush 发出去，而且比网络请求躺得更久）。
+- `redactText` 补齐：裸写的 `Bearer`/`Basic`/`Token`/`Digest` 凭证（没有 `authorization:`
+  前缀时原来不认）、`x-api-key`、`Cookie`/`Set-Cookie`、命令行凭证
+  （`--password xxx`）、URL 查询参数、JWT、`sk-`/`key-` 前缀密钥。
+- `daemon.js` 的 `redactDiagnosticText` 与 sentry 用同一套规则（原来缺裸 Bearer、
+  `x-api-key`、URL 查询参数）。
+- 新增测试：构造带全套假凭证的事件，patch `https.request` 捕获**最终请求体**，
+  断言 `FAKE_BEARER_SECRET_123` 等七个 sentinel 一个都不出现。
+
+**本地 API：`/api/client/relaunch` 不再免认证**
+
+- 从 `PUBLIC_API_PATHS` 移除。它会重启客户端，属有副作用的操作；免认证时任何本机网页
+  （`Origin: null` 也在放行名单里）都能触发。
+- 状态页渲染时把 token 嵌进 HTML；`fix-cdp.cmd` 从 `%APPDATA%\WorkDaddy\.api-token` 读取。
+- Origin 校验与 Token 校验分开：`Origin: null` 通过 Origin 校验，但**不再等于通过认证**。
+- 只读路径（`/api/status`、`/api/about`、`/api/update-check`）继续免认证，否则本地 CLI
+  与状态页自检全部退化。
+
+**RC1 审查后的四处修正（同属 1.3.1）**
+
+- **launcher 的枚举完整性不能丢在第二次 `filter()` 里**：`getWorkBuddyProcesses()` 返回的
+  数组带 `complete`/`skipped`/`errors` 非枚举属性，`workBuddyProcesses()` 再 `filter()` 一次
+  就变成了裸数组 —— 「有进程没验证成」于是退化成「没有进程」。现在两层筛选用
+  `carryProcessEnumeration()` 显式接回元信息；退出 / 重启 / 启动新实例 / 结束进程走
+  `workBuddyProcessesForAction()`，`complete === false` 直接中止并给出可照做的处置说明。
+  「客户端是否已停止」改用 `clientProcessesStopped()`：枚举不完整或查询失败一律按
+  「无法确认已停止」处理，宁可推迟清理也不动还开着的客户端。
+- **去重恢复的状态必须真的写进磁盘**：`resumeDedupe()` 原来只改内存对象，进程退出后
+  日志仍停在 `APPLYING`。现在支持显式 `journalPath`，以磁盘那份为准，状态经
+  `writeJsonAtomic` 写回并**回读确认**才算成功；写不进去返回 `persist-failed`，不会
+  出现「报告恢复完成、磁盘还是 APPLYING」。恢复前校验 journal 格式、`opId` 一致性和
+  每行写入值，缺 `after` 的旧日志直接拒绝判定。`runRollback()` 不再 `catch (_) {}`
+  吞掉写入错误，改成如实报告「已回滚但日志没写回去，重跑安全」。
+- **卸载器的两个归属证明**：`-PurgeData` 要求 `install-state.json` 里存在有效 `dataDir`
+  （缺失 / 为空 / 不是安全目录 / 与清理目标不一致都拒绝）；快捷方式不再「记录里写了就删」，
+  必须是 `.lnk` 普通文件、位于桌面或开始菜单、且目标指向本次安装目录（`wscript.exe` 带
+  AppDir 参数的形式也认）。`-Force` 的删除范围没有被扩大。
+- **发布流程拆成「构建预演」与「发布」两段**：`release.yml` 用 `build_only` 输入只构建、
+  校验、上传 Artifact，不建 tag / Release；发布路径先校验 tag 实际存在、检出的 HEAD 就是
+  tag 指向的提交（手动触发原来会检出分支头，等于用错版本打包），再校验
+  「tag = `DAEMON_VERSION` = `package.json`」三方一致；已存在同名 Release 默认拒绝覆盖，
+  不再默认 `--clobber`。资产校验抽成 `tools/verify-release-assets.js`，`test.yml` 的
+  Setup 作业每次 push 都跑一遍同一份逻辑。
+
+### 变更
+
+- **Tag 规则统一为不带 `v` 前缀**（`1.3.1` 这种，沿用 1.2.x 惯例）。
+- `build-win.yml` 降级为 **LEGACY**：去掉 `push tags: v*` 触发与 Release 挂载，只留手动
+  `workflow_dispatch`。它产出的是旧补丁版资产（`WorkDaddy-Setup-*.exe` + `WorkDaddyLauncher.exe`
+  那套），与 1.3.x 的 `build-package.ps1` 产物完全不相容。之前因为只匹配 `v*` 而从未跑过，
+  但按 `v*` 打 tag 会往 Release 上挂一套来源不同的资产。
+- 新增 `release.yml`：唯一发布入口。tag 触发，调用 `installer/build-package.ps1`，
+  发布前五道闸 —— 检出的 HEAD 必须等于 tag 提交；tag 名必须等于 `DAEMON_VERSION` 和
+  `package.json` 版本；三件资产齐全且文件名带版本；`SHA256SUMS.txt` 必须覆盖全部资产
+  且每条哈希当场重算；已存在同名 Release 默认拒绝覆盖。
+- `scripts/upstream.json` 的 `localFileHashes` 随 `daemon.js` / `win-launcher.js` / `inject.js`
+  改动重算（台账过期会让 `deploy-safety` 与 `fork-sync-contract` 红）。
+
 ## [1.3.0] — 未发布（分支 `feat/full-fork-migration`）
 
 把「基于上游安装包的补丁仓库」升级为「完整、独立、可安装、可更新、可持续同步上游的改版」。

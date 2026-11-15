@@ -42,8 +42,13 @@
 | --- | --- | --- |
 | `WorkDaddy-1.3.0-portable-win-x64.zip` | 185 个文件 / 4.65 MB；含 `installer/`，解压后可直接装到本机 | ✅ |
 | `WorkDaddy-1.3.0-source.zip` | `git archive HEAD`，7.01 MB；带 `WorkDaddy-1.3.0-source/` 前缀 | ✅ |
-| `SHA256SUMS.txt` | 上面两个包的哈希，报告里也有一份 | ✅ |
+| `SHA256SUMS.txt` | 便携包 + 源码包的哈希；`-Setup` 成功时**追加** `setup.exe` 那一行。LF 行尾（`sha256sum -c` 跨平台可用） | ✅ |
 | `WorkDaddy-1.3.0-setup.exe` | `-Setup` + 找到 `ISCC.exe` 时才产出 | CI 编译 + 真机安装；**开发机未验证** |
+
+> 1.3.1 修了一处：`release\dist` 不再被打进便携包。之前 `Get-InstallFileList` 的
+> `IncludeDirs` 含 `release` 而排除列表没有 `dist`，于是「把上一次的产物打进这一次的包」——
+> 包里还会带一份过期的 `SHA256SUMS.txt`，哈希对不上自己。`package-hygiene` 报的是
+> 「便携包里这些文本文件不是 LF：release/dist/SHA256SUMS.txt」。
 
 Setup 的设计是**引导器而不是第二套安装逻辑**：解便携包到临时目录 → 调
 `install-workdaddy.ps1` → 卸载时调 `uninstall-workdaddy.ps1`（脚本随包落在 `{app}\_setup`）。
@@ -80,13 +85,32 @@ powershell -File .github/scripts/check-powershell.ps1 -Root .
 
 ```bash
 node test/run-ci.js
-# 文件 193 / 用例 1700+ / 新增失败 0 / 历史失败 49
+# 文件 201 / 用例 1740 / 通过 1686 / 历史失败 47 / 跳过 7 / 新增失败 0
 ```
 
-## 5. 发布前人工清单（还没做，也不会自动做）
+## 5. 发布流程与人工清单
 
-1. 在**装有 Inno Setup 6** 的机器上 `installer\build-package.ps1 -Setup`，实测安装 → 卸载 → 数据保留。
-2. 在一台**没有装过** WorkDaddy 的机器上跑便携包与安装器。
-3. 在一台**装过旧补丁版**的机器上验证配置迁移（`legacy-import`）。
-4. 人工打 tag（`v1.3.0`）并触发 `build-win.yml`；本分支不合 main、不打 tag、不发 Release。
-5. 发布说明里必须写明：个人改版、AGPL-3.0、与 WorkBuddy 官方无关、数据位置与卸载方式。
+### 5.1 Tag 规则（1.3.1 统一）
+
+**tag 名不带 `v` 前缀**，形如 `1.3.0` —— 与实际发布的 1.3.0、以及 1.2.x 的历史惯例一致。
+
+| workflow | 触发 | 产出 | 是否挂 Release |
+| --- | --- | --- | --- |
+| `release.yml` | `push tags: [0-9]+.[0-9]+.[0-9]+` / 手动 | `build-package.ps1` 那套（setup + portable + source + SHA256SUMS） | **是，唯一入口** |
+| `build-win.yml`（LEGACY） | 仅手动 `workflow_dispatch` | 旧补丁版资产（`WorkDaddy-Setup-*.exe` + `WorkDaddyLauncher.exe` 那套） | 否（1.3.1 起移除） |
+| `test.yml` | push / PR | 无（只跑测试） | 否 |
+
+`release.yml` 的两道闸：
+
+1. **tag 名必须等于 `scripts/daemon.js` 的 `DAEMON_VERSION`**。不一致直接失败 ——
+   防止「tag 是 1.3.1、程序还写着 1.3.0」这种发布。
+2. **`SHA256SUMS.txt` 必须覆盖全部资产，且每条哈希当场重算**。只检查「清单存在」
+   是不够的：一份只覆盖一半资产的清单看起来有校验，实际没有。
+
+### 5.2 仍需人工做的事
+
+1. 在一台**没有装过** WorkDaddy 的机器上跑便携包与安装器。
+2. 在一台**装过旧补丁版**的机器上验证配置迁移（`legacy-import`）。
+3. 打 tag 前先 `workflow_dispatch` 空跑一次 `release.yml`：它至今**没有被真正触发过**，
+   语法与逻辑经本地核对，但「首次真跑」仍是未验证状态。
+4. 发布说明里必须写明：个人改版、AGPL-3.0、与 WorkBuddy 官方无关、数据位置与卸载方式。

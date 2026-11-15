@@ -253,11 +253,33 @@ function createRehomeRunner(options = {}) {
     const file = String(journalPath || '');
     if (!file || !fs.existsSync(file)) throw new Error(`操作日志不存在: ${file || '(未指定)'}`);
     const journal = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!journal || journal.version !== 1 || !Array.isArray(journal.rows)) {
+    // v1 只有 rows；v2 增加了 state 与 identity。两者都能回滚 —— 旧日志不能因为
+    // 升级了格式就变成不可读，那等于把已经写进去的记录丢在半路。
+    const supported = journal && (journal.version === 1 || journal.version === 2) && Array.isArray(journal.rows);
+    if (!supported) {
       throw new Error('操作日志格式不支持');
     }
+    // 已经是终态的回滚没有必要重做，直接说清楚而不是再跑一遍。
+    if (journal.state === 'ROLLED_BACK') {
+      return { ok: true, total: journal.rows.length, restored: 0, skipped: [], dryRun: !!opts.dryRun, alreadyTerminal: true };
+    }
     const db = createSessionDb({ dbPath });
-    return dedupe.rollbackDedupe(db, journal, { dryRun: !!opts.dryRun });
+    const result = await dedupe.rollbackDedupe(db, journal, { dryRun: !!opts.dryRun });
+    if (!opts.dryRun && result.ok && !result.skipped.length) {
+      // 会话已经回滚进库了，但操作日志必须写回磁盘才算这条记录闭环。
+      // 吞掉写入错误会让命令报告「已回滚」而磁盘仍停在 APPLYING —— 下次恢复
+      // 会以为操作没结束，甚至再回滚一遍。
+      const written = dedupe.persistJournalState(file, journal, 'ROLLED_BACK');
+      if (!written.ok) {
+        return {
+          ...result, ok: false, persisted: false, action: 'persist-failed',
+          error: written.error,
+          note: '会话已回滚，但操作日志未能写回状态；重跑本命令是安全的（回滚幂等）',
+        };
+      }
+      return { ...result, persisted: true, journal: written.journal };
+    }
+    return result;
   }
 
   /**

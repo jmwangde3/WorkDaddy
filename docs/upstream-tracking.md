@@ -7,7 +7,7 @@
 
 | 项 | 值 | 怎么来的 |
 | --- | --- | --- |
-| Fork 版本 | `1.3.0` | `scripts/daemon.js` 的 `DAEMON_VERSION` |
+| Fork 版本 | `1.3.1` | `scripts/daemon.js` 的 `DAEMON_VERSION` |
 | Fork 分叉点（BASE） | `fb9f8db` = 上游 1.2.20 | `git merge-base HEAD upstream/main` |
 | 已并入的上游最新提交 | `9b9bad5` = 上游 1.2.22 | 双父合并提交 `42e517e` |
 | 上游仓库 | `https://github.com/babygoton/WorkDaddy` | remote `upstream` |

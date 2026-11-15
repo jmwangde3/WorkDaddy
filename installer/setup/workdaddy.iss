@@ -6,7 +6,7 @@
 ; 避免 Setup 与脚本两条安装逻辑各自漂移。
 ;
 ; 编译：
-;   ISCC.exe /DAppVersion=1.3.0 /DRepoRoot=<仓库根> /DOutDir=<输出目录> installer\setup\workdaddy.iss
+;   ISCC.exe /DAppVersion=1.3.1 /DRepoRoot=<仓库根> /DOutDir=<输出目录> installer\setup\workdaddy.iss
 ; installer\build-package.ps1 -Setup 会自动带上这三个参数。
 ;
 ; ⚠ 本文件尚未在真机编译验证：开发机没有 Inno Setup 6。首次真正发 Setup 前

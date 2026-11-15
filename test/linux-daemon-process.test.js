@@ -2,10 +2,15 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { isVerifiedLinuxDaemonProcess } = require('../scripts/linux-daemon-process.js');
+
+// 不能用 os.tmpdir()：被客户端拉起的环境里 TEMP 会被改到
+// %APPDATA%\WorkDaddy\client-tmp\<profile>，那正是真实用户数据目录内部，
+// 测试随后的一次递归删除就在用户数据里发生了（见 docs/migration/04-installer.md §7）。
+// 仓库内 tmp/ 已 gitignore，与 installer 系列测试的约定一致。
+const tmpBase = path.join(__dirname, '..', 'tmp');
 
 test('both Linux launchers delegate daemon termination to the verified process boundary', () => {
   for (const name of ['install-linux.sh', 'relaunch-with-cdp-linux.sh']) {
@@ -16,7 +21,8 @@ test('both Linux launchers delegate daemon termination to the verified process b
 });
 
 test('Linux installer only stops its exact same-user daemon', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-proc-test-'));
+  fs.mkdirSync(tmpBase, { recursive: true });
+  const root = fs.mkdtempSync(path.join(tmpBase, 'linux-daemon-proc-'));
   const pid = 12345;
   const nodePath = process.execPath;
   const scriptPath = path.join(root, 'scripts', 'daemon.js');
@@ -42,6 +48,8 @@ test('Linux installer only stops its exact same-user daemon', () => {
     assert.equal(isVerifiedLinuxDaemonProcess(pid, options), false);
     assert.equal(isVerifiedLinuxDaemonProcess(0, options), false);
   } finally {
+    // 只删本次 mkdtemp 建出来的那一层；里面的 exe 是符号链接，rmSync 删链接本身，
+    // 不会顺着链接去动 node 可执行文件。
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
