@@ -4,15 +4,16 @@
  *
  *   node test/tray-ports-binding.test.js
  *
- * 三块互相独立，但都只在 Windows 上有意义（托盘是 winexe，`csc.exe` 才有产物）：
+ * 四块互相独立，但都只在 Windows 上有意义（托盘是 winexe，`csc.exe` 才有产物）：
  *
  *   1. 端口：四个 profile 各有自己的 UI/CDP 端口。托盘写死 47832/9222 时，
  *      AI / CodeBuddy 的「启动判断、状态、管理页、恢复 CDP」全会打到 CN 上。
- *   2. 绑定：install-binding.json 必须是合法 JSON 整体，schema 严格等于 1，
- *      profile 在白名单内，两个目录都是完整绝对路径。正则取字段骗不过截断、
- *      尾部垃圾和重复键。
- *   3. 归属：端口开着不等于「我的 daemon 在跑」—— 必须 /api/status 的 profile
- *      对得上。这里用独立进程的 mock daemon，不启动真实客户端与服务。
+ *   2. 绑定：install-binding.json 必须是合法 JSON 整体（数字也必须是 JSON 数字），
+ *      schema 严格等于 1，profile 在白名单内，两个目录都是完整绝对路径。
+ *   3. 归属：端口开着不等于「我的 daemon 在跑」。同 profile、另一个数据目录的
+ *      实例也不能认领 —— dataDir 只在 token 认证通过时才出现在 /api/status 里，
+ *      所以「拿不到 dataDir」本身就必须判失败。
+ *   4. CDP：以 daemon 的 cdp.connected / cdp.port 为准，不看 TCP 端口开放。
  */
 const fs = require('fs');
 const path = require('path');
@@ -25,6 +26,7 @@ const tmpBase = path.join(repo, 'tmp');
 const isWin = process.platform === 'win32';
 let counter = 0;
 const roots = [];
+const children = [];
 let failures = 0;
 
 function test(name, fn) {
@@ -80,6 +82,9 @@ function makeInstall(tag, profile, opts = {}) {
     const value = typeof opts.binding === 'string' ? opts.binding : JSON.stringify(opts.binding, null, 2);
     writeFile(path.join(appDir, 'install-binding.json'), value);
   }
+  if (opts.token !== undefined) {
+    writeFile(path.join(dataDir, '.api-token'), opts.token);
+  }
   return { root, appDir, dataDir, profile };
 }
 
@@ -91,6 +96,10 @@ function bindingFor(ctx, overrides = {}) {
     appDir: ctx.appDir,
     updatedAt: '2026-11-15T00:00:00Z',
   }, overrides);
+}
+
+function writeBinding(ctx, overrides) {
+  writeFile(path.join(ctx.appDir, 'install-binding.json'), JSON.stringify(bindingFor(ctx, overrides), null, 2));
 }
 
 function baseEnv(ctx, extra) {
@@ -120,7 +129,7 @@ function runTray(ctx, args, extraEnv) {
   // 先删掉上一次的输出，避免读到陈旧内容（同一 ctx 会被多次调用）
   try { fs.rmSync(path.join(ctx.root, 'tmp', 'WorkDaddyTray-cli.txt'), { force: true }); } catch (_) {}
   const r = spawnSync(trayExe, args, {
-    encoding: 'utf8', timeout: 30000, windowsHide: true, env: baseEnv(ctx, extraEnv), cwd: ctx.root,
+    encoding: 'utf8', timeout: 40000, windowsHide: true, env: baseEnv(ctx, extraEnv), cwd: ctx.root,
   });
   return { code: r.status, stderr: r.stderr || '', cli: readCli(ctx) };
 }
@@ -134,34 +143,48 @@ function freePort() {
   return port;
 }
 
+// mock daemon：按真实 daemon 的规矩返回 /api/status ——
+// dataDir / appDir 只在 x-workdaddy-token 与自己的 token 一致时才出现。
 const MOCK_DAEMON = [
   "'use strict';",
   "const http = require('http');",
   "const fs = require('fs');",
-  'const port = Number(process.argv[2]);',
-  'const profile = process.argv[3] || "";',
-  'const dataDir = process.argv[4] || "";',
-  'const ready = process.argv[5];',
+  'const cfg = JSON.parse(process.argv[2]);',
   'const server = http.createServer((req, res) => {',
   "  const p = String(req.url || '').split('?')[0];",
   "  if (p === '/api/status') {",
+  "    const supplied = String(req.headers['x-workdaddy-token'] || '');",
+  '    const authed = Boolean(cfg.token) && supplied === cfg.token;',
   "    res.setHeader('content-type', 'application/json');",
-  '    res.end(JSON.stringify({ ok: true, version: "1.3.1", profile: { id: profile }, dataDir: dataDir }));',
+  '    const body = { ok: true, version: "1.3.1", profile: { id: cfg.profile } };',
+  '    if (cfg.cdp !== undefined) body.cdp = cfg.cdp;',
+  '    if (cfg.client !== undefined) body.client = cfg.client;',
+  '    if (authed) {',
+  '      if (cfg.omitDataDir !== true) body.dataDir = cfg.dataDir;',
+  '      if (cfg.appDir) body.appDir = cfg.appDir;',
+  '    }',
+  '    res.end(JSON.stringify(body));',
+  '    return;',
+  '  }',
+  "  if (p === '/api/client/relaunch') {",
+  "    res.setHeader('content-type', 'application/json');",
+  "    res.end(JSON.stringify({ ok: true }));",
   '    return;',
   '  }',
   '  res.statusCode = 404;',
   "  res.end('{}');",
   '});',
-  "server.listen(port, '127.0.0.1', () => fs.writeFileSync(ready, String(port)));",
+  "server.listen(cfg.port, '127.0.0.1', () => fs.writeFileSync(cfg.ready, String(cfg.port)));",
 ].join('\n');
 
-function startMockDaemon(root, port, profile, dataDir) {
+function startMockDaemon(root, cfg) {
   const script = path.join(root, 'mock-daemon.js');
-  const ready = path.join(root, 'mock.ready');
+  const ready = path.join(root, 'mock.ready.' + (counter++));
   writeFile(script, MOCK_DAEMON);
-  const child = spawn(process.execPath, [script, String(port), profile, dataDir || '', ready], {
+  const child = spawn(process.execPath, [script, JSON.stringify(Object.assign({ ready }, cfg))], {
     stdio: 'ignore', windowsHide: true,
   });
+  children.push(child);
   for (let i = 0; i < 60 && !fs.existsSync(ready); i += 1) sleepSync(100);
   if (!fs.existsSync(ready)) {
     try { child.kill(); } catch (_) {}
@@ -170,13 +193,43 @@ function startMockDaemon(root, port, profile, dataDir) {
   return child;
 }
 
+// 只监听、不应答 /api/status 的进程：模拟「端口被别的程序占着」。
+function startSquatter(root, port) {
+  const script = path.join(root, 'squatter.js');
+  writeFile(script, [
+    "'use strict';",
+    "const net = require('net');",
+    'const port = Number(process.argv[2]);',
+    "net.createServer((socket) => socket.end('')).listen(port, '127.0.0.1');",
+    'setTimeout(() => process.exit(0), 60000);',
+  ].join('\n'));
+  const child = spawn(process.execPath, [script, String(port)], { stdio: 'ignore', windowsHide: true });
+  children.push(child);
+  for (let i = 0; i < 60; i += 1) {
+    const probe = spawnSync(process.execPath, ['-e',
+      "const s=require('net').createConnection({host:'127.0.0.1',port:" + port + "});s.on('connect',()=>{console.log('up');s.destroy()});s.on('error',()=>{})",
+    ], { encoding: 'utf8', timeout: 5000 });
+    if (String(probe.stdout || '').includes('up')) return child;
+    sleepSync(100);
+  }
+  throw new Error('squatter 未就绪');
+}
+
+/** 绑定文件里的 schema 用原始文本写入，用来造非法 JSON 数字。 */
+function bindingTextWithSchema(ctx, rawSchema) {
+  return '{"schema":' + rawSchema +
+    ',"clientProfile":"' + ctx.profile +
+    '","dataDir":' + JSON.stringify(ctx.dataDir) +
+    ',"appDir":' + JSON.stringify(ctx.appDir) + '}';
+}
+
 function main() {
   assert(fs.existsSync(trayExe), '托盘二进制不存在：' + trayExe);
 
   test('四种 profile 使用各自的 UI 端口与 CDP 端口', () => {
     for (const profile of PROFILES) {
       const ctx = makeInstall('ports-' + profile, profile);
-      writeFile(path.join(ctx.appDir, 'install-binding.json'), JSON.stringify(bindingFor(ctx), null, 2));
+      writeBinding(ctx);
       const r = runTray(ctx, ['--ports'], {});
       assert(/ui\s+: (\d+)/.test(r.cli), '缺 ui 行：' + r.cli);
       const ui = Number(r.cli.match(/ui\s+: (\d+)/)[1]);
@@ -188,6 +241,8 @@ function main() {
       assert(uiC === [base, base - 30000, base - 20000, base - 10000].join(','),
         profile + ' UI 候选应为与 ui-port.js 同序的四档，实际 ' + uiC);
       assert(cdp === CDP_BASE[profile], profile + ' CDP 端口应为 ' + CDP_BASE[profile] + '，实际 ' + cdp);
+      assert(cdpC.split(',').includes(String(CDP_BASE[profile])),
+        profile + ' CDP 候选必须包含默认端口，实际 ' + cdpC);
       if (profile === 'codebuddy-cn') assert(cdpC === '9224', 'codebuddy-cn 只应认 9224，实际 ' + cdpC);
       if (profile === 'codebuddy-intl') assert(cdpC === '9225', 'codebuddy-intl 只应认 9225，实际 ' + cdpC);
       if (profile === 'workbuddy-ai') assert(/^9223,9233,/.test(cdpC), 'AI 备用 CDP 应在 9233+，实际 ' + cdpC);
@@ -197,7 +252,7 @@ function main() {
 
   test('绑定文件：合法 JSON 通过校验', () => {
     const ctx = makeInstall('json-ok', 'workbuddy-ai');
-    writeFile(path.join(ctx.appDir, 'install-binding.json'), JSON.stringify(bindingFor(ctx), null, 2));
+    writeBinding(ctx);
     const r = runTray(ctx, ['--check-binding', path.join(ctx.appDir, 'install-binding.json')], {});
     assert(/binding = ok: profile=workbuddy-ai/.test(r.cli), '应通过：' + r.cli);
   });
@@ -241,38 +296,197 @@ function main() {
     }
   });
 
-  test('端口归属：mock daemon 的 profile 与绑定时才算运行中', () => {
-    const ctx = makeInstall('identity', 'workbuddy-ai');
-    writeFile(path.join(ctx.appDir, 'install-binding.json'), JSON.stringify(bindingFor(ctx), null, 2));
-    const port = freePort();
-    const child = startMockDaemon(ctx.root, port, 'workbuddy-ai', ctx.dataDir);
-    try {
-      const same = runTray(ctx, ['--status'], { WORKDADDY_TRAY_PORT: String(port) });
-      assert(/daemon\s+: running/.test(same.cli), '同 profile 应判定为运行中：' + same.cli);
+  test('绑定文件：JSON 数字严格语法（01 / 1. / 1e / +1 / 全角 / 溢出）', () => {
+    const ctx = makeInstall('json-number', 'workbuddy-ai');
+    const file = path.join(ctx.appDir, 'install-binding.json');
 
-      // 同一个端口、同一个 daemon，但托盘绑定的是另一个 profile：必须判为未运行
-      const other = makeInstall('identity-other', 'codebuddy-cn');
-      writeFile(path.join(other.appDir, 'install-binding.json'), JSON.stringify(bindingFor(other), null, 2));
-      const mismatch = runTray(other, ['--status'], { WORKDADDY_TRAY_PORT: String(port) });
-      assert(/daemon\s+: stopped/.test(mismatch.cli),
-        '兄弟 profile 的 daemon 不能被认成自己已启动：' + mismatch.cli);
+    // 合法的 1 / 1.0 / 1e0 都必须被当作 schema=1 接受
+    for (const raw of ['1', '1.0', '1e0', '1E0', '1.0e0', '0.1e1']) {
+      writeFile(file, bindingTextWithSchema(ctx, raw));
+      const out = runTray(ctx, ['--check-binding', file], {}).cli;
+      assert(/binding = ok: profile=workbuddy-ai/.test(out), 'schema=' + raw + ' 应通过：' + out);
+    }
+
+    // 非法数字：整份文档必须被拒，错误信息要说清「不是合法 JSON」
+    const bad = [
+      ['01', /前导零|不是合法 JSON/],
+      ['-01', /前导零|不是合法 JSON/],
+      ['1.', /小数点后|不是合法 JSON/],
+      ['1e', /指数|不是合法 JSON/],
+      ['1e+', /指数|不是合法 JSON/],
+      ['+1', /不是合法 JSON/],
+      ['-', /不是合法 JSON/],
+      ['\uFF11', /不是合法 JSON/],          // 全角数字 1
+      ['\u0661', /不是合法 JSON/],          // 阿拉伯-印度数字 1
+      ['1e400', /不是合法 JSON/],           // double 溢出
+      ['1e-400', /不是合法 JSON|schema 必须严格等于 1/],
+      ['NaN', /不是合法 JSON/],
+      ['Infinity', /不是合法 JSON/],
+      ['1 2', /不是合法 JSON/],
+      ['--1', /不是合法 JSON/],
+    ];
+    for (const [raw, pattern] of bad) {
+      writeFile(file, bindingTextWithSchema(ctx, raw));
+      const out = runTray(ctx, ['--check-binding', file], {}).cli;
+      assert(pattern.test(out), 'schema=' + JSON.stringify(raw) + ' 应拒绝，实际：' + out);
+    }
+  });
+
+  test('DataDir 身份：同 profile 但拿不到 dataDir 一律不算「我的 daemon」', () => {
+    const ctx = makeInstall('identity-datadir', 'workbuddy-ai', { token: 'TOKEN_A' });
+    writeBinding(ctx);
+    const port = freePort();
+    const child = startMockDaemon(ctx.root, {
+      port, profile: 'workbuddy-ai', dataDir: ctx.dataDir, appDir: ctx.appDir, token: 'TOKEN_A',
+    });
+    try {
+      const ok = runTray(ctx, ['--status'], { WORKDADDY_TRAY_PORT: String(port) });
+      assert(/daemon\s+: running/.test(ok.cli), '同 profile + 正确 token + 同 dataDir 应 running：' + ok.cli);
+
+      // 同 profile、另一个安装、另一个数据目录、另一个 token → 不能认领
+      const other = makeInstall('identity-datadir-b', 'workbuddy-ai', { token: 'TOKEN_B' });
+      writeBinding(other);
+      const wrongToken = runTray(other, ['--status'], { WORKDADDY_TRAY_PORT: String(port) });
+      assert(/daemon\s+: stopped/.test(wrongToken.cli),
+        'token 不对就拿不到 dataDir，必须判 stopped：' + wrongToken.cli);
+
+      // 没有 token 文件 → 不带 x-workdaddy-token → 同样拿不到 dataDir
+      const noToken = makeInstall('identity-datadir-c', 'workbuddy-ai');
+      writeBinding(noToken);
+      const noTokenOut = runTray(noToken, ['--status'], { WORKDADDY_TRAY_PORT: String(port) });
+      assert(/daemon\s+: stopped/.test(noTokenOut.cli), '缺 token 必须判 stopped：' + noTokenOut.cli);
+
+      // 同 profile + 正确 token + 不同 dataDir → 拒绝
+      const otherDir = makeInstall('identity-datadir-d', 'workbuddy-ai', { token: 'TOKEN_A' });
+      writeBinding(otherDir);
+      const different = runTray(otherDir, ['--status'], { WORKDADDY_TRAY_PORT: String(port) });
+      assert(/daemon\s+: stopped/.test(different.cli), 'dataDir 不同必须判 stopped：' + different.cli);
+
+      // 路径大小写不同 → 按 Windows 规则接受。
+      // appDir 是安装归属的第二条证据：daemon 报的 appDir 必须就是这一份安装，
+      // 所以这里用同一份安装 + 只把绑定里的 dataDir 换大小写。
+      const caseCtx = makeInstall('identity-datadir-case', 'workbuddy-ai', { token: 'TOKEN_A' });
+      const casePort = freePort();
+      const caseDaemon = startMockDaemon(ctx.root, {
+        port: casePort, profile: 'workbuddy-ai', dataDir: ctx.dataDir,
+        appDir: caseCtx.appDir, token: 'TOKEN_A',
+      });
+      try {
+        writeBinding(caseCtx, { dataDir: ctx.dataDir.toUpperCase() });
+        const upper = runTray(caseCtx, ['--status'], { WORKDADDY_TRAY_PORT: String(casePort) });
+        assert(/daemon\s+: running/.test(upper.cli), '大小写不同的同一路径应 running：' + upper.cli);
+      } finally {
+        try { caseDaemon.kill(); } catch (_) {}
+      }
     } finally {
       try { child.kill(); } catch (_) {}
     }
   });
 
-  test('端口被占用时不误判：启动判断走的是 /api/status 身份，不是端口', () => {
-    const ctx = makeInstall('occupied', 'workbuddy-ai');
-    writeFile(path.join(ctx.appDir, 'install-binding.json'), JSON.stringify(bindingFor(ctx), null, 2));
+  test('DataDir 身份：认证通过但这些字段不对，也要判 stopped', () => {
+    const ctx = makeInstall('identity-fields', 'workbuddy-ai', { token: 'TOKEN_A' });
+    writeBinding(ctx);
     const port = freePort();
-    // 端口上跑的是「别人的 daemon」：有响应，但 profile 不是我们的
-    const squatter = startMockDaemon(ctx.root, port, 'workbuddy-cn', '');
+
+    const cases = [
+      // 认证通过但 daemon 不返回 dataDir：身份证据不完整
+      [{ omitDataDir: true }, /daemon\s+: stopped/],
+      // 空字符串
+      [{ dataDir: '' }, /daemon\s+: stopped/],
+      // 相对路径
+      [{ dataDir: 'data' }, /daemon\s+: stopped/],
+      // 类型不是字符串
+      [{ dataDir: 123 }, /daemon\s+: stopped/],
+      // appDir 指向另一个安装
+      [{ appDir: path.join(ctx.root, 'another-install') }, /daemon\s+: stopped/],
+    ];
+    for (const [override, pattern] of cases) {
+      const cfg = Object.assign({
+        port, profile: 'workbuddy-ai', dataDir: ctx.dataDir, appDir: ctx.appDir, token: 'TOKEN_A',
+      }, override);
+      const child = startMockDaemon(ctx.root, cfg);
+      try {
+        const out = runTray(ctx, ['--status'], { WORKDADDY_TRAY_PORT: String(port) });
+        assert(pattern.test(out.cli), JSON.stringify(override) + ' 应判 stopped，实际：' + out.cli);
+      } finally {
+        try { child.kill(); } catch (_) {}
+        sleepSync(300);
+      }
+    }
+  });
+
+  test('端口归属：兄弟 profile 的 daemon 不能被认成自己', () => {
+    const ctx = makeInstall('identity', 'workbuddy-ai', { token: 'TOKEN_A' });
+    writeBinding(ctx);
+    const port = freePort();
+    const child = startMockDaemon(ctx.root, {
+      port, profile: 'workbuddy-cn', dataDir: ctx.dataDir, appDir: ctx.appDir, token: 'TOKEN_A',
+    });
     try {
       const r = runTray(ctx, ['--status'], { WORKDADDY_TRAY_PORT: String(port) });
       assert(/daemon\s+: stopped/.test(r.cli), '兄弟 profile 的 daemon 不能被当成自己：' + r.cli);
     } finally {
-      try { squatter.kill(); } catch (_) {}
+      try { child.kill(); } catch (_) {}
     }
+  });
+
+  test('端口被占用时不误判：端口上不是我们的服务就判 stopped', () => {
+    const ctx = makeInstall('occupied', 'workbuddy-ai', { token: 'TOKEN_A' });
+    writeBinding(ctx);
+    const port = freePort();
+    startSquatter(ctx.root, port);
+    const r = runTray(ctx, ['--status'], { WORKDADDY_TRAY_PORT: String(port) });
+    assert(/daemon\s+: stopped/.test(r.cli), '不应答 /api/status 的服务不能被当成 daemon：' + r.cli);
+  });
+
+  test('CDP：以 daemon 的 cdp.connected / cdp.port 为准，端口开着不算连上', () => {
+    const ctx = makeInstall('cdp', 'workbuddy-ai', { token: 'TOKEN_A' });
+    writeBinding(ctx);
+    const port = freePort();
+
+    const runWith = (cdp) => {
+      const child = startMockDaemon(ctx.root, {
+        port, profile: 'workbuddy-ai', dataDir: ctx.dataDir, appDir: ctx.appDir, token: 'TOKEN_A', cdp,
+      });
+      try {
+        return runTray(ctx, ['--status'], { WORKDADDY_TRAY_PORT: String(port) }).cli;
+      } finally {
+        try { child.kill(); } catch (_) {}
+        sleepSync(300);
+      }
+    };
+
+    // 端口开着（我们的 mock 就在这个端口上）但 daemon 说没连
+    let out = runWith({ connected: false, port: null });
+    assert(/cdp\s+: disconnected/.test(out), 'connected=false 必须判断开：' + out);
+
+    // 缺失 / 类型错误
+    out = runWith({ port: 9223 });
+    assert(/cdp\s+: disconnected/.test(out), '缺 connected 必须判断开：' + out);
+    out = runWith({ connected: 'true', port: 9223 });
+    assert(/cdp\s+: disconnected/.test(out), 'connected 不是布尔必须判断开：' + out);
+    out = runWith({ connected: true });
+    assert(/cdp\s+: disconnected/.test(out), '缺 port 必须判断开：' + out);
+    out = runWith({ connected: true, port: '9223' });
+    assert(/cdp\s+: disconnected/.test(out), 'port 不是数字必须判断开：' + out);
+    out = runWith({ connected: true, port: 9223.5 });
+    assert(/cdp\s+: disconnected/.test(out), 'port 不是整数必须判断开：' + out);
+    out = runWith({ connected: true, port: 99999 });
+    assert(/cdp\s+: disconnected/.test(out), 'port 越界必须判断开：' + out);
+    // 兄弟 profile 的 CDP 端口对当前 profile 不算合法候选
+    out = runWith({ connected: true, port: 9222 });
+    assert(/cdp\s+: disconnected/.test(out), '别的 profile 的 CDP 端口必须判断开：' + out);
+
+    // 合法连接：备用端口 9233 也要认，并且状态里显示实际端口
+    out = runWith({ connected: true, port: 9233 });
+    assert(/cdp\s+: connected/.test(out), 'connected=true + 合法备用端口应判连接：' + out);
+    assert(/ports\s+: ui=\d+ cdp=9233/.test(out), '状态应显示实际 CDP 端口 9233：' + out);
+
+    // 默认 CDP 端口 9223 被无关程序占着，实际连的是 9233：不能被 9223 骗到
+    startSquatter(ctx.root, 9223);
+    out = runWith({ connected: true, port: 9233 });
+    assert(/cdp\s+: connected/.test(out), '备用端口场景应判连接：' + out);
+    assert(!/cdp=9223\b/.test(out), '不能把被占用的默认端口当成实际端口：' + out);
   });
 
   test('APPDATA 隔离：旧记录只从测试自己的 APPDATA 读', () => {
@@ -285,6 +499,15 @@ function main() {
     const r = runTray(ctx, ['--status'], {});
     assert(/profile=codebuddy-intl/.test(r.cli), '应从测试 APPDATA 读到旧记录：' + r.cli);
     assert(/source=install-state\.json/.test(r.cli), '来源应为 install-state.json：' + r.cli);
+  });
+
+  test('管理页与工具提示：跟着当前 profile 的实际 UI 端口，不写死 47832', () => {
+    const cs = fs.readFileSync(path.join(repo, 'tray', 'WorkDaddyTray.cs'), 'utf8');
+    assert(!/打开 http:\/\/127\.0\.0\.1:47832/.test(cs), 'tooltip 不得写死 47832');
+    assert(/private static string OpenPageTip\(\)/.test(cs), '应有统一的 OpenPageTip()');
+    assert(/s_open = AddItem\("打开管理页", OpenPageTip\(\)\)/.test(cs), '构建菜单应使用 OpenPageTip()');
+    assert(/s_open\.ToolTipText = OpenPageTip\(\);/.test(cs), '状态刷新应同步 tooltip（备用端口会变）');
+    assert(/Process\.Start\(DaemonUri \+ "\/"\)/.test(cs), '打开管理页应使用 DaemonUri');
   });
 
   test('多实例边界：单运行实例（全局 Mutex + 与安装目录无关的进程匹配）', () => {
@@ -302,6 +525,9 @@ function main() {
 try {
   main();
 } finally {
+  for (const child of children) {
+    try { child.kill(); } catch (_) {}
+  }
   for (const dir of roots) {
     try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch (_) {}
   }

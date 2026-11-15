@@ -111,6 +111,9 @@ namespace WorkDaddyTray
         private static ToolStripMenuItem s_auto;
         private static ToolStripMenuItem s_open;
         private static volatile bool s_busy;
+        private static volatile int s_busyState;      // 0=进行中 1=成功 -1=失败
+        private static string s_busyOkText = "";
+        private static string s_busyErrorText = "";
         private static int s_autoTick;
         private static bool s_autoStartDone;
         private static bool s_waitingCdp;
@@ -550,8 +553,14 @@ namespace WorkDaddyTray
             catch { return null; }
         }
 
-        // 端口开着不等于「我的 daemon 在跑」：必须 profile 相同（有权限时再比 dataDir）。
-        // 只按端口判断会把兄弟 profile 的 daemon 当成自己已启动，之后所有请求都打错对象。
+        // 端口开着不等于「我的 daemon 在跑」：必须 profile 相同，且（本实例有明确数据
+        // 目录时）dataDir 也必须对得上。只按 profile 判断会把「同 profile、另一份
+        // 安装、另一个数据目录」的 daemon 当成自己已启动 —— 之后所有请求都打错对象。
+        //
+        // dataDir 只在带对 x-workdaddy-token 时才出现在 /api/status 里（token 按数据
+        // 目录存放，所以「能拿到 dataDir」本身就是权限证据）。因此：
+        //   本实例有 s_dataDir 而 status 没有 dataDir ⇒ 身份验证不完整 ⇒ 拒绝认领。
+        // 旧实现在字段缺失时默认放行，这正是 P1 的漏洞。
         private static bool StatusMatches(Dictionary<string, object> status)
         {
             if (status == null) return false;
@@ -562,35 +571,76 @@ namespace WorkDaddyTray
             Dictionary<string, object> p = prof as Dictionary<string, object>;
             object id;
             if (p == null || !p.TryGetValue("id", out id)) return false;
-            if (!string.Equals(Convert.ToString(id), s_profile, StringComparison.Ordinal)) return false;
+            if (!(id is string)) return false;
+            if (!string.Equals((string)id, s_profile, StringComparison.Ordinal)) return false;
+
+            // 没有显式数据目录（全新安装 / 走默认）：只有 profile 这一条证据可比。
+            if (string.IsNullOrEmpty(s_dataDir)) return true;
+
             object dd;
-            if (status.TryGetValue("dataDir", out dd) && !string.IsNullOrEmpty(s_dataDir))
+            if (!status.TryGetValue("dataDir", out dd)) return false;
+            if (!(dd is string)) return false;
+            string gotDir = ((string)dd).Trim();
+            if (gotDir.Length == 0) return false;
+            string a = NormalizeIdentityPath(gotDir);
+            string b = NormalizeIdentityPath(s_dataDir);
+            if (a.Length == 0 || b.Length == 0) return false;
+            if (!string.Equals(a, b, StringComparison.OrdinalIgnoreCase)) return false;
+
+            // appDir 是安装归属的第二条证据。daemon 只在认证通过时给，给了就必须一致；
+            // 缺字段不算冲突（老版本 daemon 没有这个字段），但出现了不一致就是别人的安装。
+            object ad;
+            if (status.TryGetValue("appDir", out ad) && ad != null)
             {
-                string got = Convert.ToString(dd) ?? "";
-                if (got.Length > 0)
-                {
-                    try
-                    {
-                        if (!string.Equals(Path.GetFullPath(got).TrimEnd('\\'),
-                                           Path.GetFullPath(s_dataDir).TrimEnd('\\'),
-                                           StringComparison.OrdinalIgnoreCase)) return false;
-                    }
-                    catch { return false; }
-                }
+                if (!(ad is string)) return false;
+                string gotApp = NormalizeIdentityPath(((string)ad).Trim());
+                string ownApp = NormalizeIdentityPath(s_installRoot ?? "");
+                if (gotApp.Length == 0 || ownApp.Length == 0) return false;
+                if (!string.Equals(gotApp, ownApp, StringComparison.OrdinalIgnoreCase)) return false;
             }
             return true;
         }
 
+        // 路径比较专用规范化：先要求完整绝对路径，再取全路径、去掉尾部分隔符。
+        // 盘符根（C 盘根目录）必须保留尾部反斜杠 —— 去掉以后就只剩盘符，
+        // 含义变成「该盘的当前目录」，与根目录不是一回事。
+        private static string NormalizeIdentityPath(string value)
+        {
+            if (!IsFullWindowsPath(value)) return "";
+            try
+            {
+                string full = Path.GetFullPath(value);
+                if (Regex.IsMatch(full, @"^[A-Za-z]:\\$")) return full;
+                if (Regex.IsMatch(full, @"^\\\\[^\\]+\\[^\\]+\\$")) return full;
+                return full.TrimEnd('\\');
+            }
+            catch { return ""; }
+        }
+
+        // 唯一的 daemon 身份判定入口：DaemonRunning() / CdpConnected() 都走这里，
+        // 不允许两条路径各自猜一套身份。
+        private static bool TryGetMatchedDaemonStatus(out Dictionary<string, object> status, out int port)
+        {
+            status = null;
+            port = 0;
+            foreach (int candidate in s_uiPorts)
+            {
+                if (!TestPort(candidate)) continue;
+                Dictionary<string, object> probe = ProbeDaemonStatus(candidate);
+                if (!StatusMatches(probe)) continue;
+                if (s_uiPort != candidate) s_uiPort = candidate;
+                status = probe;
+                port = candidate;
+                return true;
+            }
+            return false;
+        }
+
         private static int FindDaemonPort()
         {
-            foreach (int port in s_uiPorts)
-            {
-                if (!TestPort(port)) continue;
-                if (!StatusMatches(ProbeDaemonStatus(port))) continue;
-                if (s_uiPort != port) s_uiPort = port;
-                return port;
-            }
-            return 0;
+            Dictionary<string, object> status;
+            int port;
+            return TryGetMatchedDaemonStatus(out status, out port) ? port : 0;
         }
 
         private static bool DaemonRunning()
@@ -598,15 +648,42 @@ namespace WorkDaddyTray
             return FindDaemonPort() > 0;
         }
 
+        // CDP 是否真的连上，只能问 daemon：端口开着可能只是别的程序占着 9222，
+        // 而 WorkBuddy 真正的调试端口早就回退到 9226+ 了。旧实现「TCP 能连就算
+        // 已连接」会禁用『恢复 CDP』按钮，用户反而没法把面板救回来。
         private static bool CdpConnected()
         {
-            foreach (int port in s_cdpPorts)
-            {
-                if (!TestPort(port)) continue;
-                if (s_cdpPort != port) s_cdpPort = port;
-                return true;
-            }
-            return false;
+            Dictionary<string, object> status;
+            int uiPort;
+            if (!TryGetMatchedDaemonStatus(out status, out uiPort)) return false;
+            return CdpFromStatus(status);
+        }
+
+        private static bool CdpFromStatus(Dictionary<string, object> status)
+        {
+            if (status == null) return false;
+            object cdpValue;
+            if (!status.TryGetValue("cdp", out cdpValue)) return false;
+            Dictionary<string, object> cdp = cdpValue as Dictionary<string, object>;
+            if (cdp == null) return false;
+
+            object connected;
+            if (!cdp.TryGetValue("connected", out connected)) return false;
+            if (!(connected is bool) || !(bool)connected) return false;
+
+            object portValue;
+            if (!cdp.TryGetValue("port", out portValue)) return false;
+            if (!(portValue is double)) return false;
+            double raw = (double)portValue;
+            if (double.IsNaN(raw) || double.IsInfinity(raw)) return false;
+            if (raw != Math.Floor(raw)) return false;
+            if (raw < 1024 || raw > 65535) return false;
+            int cdpPort = (int)raw;
+            // 必须落在本 profile 的 CDP 候选里：daemon 说连上的是兄弟 profile 的端口，
+            // 对当前实例来说就是「没连上我自己的客户端」。
+            if (!s_cdpPorts.Contains(cdpPort)) return false;
+            if (s_cdpPort != cdpPort) s_cdpPort = cdpPort;
+            return true;
         }
 
         // 读 install-binding.json：整份文档必须是合法 JSON（尾部垃圾、重复键、
@@ -779,13 +856,27 @@ namespace WorkDaddyTray
             return "node";
         }
 
+        // 启动 = 起 watchdog 并等它真的把 daemon 拉起来。只凭 Process.Start() 没抛
+        // 异常就报成功是假的：单运行实例锁冲突 / 绑定非法 / 端口全被占时，watchdog
+        // 会立刻退出，用户看到的却是「已启动」，下一次状态刷新又变回「已停止」。
+        // 验收标准：匹配身份的 /api/status 出现才算成功；子进程提前非零退出立刻失败。
+        private static int StartupTimeoutMs()
+        {
+            string text = Environment.GetEnvironmentVariable("WORKDADDY_TRAY_START_TIMEOUT_MS");
+            int ms;
+            if (!string.IsNullOrEmpty(text) && int.TryParse(text, out ms) && ms >= 1000 && ms <= 120000) return ms;
+            return 20000;
+        }
+
         private static bool StartWd()
         {
             // 绑定不合法就不启动：把 daemon 送进别的 profile / 数据目录，
             // 比「点了没反应」严重得多，而且日志里看不出来。
             if (!string.IsNullOrEmpty(s_bindingError)) { s_startError = s_bindingError; return false; }
             if (!File.Exists(s_watchdog)) { s_startError = "watchdog 不存在: " + s_watchdog; return false; }
-            if (DaemonRunning()) return true;
+            if (DaemonRunning()) { s_startError = ""; return true; }
+            s_startError = "";
+            Process child = null;
             try
             {
                 ProcessStartInfo psi = new ProcessStartInfo();
@@ -810,16 +901,76 @@ namespace WorkDaddyTray
                     Environment.SetEnvironmentVariable("WBSWITCH_PROFILE", s_profile);
                     Environment.SetEnvironmentVariable("WBSWITCH_DATA_DIR",
                         string.IsNullOrEmpty(s_dataDir) ? "" : s_dataDir);
-                    Process.Start(psi);
+                    child = Process.Start(psi);
                 }
                 finally
                 {
                     Environment.SetEnvironmentVariable("WBSWITCH_PROFILE", prevProfile);
                     Environment.SetEnvironmentVariable("WBSWITCH_DATA_DIR", prevDataDir);
                 }
-                return true;
             }
             catch (Exception ex) { s_startError = ex.GetType().Name + ": " + ex.Message; return false; }
+
+            int timeout = StartupTimeoutMs();
+            int waited = 0;
+            while (waited < timeout)
+            {
+                if (DaemonRunning()) { s_startError = ""; return true; }
+                bool exited = false;
+                int code = 0;
+                try
+                {
+                    if (child != null && child.HasExited) { exited = true; code = child.ExitCode; }
+                }
+                catch { }
+                if (exited && code != 0)
+                {
+                    s_startError = "后台服务已退出（exit=" + code + "）" + WatchdogLogHint();
+                    return false;
+                }
+                Thread.Sleep(250);
+                waited += 250;
+            }
+            if (DaemonRunning()) { s_startError = ""; return true; }
+            s_startError = "后台服务在 " + (timeout / 1000) + " 秒内没有就绪" + WatchdogLogHint();
+            return false;
+        }
+
+        // 默认数据目录（与 profiles.js 的 profileDataDir 同规则）：只用来读日志尾，
+        // 不做任何写入，读不到就返回空串。
+        private static string DefaultDataDir()
+        {
+            string appData = Environment.GetEnvironmentVariable("APPDATA");
+            if (string.IsNullOrEmpty(appData))
+            {
+                appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            }
+            if (string.IsNullOrEmpty(appData)) return "";
+            string shared = Path.Combine(appData, "WorkDaddy");
+            if (string.Equals(s_profile, "workbuddy-cn", StringComparison.Ordinal)) return shared;
+            return Path.Combine(shared, "profiles", s_profile);
+        }
+
+        private static string WatchdogLogHint()
+        {
+            try
+            {
+                string dir = string.IsNullOrEmpty(s_dataDir) ? DefaultDataDir() : s_dataDir;
+                if (string.IsNullOrEmpty(dir)) return "";
+                string log = Path.Combine(dir, "watchdog.log");
+                if (!File.Exists(log)) return "";
+                string text = File.ReadAllText(log);
+                string[] lines = text.Replace("\r\n", "\n").Split('\n');
+                string last = "";
+                for (int i = lines.Length - 1; i >= 0; i--)
+                {
+                    if (lines[i].Trim().Length > 0) { last = lines[i].Trim(); break; }
+                }
+                if (last.Length == 0) return "";
+                if (last.Length > 200) last = last.Substring(last.Length - 200);
+                return "；日志：" + last;
+            }
+            catch { return ""; }
         }
 
         private static bool StopWd()
@@ -931,10 +1082,13 @@ namespace WorkDaddyTray
             s_auto.Checked = GetAutoStart();
             s_menu.Items.Add(new ToolStripSeparator());
 
-            s_open = AddItem("打开管理页", "打开 http://127.0.0.1:47832/");
+            // 管理页地址必须跟着当前 profile 的实际 UI 端口：写死 47832 的话，
+            // AI / CodeBuddy 用户点「打开管理页」会打到 CN 的端口上（甚至打到别人的
+            // 服务），提示文字和真实地址也对不上。
+            s_open = AddItem("打开管理页", OpenPageTip());
             ToolStripMenuItem exitItem = AddItem("退出托盘", "只关闭托盘程序，不影响 WorkDaddy 后台服务");
 
-            s_start.Click += delegate { RunBusy(StartWd, StartOkText()); };
+            s_start.Click += delegate { RunBusy(StartWd, StartOkText, delegate { return s_startError; }); };
             s_stop.Click += delegate { RunBusy(StopWd, "WorkDaddy 已关闭"); };
             s_restart.Click += delegate { RunBusy(RestartWd, "WorkDaddy 已重启"); };
             s_cdp.Click += delegate
@@ -971,9 +1125,14 @@ namespace WorkDaddyTray
             s_notify.DoubleClick += delegate
             {
                 if (DaemonRunning()) OpenPage();
-                else RunBusy(StartWd, StartOkText());
+                else RunBusy(StartWd, StartOkText, delegate { return s_startError; });
             };
             s_notify.BalloonTipClicked += delegate { OpenPage(); };
+        }
+
+        private static string OpenPageTip()
+        {
+            return "打开 " + DaemonUri + "/";
         }
 
         private static void OpenPage()
@@ -996,8 +1155,12 @@ namespace WorkDaddyTray
         private static void UpdateState()
         {
             if (s_busy) return;
-            bool run = DaemonRunning();
-            bool cdp = CdpConnected();
+            // 一次探测同时回答「服务在不在」和「CDP 连没连」：两次独立探测会让每个
+            // 2s 心跳都多一轮 700ms 超时，UI 线程直接卡住。
+            Dictionary<string, object> status;
+            int uiPort;
+            bool run = TryGetMatchedDaemonStatus(out status, out uiPort);
+            bool cdp = run && CdpFromStatus(status);
             string state = run ? "运行中" : "已停止";
             string cdpState = cdp ? "CDP 已连接" : "CDP 断开";
             s_notify.Icon = run ? s_iconRun : s_iconStop;
@@ -1008,6 +1171,7 @@ namespace WorkDaddyTray
             s_restart.Enabled = run;
             s_cdp.Enabled = run && !cdp && !s_waitingCdp;
             s_open.Enabled = run;
+            s_open.ToolTipText = OpenPageTip();
             s_auto.Checked = GetAutoStart();
         }
 
@@ -1018,17 +1182,75 @@ namespace WorkDaddyTray
                 : "WorkDaddy 服务已启动；面板未注入，点『恢复 CDP』";
         }
 
+        // 动作在后台线程里跑：启动要等 daemon 真正就绪（最长 20s），同步跑会把消息
+        // 循环一起冻住 —— 托盘菜单点不动、图标不刷新，看起来就像卡死。结果由 2s
+        // 心跳取回并在 UI 线程收尾，不跨线程碰控件。
         private static void RunBusy(Func<bool> work, string okText)
         {
+            RunBusy(work, delegate { return okText; }, null);
+        }
+
+        private static void RunBusy(Func<bool> work, Func<string> okText)
+        {
+            RunBusy(work, okText, null);
+        }
+
+        private static void RunBusy(Func<bool> work, Func<string> okText, Func<string> errorText)
+        {
+            if (s_busy) return;
+            s_busyErrorText = "";
+            s_busyOkText = "";
+            s_busyState = 0;
             s_busy = true;
-            s_notify.Icon = s_iconBusy;
-            bool ok;
-            string err = "";
-            try { ok = work(); }
-            catch (Exception ex) { ok = false; err = ex.Message; }
-            finally { s_busy = false; }
+            try { s_notify.Icon = s_iconBusy; } catch { }
+            Thread worker = new Thread(delegate()
+            {
+                bool ok;
+                string err = "";
+                string okTextValue = "";
+                try
+                {
+                    ok = work();
+                    if (ok && okText != null)
+                    {
+                        try { okTextValue = okText() ?? ""; } catch { okTextValue = ""; }
+                    }
+                }
+                catch (Exception ex) { ok = false; err = ex.GetType().Name + ": " + ex.Message; }
+                if (!ok && err.Length == 0 && errorText != null)
+                {
+                    try { err = errorText() ?? ""; } catch { err = ""; }
+                }
+                s_busyOkText = okTextValue;
+                s_busyErrorText = err;
+                s_busyState = ok ? 1 : -1;   // 最后写：读端靠它判断结果已就绪
+            });
+            worker.IsBackground = true;
+            try { worker.Start(); }
+            catch (Exception ex)
+            {
+                s_busyErrorText = ex.Message;
+                s_busyState = -1;
+            }
+        }
+
+        private static void FinishBusy()
+        {
+            int state = s_busyState;
+            if (state == 0) return;
+            string okText = s_busyOkText;
+            string err = s_busyErrorText;
+            s_busyState = 0;
+            s_busy = false;
             UpdateState();
-            ShowBalloon(ok ? okText : ("操作失败: " + err), ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+            if (state > 0)
+            {
+                ShowBalloon(string.IsNullOrEmpty(okText) ? "操作已完成" : okText, ToolTipIcon.Info);
+            }
+            else
+            {
+                ShowBalloon("操作失败: " + (string.IsNullOrEmpty(err) ? "原因未知" : err), ToolTipIcon.Warning);
+            }
         }
 
         private static void RunGui(bool autoStart)
@@ -1038,6 +1260,11 @@ namespace WorkDaddyTray
             s_timer.Interval = 2000;
             s_timer.Tick += delegate
             {
+                if (s_busy)
+                {
+                    FinishBusy();   // 后台动作结束就收尾；还没结束就保持忙碌图标
+                    return;
+                }
                 UpdateState();
                 // 恢复 CDP 期间 daemon 要跑约 60 秒；轮询端口，真正恢复后再提示一次，
                 // 避免「点了没反应 / 误报失败」。90 秒仍未恢复则给出超时提示。
@@ -1070,7 +1297,7 @@ namespace WorkDaddyTray
                     if (s_autoTick >= 3)
                     {
                         s_autoStartDone = true;
-                        if (!DaemonRunning()) RunBusy(StartWd, StartOkText());
+                        if (!DaemonRunning()) RunBusy(StartWd, StartOkText, delegate { return s_startError; });
                     }
                 }
             };
@@ -1387,21 +1614,51 @@ namespace WorkDaddyTray
             }
         }
 
+        // JSON 数字语法：-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+        // 不能用 char.IsDigit：它会接受全角/阿拉伯-印度数字；也不能只靠
+        // double.TryParse —— 01、+1、1.、1e 这些都会被它或宽或窄地放过，
+        // 「宽松接受」在绑定校验里等于把非法文件当成合法身份。
         private double ParseNumber()
         {
             int start = _pos;
             if (_text[_pos] == '-') _pos++;
-            while (_pos < _text.Length && char.IsDigit(_text[_pos])) _pos++;
+            if (_pos >= _text.Length) throw new FormatException("数字不完整");
+            char first = _text[_pos];
+            if (first == '0')
+            {
+                _pos++;
+            }
+            else if (first >= '1' && first <= '9')
+            {
+                while (_pos < _text.Length && IsAsciiDigit(_text[_pos])) _pos++;
+            }
+            else
+            {
+                throw new FormatException("非法数字（第 " + _pos + " 个字符）");
+            }
+            // 前导零：01 / -01。JSON 不允许，且不同解析器对它的解释不一致。
+            if (_pos < _text.Length && IsAsciiDigit(_text[_pos]))
+            {
+                throw new FormatException("数字不允许前导零（第 " + start + " 个字符）");
+            }
             if (_pos < _text.Length && _text[_pos] == '.')
             {
                 _pos++;
-                while (_pos < _text.Length && char.IsDigit(_text[_pos])) _pos++;
+                if (_pos >= _text.Length || !IsAsciiDigit(_text[_pos]))
+                {
+                    throw new FormatException("小数点后必须至少有一位数字（第 " + start + " 个字符）");
+                }
+                while (_pos < _text.Length && IsAsciiDigit(_text[_pos])) _pos++;
             }
             if (_pos < _text.Length && (_text[_pos] == 'e' || _text[_pos] == 'E'))
             {
                 _pos++;
                 if (_pos < _text.Length && (_text[_pos] == '+' || _text[_pos] == '-')) _pos++;
-                while (_pos < _text.Length && char.IsDigit(_text[_pos])) _pos++;
+                if (_pos >= _text.Length || !IsAsciiDigit(_text[_pos]))
+                {
+                    throw new FormatException("指数部分必须至少有一位数字（第 " + start + " 个字符）");
+                }
+                while (_pos < _text.Length && IsAsciiDigit(_text[_pos])) _pos++;
             }
             string raw = _text.Substring(start, _pos - start);
             double value;
@@ -1410,7 +1667,16 @@ namespace WorkDaddyTray
             {
                 throw new FormatException("非法数字：" + raw);
             }
+            if (double.IsNaN(value) || double.IsInfinity(value))
+            {
+                throw new FormatException("数字超出可表示范围：" + raw);
+            }
             return value;
+        }
+
+        private static bool IsAsciiDigit(char c)
+        {
+            return c >= '0' && c <= '9';
         }
 
         private void Expect(string literal)
