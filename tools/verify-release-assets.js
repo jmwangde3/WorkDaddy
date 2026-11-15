@@ -25,13 +25,14 @@ const repoRoot = path.join(__dirname, '..');
 const MIN_ASSET_BYTES = 100 * 1024;
 
 function parseArgs(argv) {
-  const out = { dir: '', version: '', requireSetup: false, report: '', json: '' };
+  const out = { dir: '', version: '', requireSetup: false, report: '', json: '', expectedCommit: '' };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--dir') out.dir = argv[++i] || '';
     else if (a === '--version') out.version = argv[++i] || '';
     else if (a === '--require-setup') out.requireSetup = true;
     else if (a === '--report') out.report = argv[++i] || '';
+    else if (a === '--expected-commit') out.expectedCommit = argv[++i] || '';
     else if (a === '--json') out.json = argv[++i] || '';
     else if (a === '--help' || a === '-h') out.help = true;
     else throw new Error(`未知参数：${a}`);
@@ -70,7 +71,16 @@ function verify(opts) {
     fail(`--version 与 DAEMON_VERSION 不一致：${opts.version} / ${versions.daemon}`);
   }
 
-  // 打包报告：确认 build-package 自己认为成功、且工作区干净。
+  // 来源验证：没有 --report 就没有 Git 证据，不能靠「看起来干净」放行。
+  const expectedCommit = String(opts.expectedCommit || '').trim().toLowerCase();
+  if (expectedCommit && !/^[0-9a-f]{40}$/.test(expectedCommit)) {
+    fail(`--expected-commit 不是合法的 40 位 SHA：${opts.expectedCommit}`);
+  }
+  if (expectedCommit && !opts.report) {
+    fail('传了 --expected-commit 就必须同时传 --report：没有打包报告就无法证明来源');
+  }
+
+  // 打包报告：ok / dirty / 两个 Git 退出码 / sourceCommit 都要有，缺一项就失败关闭。
   if (opts.report) {
     const reportPath = path.resolve(opts.report);
     if (!fs.existsSync(reportPath)) {
@@ -84,21 +94,47 @@ function verify(opts) {
         if (report.ok !== true) fail('打包报告 ok != true');
         if (version && report.version !== version) fail(`打包报告版本 ${report.version} 与期望 ${version} 不一致`);
         if (opts.requireSetup && report.setup !== 'built') fail(`Setup 没有编译成功：${report.setup}`);
-        if (report.dirty) {
+        if (report.dirty !== false) {
           const detail = Array.isArray(report.dirtyPaths) && report.dirtyPaths.length
             ? `（${report.dirtyPaths.slice(0, 5).join(' | ')}）`
             : '';
-          fail(`打包时工作区不干净${detail}：发布资产必须来自干净提交`);
+          fail(`打包报告 dirty 不是 false${report.dirty === true ? detail : '（字段缺失或类型不对）'}：发布资产必须来自干净提交`);
+        }
+        if (report.gitRevParseExitCode !== 0) {
+          fail(`打包报告 gitRevParseExitCode=${JSON.stringify(report.gitRevParseExitCode)}，必须是 0`);
+        }
+        if (report.gitStatusExitCode !== 0) {
+          fail(`打包报告 gitStatusExitCode=${JSON.stringify(report.gitStatusExitCode)}，必须是 0`);
+        }
+        const sourceCommit = String(report.sourceCommit || '').trim().toLowerCase();
+        if (!sourceCommit) {
+          fail('打包报告缺少 sourceCommit：无法证明资产来自哪个提交');
+        } else if (!/^[0-9a-f]{40}$/.test(sourceCommit)) {
+          fail(`打包报告 sourceCommit 不是合法的 40 位 SHA：${report.sourceCommit}`);
+        } else if (expectedCommit && sourceCommit !== expectedCommit) {
+          fail(`sourceCommit 与期望提交不一致：报告 ${sourceCommit} / 期望 ${expectedCommit}`);
         }
       }
     }
   }
 
+  // 精确白名单：正式发布只允许这几个文件，多一个字节的文件都不行。
   const required = [
     `WorkDaddy-${version}-portable-win-x64.zip`,
     `WorkDaddy-${version}-source.zip`,
   ];
   if (opts.requireSetup) required.push(`WorkDaddy-${version}-setup.exe`);
+  const allowed = new Set(required.concat(['SHA256SUMS.txt']));
+
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const name = entry.name;
+    if (!allowed.has(name)) {
+      fail(`目录里有多余条目：${name}${entry.isDirectory() ? '（子目录）' : ''}`);
+    } else if (!entry.isFile()) {
+      fail(`资产不是普通文件：${name}`);
+    }
+  }
 
   const assets = [];
   for (const name of required) {
@@ -121,22 +157,25 @@ function verify(opts) {
       if (!m) { fail(`SHA256SUMS 行格式不对：${line}`); continue; }
       const expect = m[1].toLowerCase();
       const name = m[2].trim();
+      // 清单里只允许当前目录下的普通文件名：路径分隔符、..、绝对路径都拒绝。
+      if (/[\\/]/.test(name) || name === '.' || name === '..' || name.includes('..')) {
+        fail(`SHA256SUMS 里出现可疑文件名：${name}`);
+        continue;
+      }
+      if (listed.includes(name)) { fail(`SHA256SUMS 重复列出：${name}`); continue; }
       listed.push(name);
       const file = path.join(dir, name);
       if (!fs.existsSync(file)) { fail(`SHA256SUMS 列了不存在的文件：${name}`); continue; }
+      if (!allowed.has(name)) { fail(`SHA256SUMS 列了非正式资产：${name}`); continue; }
       const actual = sha256(file);
       if (actual !== expect) fail(`哈希不符：${name}（清单 ${expect} / 实算 ${actual}）`);
     }
-    // 反向覆盖：目录里每个资产都要在清单里，否则「校验和」可以被绕过。
-    const onDisk = fs.readdirSync(dir).filter((n) => n !== 'SHA256SUMS.txt');
-    for (const name of onDisk) {
+    // 双向覆盖：正式资产必须都在清单里，清单也不能多出别的条目。
+    for (const name of required) {
       if (!listed.includes(name)) fail(`资产没被 SHA256SUMS 覆盖：${name}`);
-      if (version && !name.startsWith(`WorkDaddy-${version}-`)) {
-        fail(`存在与本次版本无关的产物：${name}`);
-      }
     }
-    if (onDisk.length !== listed.length) {
-      warnings.push(`目录里 ${onDisk.length} 个文件，清单 ${listed.length} 条`);
+    if (listed.length !== required.length) {
+      fail(`SHA256SUMS 条目数 ${listed.length} 与正式资产数 ${required.length} 不一致`);
     }
   }
 
@@ -145,6 +184,7 @@ function verify(opts) {
     version,
     daemonVersion: versions.daemon,
     packageVersion: versions.package,
+    expectedCommit: expectedCommit || null,
     dir,
     requireSetup: opts.requireSetup,
     assets,
@@ -163,7 +203,7 @@ function main() {
     process.exit(2);
   }
   if (opts.help) {
-    process.stdout.write('用法：node tools/verify-release-assets.js --dir <dist> [--require-setup] [--report <json>] [--json <out>]\n');
+    process.stdout.write('用法：node tools/verify-release-assets.js --dir <dist> [--require-setup] [--report <json>] [--expected-commit <sha>] [--json <out>]\n');
     process.exit(0);
   }
 

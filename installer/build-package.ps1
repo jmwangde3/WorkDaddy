@@ -35,6 +35,11 @@ $report = [ordered]@{
     version   = ''
     sourceCommit = ''
     dirty     = $false
+    dirtyPaths = @()
+    # -1 表示「没有取到」，不是「取到了 0」。校验器看到 -1 必须拒绝。
+    gitRevParseExitCode = -1
+    gitStatusExitCode = -1
+    gitTopLevelPrefix = ''
     outDir    = $OutputDirectory
     artifacts = @()
     setup     = 'not-requested'
@@ -52,6 +57,15 @@ function Fail-Package {
     exit $Code
 }
 
+# git 的输出可能被 PowerShell 拼成多行（warning、空行）。只取第一条非空行，
+# 否则后面拿它做路径比较时会因为夹带换行而抛「路径中有非法字符」。
+function Get-FirstOutputLine {
+    param([object]$Output)
+    $lines = @((($Output | Out-String) -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 1)
+    if ($lines.Count -eq 0) { return '' }
+    return ([string]$lines[0]).Trim()
+}
+
 Write-Line '=============================================================='
 Write-Line ' WorkDaddy 打包'
 Write-Line '=============================================================='
@@ -60,6 +74,64 @@ if (-not $Version) { $Version = Get-SourceVersion $repoRoot }
 if (-not $Version) { Fail-Package '读不到 scripts\daemon.js 里的 DAEMON_VERSION，请用 -Version 指定' 1 }
 if ($Version -notmatch '^\d+\.\d+\.\d+') { Fail-Package ('版本号格式不对：' + $Version) 1 }
 $report.version = $Version
+
+# ---- Git 来源：无法证明就不打包 ----
+# 发布资产必须能证明来自某个具体提交。读不到 Commit、或读不到工作区状态时，
+# 任何「默认干净」的假设都会让校验器放过一个来源不明的包 —— 这里 fail closed。
+$commit = ''
+$statusText = ''
+$topPrefix = ''
+$prefixCode = 0
+$revParseCode = 0
+$statusCode = 0
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $commit = Get-FirstOutputLine (& git -C $repoRoot rev-parse --verify HEAD 2>$null)
+    $revParseCode = $LASTEXITCODE
+    # Git 会向上查找 .git：把 installer 复制到别的仓库子目录里打包时，
+    # rev-parse 会返回上层仓库的提交，资产就带上了一个不相干的 Commit。
+    # 用 --show-prefix 判断「当前目录是不是仓库顶层」：顶层为空，子目录非空。
+    # 不比较路径字符串 —— git 输出的中文路径在 PS 5.1 里会按 936 解码成乱码。
+    $topPrefix = Get-FirstOutputLine (& git -C $repoRoot rev-parse --show-prefix 2>$null)
+    $prefixCode = $LASTEXITCODE
+    # stderr 单独丢弃：GitHub runner 上 git 会往 stderr 写 safe.directory 一类提示，
+    # 用 2>&1 合并进来会被当成「有未提交改动」。
+    $statusText = ((& git -C $repoRoot status --porcelain=v1 --untracked-files=all 2>$null) | Out-String).Trim()
+    $statusCode = $LASTEXITCODE
+} catch {
+    $ErrorActionPreference = $prevEap
+    Fail-Package ('无法执行 git：' + $_.Exception.Message + '；无法证明源码来源，已中止') 2
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+$report['gitRevParseExitCode'] = $revParseCode
+$report['gitStatusExitCode'] = $statusCode
+$report['gitTopLevelPrefix'] = $topPrefix
+$report['gitTopLevelExitCode'] = $prefixCode
+if ($revParseCode -ne 0) {
+    Fail-Package ('无法确认源码提交（git rev-parse 退出码 ' + $revParseCode + '）；已中止') 2
+}
+if (-not $commit) { Fail-Package '无法确认源码提交（git rev-parse 没有输出）；已中止' 2 }
+if ($commit -notmatch '^[0-9a-fA-F]{40}$') {
+    Fail-Package ('源码提交不是合法的 40 位 SHA：' + $commit + '；已中止') 2
+}
+if (-not $topPrefix -and $prefixCode -ne 0) { Fail-Package ('无法确认 Git 顶层目录（git rev-parse --show-prefix 退出码 ' + $prefixCode + '）；已中止') 2 }
+if ($topPrefix) {
+    Fail-Package ('当前目录不是 Git 仓库顶层（相对顶层前缀：' + $topPrefix + '）；提交号会指向别的仓库，已中止') 2
+}
+if ($statusCode -ne 0) {
+    Fail-Package ('无法确认工作区状态（git status 退出码 ' + $statusCode + '）；已中止') 2
+}
+$dirty = [bool]$statusText
+$statusLines = @()
+if ($statusText) {
+    $statusLines = @($statusText -split "`r?`n" | Where-Object { $_ } | Select-Object -First 20)
+}
+$report.sourceCommit = $commit
+$report.dirty = $dirty
+$report['dirtyPaths'] = $statusLines
+if ($dirty) { $report.warnings += '工作区有未提交改动：源码包内容来自最后一次提交，不包含这些改动' }
 
 # 打包时额外排除：这些都是「本机才知道的东西」，进包就是泄露
 $packageExclude = @('workbuddy-exe.json')
@@ -118,31 +190,8 @@ try {
 }
 
 # ---- 源码包：用 git archive，保证和提交一致 ----
+# Commit 与工作区状态已在打包前验证（见文件开头）。这里只产出源码包。
 $sourceZip = Join-Path $OutputDirectory ('WorkDaddy-' + $Version + '-source.zip')
-$commit = ''
-$dirty = $false
-$statusLines = @()
-$statusCode = 0
-try {
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    $commit = ((& git -C $repoRoot rev-parse HEAD 2>$null) | Out-String).Trim()
-    # stderr 必须单独丢弃：GitHub runner 上 git 可能往 stderr 写 safe.directory /
-    # 目录权限之类的提示，用 2>&1 合并进来就会被当成「有未提交改动」，
-    # 于是发布闸门在干净的 checkout 上也会红。
-    $statusText = ((& git -C $repoRoot status --porcelain 2>$null) | Out-String).Trim()
-    $statusCode = $LASTEXITCODE
-    $ErrorActionPreference = $prevEap
-    $dirty = [bool]$statusText
-    if ($statusText) { $statusLines = @($statusText -split "`r?`n" | Where-Object { $_ } | Select-Object -First 20) }
-} catch { $dirty = $false }
-$report.sourceCommit = $commit
-$report.dirty = $dirty
-$report['dirtyPaths'] = $statusLines
-$report['gitStatusExitCode'] = $statusCode
-if ($statusCode -ne 0) { $report.warnings += ('无法确认工作区状态（git status 退出码 ' + $statusCode + '）') }
-if ($dirty) { $report.warnings += '工作区有未提交改动：源码包内容来自最后一次提交，不包含这些改动' }
-
 if (Test-Path -LiteralPath $sourceZip) { Remove-Item -LiteralPath $sourceZip -Force }
 # 参数要拼成单个字符串再传：`--prefix=(表达式)` 在 5.1 下不会被求值，会原样交给 git
 $prefixArg = '--prefix=WorkDaddy-' + $Version + '-source/'
