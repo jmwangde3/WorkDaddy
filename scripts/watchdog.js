@@ -5,6 +5,15 @@
  * The loopback lock belongs to the OS and disappears automatically when this
  * process exits. watchdog.pid is only a hint for the native install helper;
  * it is never trusted on its own for process termination.
+ *
+ * 单运行实例（约定 A：可以装多份，但同一台机器同时只允许一个后台服务）：
+ *   1. 全局锁 47931 —— 与 profile 无关，新版本之间靠互斥；
+ *   2. 旧版兼容探测 47932-47935 —— 1.3.1 及更早只有 per-profile 锁，
+ *      它们不认全局锁，所以启动前必须逐个探一遍，命中就拒绝启动；
+ *   3. profile 锁仍是原来的 47932-47935 —— 旧版 watchdog 看到它会自己退出，
+ *      保持「同一 profile 不会双开」这条老保证。
+ * 锁冲突一律 exit 3，并在日志里写清是哪个端口：托盘据此报告启动失败，
+ * 不会把「第二个实例被挡下」当成启动成功。
  */
 'use strict';
 
@@ -46,11 +55,25 @@ const DATA_DIR = RAW_DATA_DIR || profileDataDir(PROFILE);
 const PID_FILE = path.join(DATA_DIR, 'watchdog.pid');
 const LOG_FILE = path.join(DATA_DIR, 'watchdog.log');
 const DAEMON_FILE = path.join(__dirname, 'daemon.js');
-const LOCK_PORT = ({'workbuddy-cn':47932,'workbuddy-ai':47933,'codebuddy-cn':47934,'codebuddy-intl':47935})[PROFILE.id];
+const PROFILE_LOCK_PORTS = ({'workbuddy-cn':47932,'workbuddy-ai':47933,'codebuddy-cn':47934,'codebuddy-intl':47935});
+// 全局服务锁：与 profile 无关的「只允许一个后台服务」。
+const GLOBAL_LOCK_BASE = 47931;
+// 测试注入：WORKDADDY_LOCK_BASE 把 5 个锁端口整体平移，互不相同的相对关系不变。
+// 自动化测试不能去抢真实服务正在用的 47931-47935（那会把用户的服务挡掉）。
+const LOCK_OFFSET = (() => {
+  const raw = Number(process.env.WORKDADDY_LOCK_BASE || 0);
+  if (!Number.isInteger(raw) || raw < 1024 || raw > 65000) return 0;
+  return raw - GLOBAL_LOCK_BASE;
+})();
+const GLOBAL_LOCK_PORT = GLOBAL_LOCK_BASE + LOCK_OFFSET;
+const LOCK_PORT = PROFILE_LOCK_PORTS[PROFILE.id] + LOCK_OFFSET;
+// 旧版（<=1.3.1）只监听上面那张表里的端口，不认全局锁。
+const LEGACY_LOCK_PORTS = Object.keys(PROFILE_LOCK_PORTS).map((key) => PROFILE_LOCK_PORTS[key] + LOCK_OFFSET);
 
 let child = null;
 let stopping = false;
 let restartDelay = 3000;
+let globalLock = null;
 
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}\n`;
@@ -106,23 +129,84 @@ function shutdown() {
   setTimeout(() => {
     removePidFile();
     try { lockServer.close(); } catch (_) {}
+    try { if (globalLock) globalLock.close(); } catch (_) {}
     process.exit(0);
   }, 800);
+}
+
+// 端口上是否有人在听。只用来发现「旧版 watchdog 还在跑」，不用于身份判断。
+function portListening(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      try { socket.destroy(); } catch (_) {}
+      resolve(value);
+    };
+    socket.setTimeout(400);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
 }
 
 const lockServer = net.createServer();
 lockServer.unref();
 lockServer.once('error', (error) => {
   if (error && error.code === 'EADDRINUSE') {
-    log('当前 profile 的 watchdog 已在运行，本实例退出');
-    process.exit(0);
+    log('当前 profile 的 watchdog 已在运行（lock ' + LOCK_PORT + ' 被占用），本实例退出');
+    process.exit(3);
   }
   throw error;
 });
-lockServer.listen({ host: '127.0.0.1', port: LOCK_PORT, exclusive: true }, () => {
+
+function listenGlobal() {
+  return new Promise((resolve) => {
+    globalLock = net.createServer();
+    globalLock.unref();
+    globalLock.once('error', (error) => {
+      if (error && error.code === 'EADDRINUSE') {
+        log('已有 WorkDaddy 后台服务在运行（单实例锁 ' + GLOBAL_LOCK_PORT + ' 被占用），本实例退出');
+        process.exit(3);
+      }
+      throw error;
+    });
+    globalLock.listen({ host: '127.0.0.1', port: GLOBAL_LOCK_PORT, exclusive: true }, resolve);
+  });
+}
+
+function listenProfileLock() {
+  // 冲突/异常统一由上面挂的 once('error') 处理（exit 3），这里只等成功。
+  return new Promise((resolve) => {
+    lockServer.listen({ host: '127.0.0.1', port: LOCK_PORT, exclusive: true }, resolve);
+  });
+}
+
+async function acquireLocks() {
+  await listenGlobal();
+  // 旧版服务不认全局锁：逐个探，发现就退出（exit 3），不做「先起来再说」。
+  for (const port of LEGACY_LOCK_PORTS) {
+    if (await portListening(port)) {
+      log('检测到旧版 WorkDaddy 后台服务仍在运行（lock ' + port + '），请先关闭它再启动本实例');
+      process.exit(3);
+    }
+  }
+  await listenProfileLock();
   writePidFile();
-  log('watchdog 已获取回环单实例锁 port=' + LOCK_PORT + ' pid=' + process.pid);
+  log('watchdog 已获取单实例锁 global=' + GLOBAL_LOCK_PORT + ' profile=' + LOCK_PORT + ' pid=' + process.pid);
   startDaemon();
+}
+
+acquireLocks().catch((error) => {
+  const code = error && error.code ? error.code : '';
+  if (code === 'EADDRINUSE') {
+    log('当前 profile 的 watchdog 已在运行（lock ' + LOCK_PORT + ' 被占用），本实例退出');
+    process.exit(3);
+  }
+  log('watchdog 启动失败: ' + (error && error.message ? error.message : String(error)));
+  process.exit(2);
 });
 
 process.on('SIGTERM', shutdown);
