@@ -1,7 +1,7 @@
 name: Tests
 
 # 普通 CI：只读仓库，不发布、不写 Release。
-# 发布流程仍在 build-win.yml（仅 tag / 手动触发，权限另算）。
+# 正式发布在 release.yml（tag push 或手动触发；build 只读、publish 才提权）。
 on:
   push:
     branches: ['main', 'fix/**', 'feat/**', 'sync/**']
@@ -243,11 +243,13 @@ jobs:
       - name: 发布资产预演校验（只校验，不发布）
         shell: pwsh
         run: |
-          # 和 release.yml 用的是同一份校验逻辑：版本三方一致、三件套齐全、
-          # 体积合理、SHA256SUMS 全覆盖并逐条重算。这里跑通不代表已发布 ——
-          # 发布仍然只能在 tag 上由 release.yml 做。
+          # 和 release.yml 用的是同一份校验逻辑：版本三方一致、来源提交一致、
+          # 精确白名单、SHA256SUMS 全覆盖并逐条重算。这里跑通不代表已发布 ——
+          # 发布仍然只能在 tag 上由 release.yml 的 publish job 做。
+          $head = ((& git rev-parse HEAD) 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $head) { throw '拿不到当前提交，无法校验来源' }
           node tools/verify-release-assets.js --dir tmp/dist --require-setup `
-            --report tmp/report.json --json tmp/release-assets.json
+            --report tmp/report.json --expected-commit $head --json tmp/release-assets.json
           if ($LASTEXITCODE -ne 0) { throw "发布资产预演校验失败：$LASTEXITCODE" }
           Get-Content tmp/release-assets.json -Raw -Encoding UTF8
 
