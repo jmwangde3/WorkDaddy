@@ -23,10 +23,13 @@ rehome_sessions.py — 切换 WorkBuddy 账号后，把本机会话归属 + 分�
 环境变量（等价于同名命令行参数）：
   WORKBUDDY_DB / WORKBUDDY_AUTH / WORKBUDDY_BACKUP_DIR
 
-挂接方式（任选其一）：
-  A. WorkDaddy「自动化」→ 新建任务 → 触发方式「账号切换 / pageReady」→ 执行本脚本 --apply
-  B. scripts/daemon.js 切号完成 / pageReady 处 spawn 本脚本 --apply
-  C. 手动切号后跑一次
+挂接方式（**手动排障用**）：
+  生产路径只有一条：`scripts/daemon.js` → `scripts/rehome-sessions.js`（JS 版），它在切号
+  watcher 里自动跑，并且带完整的接管范围校验（local/cloud 区分、老库 deleted_at=-1 歧义阻断）。
+  本 Python 版是同一套规则的简化实现，给「daemon 没跑起来时手动救一次」用：
+    A. 手动：python rehome_sessions.py --apply
+    B. 不要把 --apply 挂成自动化任务（它缺少 JS 版的 cloud 校验与歧义阻断）
+  两者的分组镜像规则（多源冲突、重复同名、detach）保持一致。
 """
 import argparse
 import json
@@ -127,24 +130,63 @@ def plan_spaces(con, uid):
             continue
         mine[n] = r
 
-    inserts, remaps, own, conflicts = [], [], [], []
+    rows_by_name = {}
+    for r in records:
+        n = str(r["name"] or "")
+        if not n:
+            continue
+        rows_by_name.setdefault(n, []).append(r)
+    dup_set = set(duplicate_targets)
+
+    inserts, remaps, own, conflicts, detach = [], [], [], [], []
+
+    def src_ids_of(name):
+        return [str(r["id"]) for r in records
+                if str(r["name"]) == name and str(r["user_id"]) != uid]
+
     for name, tpl in templates.items():
+        # 目标账号自己就有两份同名分组：身份有歧义，不镜像 / 不改挂 / 不归位。
+        if name in dup_set:
+            conflicts.append({"name": name, "reason": "duplicate-target"})
+            continue
         own_rec = mine.get(name)
         tpl_path = norm(tpl["primary_folder_path"] or "")
         mine_path = norm(own_rec["primary_folder_path"] or "") if own_rec else ""
+
+        # 所有账号下同名分组的目录必须一致（或都没写），否则无法确认是同一逻辑分组。
+        src_paths = set()
+        for r in rows_by_name.get(name, []):
+            p = norm(r["primary_folder_path"] or "")
+            c = norm(r["create_folder_path"] or "")
+            if p:
+                src_paths.add(p)
+            if c:
+                src_paths.add(c)
+        if len(src_paths) > 1:
+            conflicts.append({"name": name, "reason": "source-paths-differ",
+                              "paths": sorted(src_paths)[:6]})
+            if own_rec is not None:
+                own.append({"id": str(own_rec["id"]), "name": name})
+            ids = src_ids_of(name)
+            if ids:
+                detach.append({"name": name, "src_ids": ids})
+            continue
+
         # 同名不等于同一分组：两边都写明了目录且不同 → 不镜像、不改挂，只保留自己那份。
         if own_rec is not None and tpl_path and mine_path and tpl_path != mine_path:
-            conflicts.append({"name": name,
+            conflicts.append({"name": name, "reason": "template-vs-target",
                               "template": tpl["primary_folder_path"],
                               "target": own_rec["primary_folder_path"]})
             own.append({"id": str(own_rec["id"]), "name": name})
+            ids = src_ids_of(name)
+            if ids:
+                detach.append({"name": name, "src_ids": ids})
             continue
         target_id = str(own_rec["id"]) if own_rec else str(uuid.uuid4())
         if own_rec is None:
             inserts.append({"template": tpl, "id": target_id, "name": name})
         own.append({"id": target_id, "name": name})
-        src_ids = [str(r["id"]) for r in records
-                   if str(r["name"]) == name and str(r["user_id"]) != uid and str(r["id"]) != target_id]
+        src_ids = [i for i in src_ids_of(name) if i != target_id]
         if src_ids:
             remaps.append({"name": name, "target_id": target_id, "src_ids": src_ids})
 
@@ -243,6 +285,8 @@ def plan_spaces(con, uid):
         # 同名但目录不同的分组、目标账号自身的重复同名分组：只报不合并。
         "conflicts": conflicts,
         "duplicate_targets": duplicate_targets,
+        # 冲突分组上的会话要 detach 成 NULL，避免跨账号孤儿引用。
+        "detach": detach,
     }
 
 
@@ -359,12 +403,25 @@ def main() -> None:
                 con.execute(sql, vals)
             # IN 列表分块：SQLite 变量上限因版本而异（999 / 32766），大账号会整事务回滚。
             for rm in plan["remaps"]:
+                # 目标 id 用子查询现场解析：即使 INSERT 被 NOT EXISTS 跳过，也落到真实行上。
                 for part in chunk(rm["src_ids"], 400):
                     marks = ",".join("?" * len(part))
                     con.execute(
-                        "UPDATE sessions SET space_id = ?, updated_at = ?"
-                        " WHERE user_id = ? AND space_id IN (%s)" % marks,
-                        [rm["target_id"], now, uid] + part,
+                        "UPDATE sessions SET space_id = (SELECT id FROM spaces"
+                        " WHERE user_id = ? AND name = ? AND " + SPACE_ACTIVE +
+                        " ORDER BY created_at ASC, id ASC LIMIT 1), updated_at = ?"
+                        " WHERE user_id = ? AND space_id IN (%s)"
+                        " AND (deleted_at IS NULL OR deleted_at = -1)" % marks,
+                        [uid, rm["name"], now, uid] + part,
+                    )
+            for d in plan["detach"]:
+                for part in chunk(d["src_ids"], 400):
+                    marks = ",".join("?" * len(part))
+                    con.execute(
+                        "UPDATE sessions SET space_id = NULL, updated_at = ?"
+                        " WHERE user_id = ? AND space_id IN (%s)"
+                        " AND (deleted_at IS NULL OR deleted_at = -1)" % marks,
+                        [now, uid] + part,
                     )
             for group in plan["adopt"]:
                 for part in chunk(group["ids"], 400):

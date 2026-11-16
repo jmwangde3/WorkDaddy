@@ -148,15 +148,57 @@ async function planSpaceMirror(db, targetUid) {
   const remaps = [];
   const own = [];
   const conflicts = [];
+  // 冲突分组上的会话不能改挂，但也不能留着指向别人账号的分组当孤儿：
+  // 统一置 NULL 回到「最近列表」，等用户自己决定归到哪个分组。
+  const detach = [];
+  const srcIdsOf = (name) => rows
+    .filter((r) => String(r.name) === name && String(r.user_id) !== targetUid)
+    .map((r) => String(r.id));
+
+  // 同名分组的「全来源」索引：身份冲突不能只看模板 vs 目标。A/B 路径相同、
+  // C 指向别处时，C 的会话若被并进 B 就是错归，必须整体拒绝这个 name。
+  const rowsByName = new Map();
+  for (const r of rows) {
+    const n = String(r.name || '');
+    if (!n) continue;
+    if (!rowsByName.has(n)) rowsByName.set(n, []);
+    rowsByName.get(n).push(r);
+  }
+  const dupSet = new Set(duplicateTargets);
+
   for (const [name, tpl] of byName) {
+    // 目标账号自己就有两份同名分组：身份有歧义，不镜像 / 不改挂 / 不归位。
+    if (dupSet.has(name)) {
+      conflicts.push({ name, reason: 'duplicate-target' });
+      continue;
+    }
     const mine = targetByName.get(name);
     const tplPath = normalizePath(tpl.primary_folder_path || '');
     const minePath = mine ? normalizePath(mine.primary_folder_path || '') : '';
+
+    // 所有账号下同名分组的目录必须一致（或都没写），否则无法确认是同一逻辑分组。
+    const srcPaths = new Set();
+    for (const r of rowsByName.get(name) || []) {
+      const p = normalizePath(r.primary_folder_path || '');
+      const c = normalizePath(r.create_folder_path || '');
+      if (p) srcPaths.add(p);
+      if (c) srcPaths.add(c);
+    }
+    if (srcPaths.size > 1) {
+      conflicts.push({ name, reason: 'source-paths-differ', paths: [...srcPaths].slice(0, 6) });
+      if (mine) own.push({ id: String(mine.id), name });
+      const ids = srcIdsOf(name);
+      if (ids.length) detach.push({ name, srcIds: ids });
+      continue;
+    }
+
     // 同名不等于同一分组：两边都写明了目录且目录不同 → 视为不同逻辑分组，
     // 不镜像、不改挂，只把归位目标限定到目标账号自己那份。
     if (mine && tplPath && minePath && tplPath !== minePath) {
-      conflicts.push({ name, template: tpl.primary_folder_path, target: mine.primary_folder_path });
+      conflicts.push({ name, reason: 'template-vs-target', template: tpl.primary_folder_path, target: mine.primary_folder_path });
       own.push({ id: String(mine.id), name });
+      const ids = srcIdsOf(name);
+      if (ids.length) detach.push({ name, srcIds: ids });
       continue;
     }
     const targetId = mine ? String(mine.id) : crypto.randomUUID();
@@ -170,7 +212,7 @@ async function planSpaceMirror(db, targetUid) {
   }
   return {
     available: true, templates: byName.size, inserts, remaps, own,
-    conflicts, duplicateTargets,
+    conflicts, duplicateTargets, detach,
   };
 }
 
@@ -184,7 +226,7 @@ function normalizePath(p) {
  * 就归到那个分组。分组目录 = <root>/<space name>，root 取该账号已归组会话的众数根，
  * 避免不同机器/不同工作区根时猜错。
  */
-async function planCwdAdoption(db, targetUid, ownSpaces) {
+async function planCwdAdoption(db, targetUid, ownSpaces, options = {}) {
   if (!ownSpaces || !ownSpaces.length) return { bySpace: [], total: 0 };
   const anchored = await db.all(
     `SELECT s.user_id AS uid, s.cwd AS cwd, sp.name AS name
@@ -202,8 +244,12 @@ async function planCwdAdoption(db, targetUid, ownSpaces) {
       const name = String(row.name || '');
       if (!name) continue;
       const cwd = normalizePath(row.cwd);
-      const idx = cwd.indexOf('/' + name.toLowerCase());
+      const needle = '/' + name.toLowerCase();
+      const idx = cwd.indexOf(needle);
       if (idx <= 0) continue;
+      // 目录边界：workspace 不能命中 workspace2/proj。
+      const after = cwd.charAt(idx + needle.length);
+      if (after && after !== '/') continue;
       const root = cwd.slice(0, idx);
       roots.set(root, (roots.get(root) || 0) + 1);
     }
@@ -234,10 +280,14 @@ async function planCwdAdoption(db, targetUid, ownSpaces) {
   }
   if (!root) return { bySpace: [], total: 0, root: null, source: null };
 
+  // 归位与接管共用同一套资格判定：范围没放开 cloud 时，cloud 行不参与归位。
+  const transportGuard = options.transportAware && !options.allowCloud
+    ? "AND COALESCE(transport, 'local') = 'local'"
+    : '';
   const loose = await db.all(
     `SELECT id, cwd FROM sessions
       WHERE user_id = ? AND space_id IS NULL AND cwd IS NOT NULL AND cwd <> ''
-        AND (deleted_at IS NULL OR deleted_at = -1)`,
+        AND (deleted_at IS NULL OR deleted_at = -1) ${transportGuard}`,
     [targetUid]
   );
   const groups = new Map();
@@ -552,7 +602,31 @@ function createRehomeRunner(options = {}) {
       ? await countSpaceRemaps(db, mirror.remaps, targetUid, scope)
       : { total: 0, detail: [] };
     // 上一轮可能只改了 user_id 没挂分组：按 cwd 落点把散落在「最近列表」的会话归位。
-    const adoption = mirror.available ? await planCwdAdoption(db, targetUid, mirror.own) : { bySpace: [], total: 0 };
+    const adoption = mirror.available
+      ? await planCwdAdoption(db, targetUid, mirror.own, {
+        allowCloud: !!scope.cloud,
+        transportAware: !!scope.transportAware,
+      })
+      : { bySpace: [], total: 0 };
+    // 冲突分组：会话不改挂，但必须脱离「别人账号的分组」，否则就是跨账号孤儿引用。
+    // 计数要算上「本次会被接管的会话」（此刻它们还属于源账号），否则第一次切号会漏。
+    let detachTotal = 0;
+    const detachPlan = [];
+    const detachScope = scope && scope.where ? ` OR (${scope.where})` : '';
+    const detachScopeParams = scope && scope.where ? (scope.params || []) : [];
+    for (const d of mirror.detach || []) {
+      for (const part of chunk(d.srcIds, 400)) {
+        const placeholders = part.map(() => '?').join(', ');
+        const row = await db.all(
+          `SELECT COUNT(*) AS n FROM sessions
+            WHERE space_id IN (${placeholders}) AND (user_id = ?${detachScope})
+              AND (deleted_at IS NULL OR deleted_at = -1)`,
+          [...part, targetUid, ...detachScopeParams]
+        );
+        const n = Number((row && row[0] && row[0].n) || 0);
+        if (n > 0) { detachPlan.push({ part, n }); detachTotal += n; }
+      }
+    }
     const spaceReport = {
       available: mirror.available,
       templates: mirror.templates,
@@ -567,8 +641,10 @@ function createRehomeRunner(options = {}) {
       // 同名但目录不同的分组、以及目标账号自身的重复同名分组：只报不合并。
       conflicts: mirror.conflicts || [],
       duplicateTargets: mirror.duplicateTargets || [],
+      // 冲突分组上的会话被置 NULL（避免跨账号孤儿引用）。
+      detached: detachTotal,
     };
-    const spaceWrites = mirror.inserts.length + remapCounts.total + adoption.total;
+    const spaceWrites = mirror.inserts.length + remapCounts.total + adoption.total + detachTotal;
 
     // 老库有 -1 行且用户没有显式承认 → 不写库。这不是「提醒」，是硬停：
     // 我们无法证明这些行是活的还是回收站，改归属可能把已删会话搬给新账号。
@@ -619,15 +695,33 @@ function createRehomeRunner(options = {}) {
     }
     // IN 列表分块：SQLite 变量上限因版本而异（常见 999 / 32766），
     // 大账号一次上千条会直接让整个切号事务回滚。分块但不分事务。
+    // 目标 id 用子查询现场解析，不用 plan 阶段生成的随机 uuid：即使上面的
+    // INSERT 因 NOT EXISTS 被跳过（客户端并发建了同名分组），这里也落到真实行上；
+    // 万一分组确实不存在，子查询给 NULL，比留下悬空 space_id 更安全。
     for (const rm of mirror.remaps) {
       for (const part of chunk(rm.srcIds, 400)) {
         const placeholders = part.map(() => '?').join(', ');
         statements.push({
-          sql: `UPDATE sessions SET space_id = ?, updated_at = ?
-                 WHERE user_id = ? AND space_id IN (${placeholders})`,
-          params: [rm.targetId, now, targetUid, ...part],
+          sql: `UPDATE sessions SET space_id = (
+                   SELECT id FROM spaces
+                    WHERE user_id = ? AND name = ? AND ${SPACE_ACTIVE}
+                    ORDER BY created_at ASC, id ASC LIMIT 1
+                 ), updated_at = ?
+                 WHERE user_id = ? AND space_id IN (${placeholders})
+                   AND (deleted_at IS NULL OR deleted_at = -1)`,
+          params: [targetUid, rm.name, now, targetUid, ...part],
         });
       }
+    }
+    // 冲突分组：会话不改挂，但必须脱离「别人账号的分组」，否则就是跨账号孤儿引用。
+    for (const dp of detachPlan) {
+      const placeholders = dp.part.map(() => '?').join(', ');
+      statements.push({
+        sql: `UPDATE sessions SET space_id = NULL, updated_at = ?
+               WHERE user_id = ? AND space_id IN (${placeholders})
+                 AND (deleted_at IS NULL OR deleted_at = -1)`,
+        params: [now, targetUid, ...dp.part],
+      });
     }
     for (const group of adoption.bySpace) {
       for (const part of chunk(group.ids, 400)) {

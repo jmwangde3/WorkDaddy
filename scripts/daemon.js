@@ -738,8 +738,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 //        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
 // 1.3.1：可靠性 + 安全加固（不新增功能）。tag、本常量、package.json 三者必须一致，
 //        release.yml 会当场比对，不一致就拒绝发布。
-const DAEMON_VERSION = '1.3.4';
-const DAEMON_BUILD_ID = 'release-1.3.4-full-fork';
+const DAEMON_VERSION = '1.3.5';
+const DAEMON_BUILD_ID = 'release-1.3.5-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({

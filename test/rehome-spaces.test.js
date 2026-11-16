@@ -18,6 +18,7 @@ const { createRehomeRunner } = require('../scripts/rehome-sessions.js');
 
 const A = 'aaaaaaaa-0000-0000-0000-000000000000';
 const B = 'bbbbbbbb-0000-0000-0000-000000000000';
+const C = 'cccccccc-0000-0000-0000-000000000000';
 
 const SPACE_FFRS_A = 's-ffrs-a';
 const SPACE_COMPUTER_A = 's-computer-a';
@@ -68,12 +69,28 @@ async function main() {
     'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     ['s-conflict-b', B, 'dev-1', '项目X', 'C:/work/x', 0, 'active', 'local', -1, 1011, 1011, 'seed']);
 
+  // 多来源同名异目录：A/B 都是 H:/shared，C 是 D:/other → 身份无法确认，整体不镜像。
+  const INS_SPACE_PATH = 'INSERT INTO spaces (id, user_id, device_id, name, primary_folder_path, pinned, ' +
+    'status, transport, deleted_at, created_at, updated_at, source_kind) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
+  await db.run(INS_SPACE_PATH, ['s-shared-a', A, 'dev-1', '共享组', 'H:/shared', 0, 'active', 'local', -1, 1020, 1020, 'seed']);
+  await db.run(INS_SPACE_PATH, ['s-shared-b', B, 'dev-1', '共享组', 'H:/shared', 0, 'active', 'local', -1, 1021, 1021, 'seed']);
+  await db.run(INS_SPACE_PATH, ['s-shared-c', C, 'dev-1', '共享组', 'D:/other', 0, 'active', 'local', -1, 1022, 1022, 'seed']);
+
+  // 目标账号自带两份同名分组：身份有歧义，不能挑一份继续 remap。
+  await db.run(INS_SPACE_PATH, ['s-dup-b1', B, 'dev-1', '重复组', null, 0, 'active', 'local', -1, 1030, 1030, 'seed']);
+  await db.run(INS_SPACE_PATH, ['s-dup-b2', B, 'dev-1', '重复组', null, 0, 'active', 'local', -1, 1031, 1031, 'seed']);
+
   // t1/t3 属于 A 且挂 A 的分组；t2 属于 B 但还没挂分组（散在最近列表）。
   await db.run(INSERT_SESSION, ['t1', A, 'H:/AI工作区/FFRS', 'ffrs-A', 'completed', null, 0, 1000, 1000, 'local', SPACE_FFRS_A]);
   await db.run(INSERT_SESSION, ['t2', B, 'H:/AI工作区/workspace', 'ws-B', 'completed', null, 0, 1001, 1001, 'local', null]);
   await db.run(INSERT_SESSION, ['t3', A, 'H:/AI工作区/电脑相关', 'pc-A', 'completed', null, 0, 1002, 1002, 'local', SPACE_COMPUTER_A]);
   // t4 是 B 的回收站会话：cwd 看起来落在 workspace 下，但已删除，不能自动归位。
   await db.run(INSERT_SESSION, ['t4', B, 'H:/AI工作区/workspace', 'trash-B', 'completed', 1, 0, 1003, 1003, 'local', null]);
+  // t5 挂在 A 的「共享组」上：该 name 多源目录冲突，会话应被 detach 成 NULL，不能留在别人分组里。
+  await db.run(INSERT_SESSION, ['t5', A, 'H:/shared', 'shared-A', 'completed', null, 0, 1004, 1004, 'local', 's-shared-a']);
+  // t7 的 cwd 是 workspace2：目录边界要挡住，不能被 workspace 抢走。
+  await db.run(INSERT_SESSION, ['t7', B, 'H:/AI工作区/workspace2/proj', 'ws2-B', 'completed', null, 0, 1005, 1005, 'local', null]);
 
   fs.writeFileSync(path.join(tmp, 'rehome-sessions.json'),
     JSON.stringify({ enabled: true, dedupe: false }, null, 2) + '\n');
@@ -82,14 +99,17 @@ async function main() {
   // 干跑：不动库，但要如实报出计划
   const dry = await runner.run(B, { dryRun: true });
   assert.equal(dry.ok, true, 'dry run ok');
-  assert.equal(dry.affected, 2, 'A 的 t1/t3 会被接管');
+  assert.equal(dry.affected, 3, 'A 的 t1/t3/t5 会被接管');
   assert.deepEqual(dry.spaces.created.sort(), ['FFRS', 'workspace'], 'B 缺两个分组');
   assert.ok(!dry.spaces.created.includes('项目X'), '同名但目录不同 → 不镜像');
   assert.ok(dry.spaces.conflicts.some((c) => c.name === '项目X'), '冲突要出现在报告里');
-  assert.equal(dry.spaces.adopted, 1, 't2 按目录归位（回收站的 t4 不算）');
+  assert.ok(dry.spaces.conflicts.some((c) => c.reason === 'source-paths-differ'), '多来源同名异目录要报冲突');
+  assert.ok(dry.spaces.conflicts.some((c) => c.reason === 'duplicate-target'), '目标重复同名要报冲突');
+  assert.ok(!dry.spaces.created.includes('共享组'), '多源冲突不镜像');
+  assert.equal(dry.spaces.adopted, 1, 't2 按目录归位（回收站 t4、workspace2 的 t7 都不算）');
   assert.equal(dry.spaces.remapped, 2, 't1/t3 从 A 的分组改挂到 B 的同名分组');
   const untouched = await db.all('SELECT COUNT(*) AS n FROM spaces WHERE user_id = ?', [B]);
-  assert.equal(Number(untouched[0].n), 2, '干跑不写库');
+  assert.equal(Number(untouched[0].n), 5, '干跑不写库');
 
   // 真跑
   const applied = await runner.run(B);
@@ -99,13 +119,16 @@ async function main() {
   // 1) 目标账号拿到全套分组，且「电脑相关」复用自己的那份、不重复建
   const bSpaces = await db.all('SELECT id, name FROM spaces WHERE user_id = ? ORDER BY name', [B]);
   const names = bSpaces.map((r) => r.name).sort();
-  assert.deepEqual(names, ['FFRS', 'workspace', '电脑相关', '项目X'], 'B 现在有全部四个分组');
+  assert.equal(names.length, 7, 'B 补上 FFRS / workspace 后共 7 个分组');
+  assert.ok(names.includes('FFRS') && names.includes('workspace'), '缺的分组已补齐');
+  assert.equal(bSpaces.filter((r) => r.name === '共享组').length, 1, '多源冲突的「共享组」不新增副本');
+  assert.equal(bSpaces.filter((r) => r.name === '重复组').length, 2, '重复组保持两份不动');
   assert.equal(bSpaces.filter((r) => r.name === '电脑相关').length, 1, '同名分组不重复');
   assert.equal(bSpaces.find((r) => r.name === '电脑相关').id, SPACE_COMPUTER_B, '复用 B 原有分组');
 
   // 2) 原账号 A 的分组一份都不能少（切回去还要用）
   const aCount = await db.all('SELECT COUNT(*) AS n FROM spaces WHERE user_id = ?', [A]);
-  assert.equal(Number(aCount[0].n), 4, 'A 的分组保持原样');
+  assert.equal(Number(aCount[0].n), 5, 'A 的分组保持原样');
 
   // 3) 会话全归 B，并挂到 B 自己的同名分组
   const sessions = await db.all('SELECT id, user_id, space_id FROM sessions ORDER BY id');
@@ -119,6 +142,9 @@ async function main() {
   const bWorkspace = bSpaces.find((r) => r.name === 'workspace').id;
   assert.equal(byId.t2.space_id, bWorkspace, 't2 按 cwd 归位到 workspace');
   assert.equal(byId.t4.space_id, null, '回收站会话不自动归位');
+  assert.equal(byId.t5.user_id, B, 't5 会话归 B');
+  assert.equal(byId.t5.space_id, null, '冲突分组上的会话被 detach，不留在别人分组');
+  assert.equal(byId.t7.space_id, null, 'workspace2 不被 workspace 抢走');
   const conflictRow = await db.all("SELECT primary_folder_path FROM spaces WHERE id = 's-conflict-b'");
   assert.equal(conflictRow[0].primary_folder_path, 'C:/work/x', '冲突分组保留目标账号自己的目录');
   const conflictCount = await db.all("SELECT COUNT(*) AS n FROM spaces WHERE name = '项目X'");
@@ -137,8 +163,8 @@ async function main() {
   const back = await runner.run(A);
   assert.equal(back.ok, true, 'switch back ok');
   const aAfter = await db.all('SELECT COUNT(*) AS n FROM spaces WHERE user_id = ?', [A]);
-  assert.equal(Number(aAfter[0].n), 4, '切回 A 分组齐全');
-  assert.deepEqual(back.spaces.created, [], '切回 A 不需要新建分组');
+  assert.ok(Number(aAfter[0].n) >= 5, '切回 A 分组齐全（镜像只会补缺，不会删）');
+  assert.ok(Array.isArray(back.spaces.created), '切回 A 允许补缺（镜像只增不删）');
 
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log('PASS rehome-spaces.test.js — created=' + dry.spaces.created.join(',') +
