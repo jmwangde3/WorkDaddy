@@ -2027,6 +2027,23 @@ function isCurrentWindowsDaemonProcess(pid) {
   }
 }
 
+// 锁的写句柄会让「只想读内容」的进程撞上共享冲突：托盘用 File.ReadAllText 打开
+// （FileShare.Read，等于拒绝写共享），而我们当时正持有写访问 —— 于是它拿到的永远
+// 是「正由另一进程使用」。但托盘恰恰要靠锁内容证明「这个 pid 就是本目录的 daemon」，
+// 读不到就只能失败关闭，「关闭/重启」的兜底等于失效。
+//
+// 所以创建并写完内容后立刻把句柄降级成只读：单实例语义一点没变（原子创建 + 文件
+// 存在性 + pid 存活检查），只是内容从此可读。
+function downgradeLockToReadOnly() {
+  if (daemonLockFd === null) return;
+  try {
+    fs.closeSync(daemonLockFd);
+    daemonLockFd = fs.openSync(daemonLockPath, 'r');
+  } catch (_) {
+    daemonLockFd = null;
+  }
+}
+
 // launchd 应只启动一个 daemon；启动器的 nohup 兜底和 launchd 异步拉起可能短暂重叠，
 // 用原子创建锁文件把这类竞态变成可观测的单实例退出，而不是两个进程同时清理/注入页面。
 // Windows 数据目录锁不可写时，使用同一台机器用户临时目录中的哈希锁继续保证单实例。
@@ -2042,6 +2059,8 @@ function acquireDaemonLock() {
         daemonLockFd = fs.openSync(lockPath, 'wx', 0o600);
         fs.writeFileSync(daemonLockFd, payload, 'utf8');
         daemonLockPath = lockPath;
+        daemonLockOwned = true;
+        downgradeLockToReadOnly();
         if (lockPath !== DAEMON_LOCK_FILE) reportDaemonLockFallback(fallbackReason || { code: 'EEXIST' });
         log(`[lock] daemon 单实例锁已获取 (pid=${process.pid})`);
         return true;
@@ -2088,9 +2107,12 @@ function acquireDaemonLock() {
 }
 
 function releaseDaemonLock() {
-  if (daemonLockFd === null) return;
-  try { fs.closeSync(daemonLockFd); } catch (_) {}
-  daemonLockFd = null;
+  if (!daemonLockOwned) return;
+  daemonLockOwned = false;
+  if (daemonLockFd !== null) {
+    try { fs.closeSync(daemonLockFd); } catch (_) {}
+    daemonLockFd = null;
+  }
   try {
     const owner = JSON.parse(fs.readFileSync(daemonLockPath, 'utf8'));
     if (Number(owner.pid) === process.pid) fs.unlinkSync(daemonLockPath);
@@ -2267,6 +2289,7 @@ const DAEMON_LOCK_FALLBACK_FILE = path.join(
 );
 let daemonLockFd = null;
 let daemonLockPath = DAEMON_LOCK_FILE;
+let daemonLockOwned = false;
 // 注入节流：仅避免 connect 与 loadEventFired 在同一瞬间（<1.5s）重复注入导致闪烁；
 // 但每次页面刷新（含 Command+R）都应重新注入最新代码，因此不用“一次加载只注入一次”的布尔去重，
 // 否则 Electron 重载未触发 loadEventFired 时会遗留旧版本组件。

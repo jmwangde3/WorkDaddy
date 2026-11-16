@@ -91,6 +91,22 @@ function writeDaemonLock(ctx, pid) {
 }
 
 async function main() {
+  // 回归用例：daemon 用写句柄持有锁时，托盘 File.ReadAllText（FileShare.Read）会撞
+  // 共享冲突，读到的永远是「正由另一进程使用」——于是归属证明恒失败、超时兜底恒拒绝。
+  // daemon 现在写完就把句柄降级成只读，这条必须一直绿。
+  await test('运行中的 daemon：锁文件可被托盘读取，归属证明为 ok', async () => {
+    const cn = install('own-proof-cn', 'workbuddy-cn');
+    start(cn);
+    await waitRunning(cn);
+    const state = fixture.readStateFile(cn);
+    assert(state && state.daemonPid > 0, '应有 daemonPid');
+    const r = fixture.runTray(cn, ['--status'], { WORKDADDY_TRAY_PORT: String(cn.uiPort) });
+    const cli = r.cli || '';
+    const own = (cli.split(/\r?\n/).find((line) => /^own\s+:/.test(line)) || '').trim();
+    assert(/proof=ok/.test(own), '归属证明必须是 ok（锁可读）：' + own);
+    assert(!/锁文件/.test(own), '不应出现锁文件读取错误：' + own);
+  });
+
   await test('CN / AI 共用同一个 AppDir：CN daemon 超时，Stop CN 不得结束 AI', async () => {
     const cn = install('own-share-cn', 'workbuddy-cn');
     const ai = install('own-share-ai', 'workbuddy-ai', { appDir: cn.appDir });

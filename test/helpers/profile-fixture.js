@@ -58,14 +58,30 @@ record('daemon-' + process.pid + '.json', {
 
 // 生产 daemon 在数据目录写的单实例锁：托盘 StopWd 靠它证明「这个 pid 就是本目录
 // 的那个 daemon」。替身必须照做，否则「有归属证明才允许强杀」这条规则测不出来。
+//
+// 关键细节：生产实现在写完内容后把句柄**降级成只读**（写句柄会让托盘以
+// FileShare.Read 打开时撞上共享冲突，于是永远读不到 pid）。替身也照做 —— 之前是
+// 写完就关，掩盖了「锁根本读不了」这个事实。
+const stubStartedAt = new Date().toISOString();
+let lockFd = null;
+let ownsLock = false;
 if (!grandchild) {
-  try { fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), version: 'stub' })); } catch (_) {}
+  try {
+    lockFd = fs.openSync(lockFile, 'wx', 0o600);
+    fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, startedAt: stubStartedAt, version: 'stub' }), 'utf8');
+    ownsLock = true;
+    fs.closeSync(lockFd);
+    lockFd = fs.openSync(lockFile, 'r');
+  } catch (_) {
+    try { if (lockFd !== null) fs.closeSync(lockFd); } catch (_) {}
+    lockFd = null;
+  }
 }
 const releaseLock = () => {
-  try {
-    const owner = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
-    if (Number(owner.pid) === process.pid) fs.unlinkSync(lockFile);
-  } catch (_) {}
+  if (!ownsLock) return;
+  ownsLock = false;
+  if (lockFd !== null) { try { fs.closeSync(lockFd); } catch (_) {} lockFd = null; }
+  try { fs.unlinkSync(lockFile); } catch (_) {}
 };
 
 // STUB_IGNORE_SHUTDOWN：模拟「不响应 shutdown / IPC 断开」的 daemon（旧版没有 IPC
