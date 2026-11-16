@@ -53,6 +53,26 @@ function makeShortcut(root, file, target) {
   assert.ok(fs.existsSync(file), '前置：快捷方式应已创建 ' + file);
 }
 
+// 读 .lnk 的目标/参数/工作目录。快捷方式入口从 vbs 换成托盘 exe 之后，
+// 只有真读一次才知道装出来的是不是我们要的那个入口。
+// 复用 runPs 的 -Json 报告通道：脚本把结果写成无 BOM 的 UTF-8 JSON。
+const READ_LNK = [
+  'param([string]$Lnk = "", [string]$Json = "")',
+  '$shell = New-Object -ComObject WScript.Shell',
+  '$sc = $shell.CreateShortcut($Lnk)',
+  '$o = [ordered]@{ target = [string]$sc.TargetPath; arguments = [string]$sc.Arguments; workDir = [string]$sc.WorkingDirectory }',
+  '$txt = ($o | ConvertTo-Json -Depth 4)',
+  '[IO.File]::WriteAllText($Json, $txt, (New-Object System.Text.UTF8Encoding($false)))',
+].join('\r\n');
+
+function readShortcut(root, lnk) {
+  const reader = path.join(root, 'read-lnk.ps1');
+  writeFile(reader, READ_LNK);
+  const r = runPs(reader, ['-Lnk', lnk], root);
+  assert.ok(r.report, '读快捷方式失败：' + (r.stderr || r.stdout));
+  return r.report;
+}
+
 function main() {
   assert.ok(fs.existsSync(installPs1), 'install-workdaddy.ps1 存在');
   assert.ok(fs.existsSync(updatePs1), 'update-workdaddy.ps1 存在');
@@ -97,6 +117,48 @@ function main() {
     assert.equal(config.rehome.dedupe, false);
     assert.equal(config.rehome.dedupeMode, 'exact', '默认必须是精确副本');
     assert.equal(config.permission.preferenceGuard, false, '默认不得写偏好');
+  });
+
+  test('桌面快捷方式直接指向托盘 exe：双击即有图标、服务由托盘自己拉起', () => {
+    const root = tmpRoot('traylnk');
+    const src = makeSource(root, '1.3.0');
+    // 托盘 exe 是预编译产物，夹具里给个占位文件（安装器只检查存在与拷贝）
+    writeFile(path.join(src, 'tray', 'WorkDaddyTray.exe'), 'MZ-tray-placeholder');
+    const appDir = path.join(root, 'app');
+    const dataDir = path.join(root, 'data');
+    const desktop = path.join(root, 'desktop');
+    const r = runPs(installPs1, ['-SourceDir', src, '-AppDir', appDir, '-DataDir', dataDir,
+      '-DesktopDir', desktop, '-SkipClientCheck', '-LegacyScriptsDir', path.join(root, 'nolegacy')], root);
+
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.report.shortcutEntry, 'tray', '入口应为托盘 exe，实际：' + r.report.shortcutEntry);
+
+    const lnk = path.join(desktop, 'WorkDaddy.lnk');
+    assert.ok(fs.existsSync(lnk), '应创建桌面快捷方式');
+    const info = readShortcut(root, lnk);
+    assert.equal(path.basename(info.target).toLowerCase(), 'workdaddytray.exe', '目标应为托盘 exe：' + info.target);
+    assert.ok(/[\\/]tray[\\/]WorkDaddyTray\.exe$/i.test(info.target), '目标必须在 tray 目录内：' + info.target);
+    assert.equal(String(info.arguments).trim(), '/start', '参数应为 /start（确保服务在跑）');
+    assert.equal(path.basename(info.workDir).toLowerCase(), 'tray', '工作目录应为 tray：' + info.workDir);
+
+    const state = JSON.parse(fs.readFileSync(path.join(dataDir, 'install-state.json'), 'utf8'));
+    assert.equal(state.shortcut, lnk, '安装记录要记这条快捷方式（卸载时按它删）');
+  });
+
+  test('源里没有托盘 exe：回退到 launcher-hidden.vbs，不建空快捷方式', () => {
+    const root = tmpRoot('traylnk-fallback');
+    const src = makeSource(root, '1.3.0');
+    const appDir = path.join(root, 'app');
+    const dataDir = path.join(root, 'data');
+    const desktop = path.join(root, 'desktop');
+    const r = runPs(installPs1, ['-SourceDir', src, '-AppDir', appDir, '-DataDir', dataDir,
+      '-DesktopDir', desktop, '-SkipClientCheck', '-LegacyScriptsDir', path.join(root, 'nolegacy')], root);
+
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.report.shortcutEntry, 'launcher-hidden.vbs', '无托盘时应回退 vbs：' + r.report.shortcutEntry);
+    const info = readShortcut(root, path.join(desktop, 'WorkDaddy.lnk'));
+    assert.equal(path.basename(info.target).toLowerCase(), 'wscript.exe', '回退目标应为 wscript：' + info.target);
+    assert.match(String(info.arguments), /launcher-hidden\.vbs/, '回退参数应带 vbs 路径：' + info.arguments);
   });
 
   test('重复安装（同版本）：同样先备份，成功后再覆盖', () => {

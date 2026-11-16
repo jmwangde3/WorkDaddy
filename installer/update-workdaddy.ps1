@@ -49,6 +49,8 @@ $report = [ordered]@{
     rolledBack = $false
     fileCount  = 0
     health     = [ordered]@{}
+    # 绑定文件跟着程序走；更新只换程序，profile / DataDir 一律沿用安装时的选择。
+    binding    = [ordered]@{ path = ''; written = $false; restored = $false; note = '' }
     # 状态提交是更新事务的一部分，逐阶段留证据：写临时文件 → 校验 → 原子替换 → 校验
     state      = [ordered]@{
         previousSaved = ''
@@ -95,6 +97,14 @@ $state = Read-JsonFile $statePath
 if (-not $state) { Fail-Update ('找不到安装记录：' + $statePath + '；请先用 install-workdaddy.ps1 安装') 1 }
 $report.fromVersion = [string]$state.version
 if ([string]$state.appDir) { $AppDir = ([string]$state.appDir).TrimEnd('\') }
+
+# 更新前的绑定原文。更新不允许改 profile / DataDir，回滚时要按原样写回 ——
+# 程序备份会整目录还原，但备份里未必有绑定（老版本安装没有这个文件）。
+$script:bindingBefore = $null
+try {
+    $binding0 = Get-BindingPath $AppDir
+    if (Test-Path -LiteralPath $binding0) { $script:bindingBefore = [IO.File]::ReadAllText($binding0) }
+} catch { $script:bindingBefore = $null }
 
 # ---- 0.5 上次事务残留检查 ----
 # 如果上一次更新崩在「文件已替换、状态未提交」之间，磁盘上会留一份 journal。
@@ -268,6 +278,22 @@ function Invoke-UpdateRollback {
     $progOk = [bool](Restore-Backup -From $backupDir -To $AppDir)
     $report.rollback.programRestored = $progOk
 
+    # 绑定文件不属于「程序文件」，但它是这一份安装的身份。更新前有就按原文写回，
+    # 更新前没有就不能凭空多出来（否则回滚后的实例会指向一个不存在的历史）。
+    try {
+        $bindingPath = Get-BindingPath $AppDir
+        if ($script:bindingBefore) {
+            [IO.File]::WriteAllText($bindingPath, $script:bindingBefore, (New-Object System.Text.UTF8Encoding($false)))
+        } elseif (Test-Path -LiteralPath $bindingPath) {
+            Remove-Item -LiteralPath $bindingPath -Force -ErrorAction SilentlyContinue
+        }
+        Get-ChildItem -LiteralPath $AppDir -Filter '.install-binding.tmp-*' -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        $report.binding.restored = $true
+    } catch {
+        $report.binding.note = '绑定文件恢复失败：' + $_.Exception.Message
+    }
+
     $stateOk = $false
     if ($InjectFault -eq 'state-restore') {
         # 只注入「回滚时状态恢复失败」：程序恢复照常，状态故意不写回
@@ -418,6 +444,25 @@ if (-not $DryRun) {
         $err = Test-StatePayload -Path $statePath -ExpectVersion $toVersion -ExpectAppDir $AppDir -MinFiles $files.Count
         if ($err) { throw ('提交后校验失败：' + $err) }
         $report.state.committed = $true
+
+        # 绑定文件最后刷新：profile 与 DataDir 都取自安装记录，更新不改用户选择。
+        # 记录里没有（老版本装出来的）就沿用现有绑定，最后才退回默认。
+        $bindingProfile = [string]$state.clientProfile
+        if (-not (Test-KnownProfileId $bindingProfile)) {
+            $existingBinding = Read-JsonFile (Get-BindingPath $AppDir)
+            if ($existingBinding -and (Test-KnownProfileId ([string]$existingBinding.clientProfile))) {
+                $bindingProfile = [string]$existingBinding.clientProfile
+            } else {
+                $bindingProfile = 'workbuddy-cn'
+            }
+            $report.warnings += ('安装记录缺少合法 clientProfile，绑定沿用：' + $bindingProfile)
+        }
+        $bindingFile = Write-InstallBinding -AppDir $AppDir -ClientProfile $bindingProfile -DataDir $DataDir -Stamp $stamp
+        $report.binding.path = $bindingFile
+        $report.binding.written = $true
+        if ($report.binding.path -and (Test-Path -LiteralPath ($report.binding.path + '.bak'))) {
+            Remove-Item -LiteralPath ($report.binding.path + '.bak') -Force -ErrorAction SilentlyContinue
+        }
         # 只用于「状态恢复失败」这一种故障注入：提交成功后再抛，
         # 让回滚必须同时处理「程序已回旧、状态是新」的两侧不一致。
         if ($InjectFault -eq 'state-restore') { throw '故障注入：状态提交后校验失败' }

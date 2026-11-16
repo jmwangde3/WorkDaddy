@@ -33,6 +33,24 @@ function detectWindowsPrivilege(run = spawnSync) {
   throw new Error('无法确认 Windows 进程是否为普通用户权限');
 }
 
+// 权限探测的两条路（powershell / 原生 helper）都要 spawn 外部进程，被组策略、
+// AppLocker、超时或 helper 缺失挡住是真实现象。这里只负责「按顺序试，全失败给
+// unknown」，不做安全判定本身：危险动作由 assertStandardWindowsPrivilege 与
+// 逐 PID 身份断言把关，调用方拿到 unknown 只是「不知道」，不是「放行」。
+function resolveWindowsPrivilege(detectors) {
+  const errors = [];
+  for (const detect of Array.isArray(detectors) ? detectors : []) {
+    try {
+      const privilege = detect();
+      if (privilege === 'standard' || privilege === 'elevated') return { privilege, errors };
+      errors.push(`权限探测返回无效值：${String(privilege)}`);
+    } catch (error) {
+      errors.push(String((error && error.message) || error));
+    }
+  }
+  return { privilege: 'unknown', errors };
+}
+
 // Native children inherit the real Windows token. Ask the installed helper to
 // verify it (including saved consent for elevated sessions), never an env flag.
 function detectNativeWindowsPrivilege(appDir, profile, run = spawnSync) {
@@ -367,7 +385,10 @@ function selectVerifiedProcessPids(expectedBinary, processes, realpath = fs.real
     .map((process) => process.ProcessId);
 }
 
-function selectRunningProfileBinary(profileNames, processes, realpath = fs.realpathSync.native) {
+// accept：可选的身份校验。运行进程只能证明「有同名的 exe 在跑」，
+// CodeBuddy CN 与国际版共用 CodeBuddy.exe 时，文件名不足以判定归属 ——
+// 调用方传 accept（读 product.json）后，认不出的进程会被跳过而不是被认领。
+function selectRunningProfileBinary(profileNames, processes, realpath = fs.realpathSync.native, accept = null) {
   const names = profileNames instanceof Set ? profileNames : new Set(profileNames || []);
   const binaries = new Map();
   for (const item of Array.isArray(processes) ? processes : []) {
@@ -382,6 +403,7 @@ function selectRunningProfileBinary(profileNames, processes, realpath = fs.realp
     if (path.win32.basename(executable).toLowerCase() !== name) {
       throw new Error(`Executable name does not match CIM Name for PID ${process.ProcessId}`);
     }
+    if (typeof accept === 'function' && !accept(executable)) continue;
     binaries.set(executable.toLowerCase(), executable);
   }
   if (binaries.size > 1) throw new Error('检测到当前 profile 在多个安装目录运行，无法安全选择目标');
@@ -560,6 +582,7 @@ module.exports = {
   parseCimProcessResult,
   readProcessEnumeration,
   resolveWindowsExecutable,
+  resolveWindowsPrivilege,
   sameWindowsPath,
   selectRunningProfileBinary,
   selectPreferredDiscoveredBinary,

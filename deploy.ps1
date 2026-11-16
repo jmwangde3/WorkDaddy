@@ -152,7 +152,8 @@ Head '2/7 校验补丁清单与源文件'
 $newFiles = @(
     'rehome-sessions.js', 'rehome-watcher.js', 'rehome-audit.js', 'session-dedupe.js',
     'session-scope.js', 'permission-sync.js', 'upstream.json', 'rehome_sessions.py',
-    'bind-rehome-ui.py', 'fix-cdp.cmd', 'setup-rehome.ps1', 'stop-workdaddy.ps1'
+    'bind-rehome-ui.py', 'fix-cdp.cmd', 'setup-rehome.ps1', 'stop-workdaddy.ps1',
+    'lifecycle-child.js'
 )
 $patchedFiles = @(
     'daemon.js', 'inject.js', 'lib.js', 'win-launcher.js'

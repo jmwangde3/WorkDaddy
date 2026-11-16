@@ -114,6 +114,75 @@ powershell -ExecutionPolicy Bypass -File installer\build-tray.ps1 -Verify
 `WorkDaddyTray.exe.build.json`，`-Verify` 还会真的跑 `--selftest` / `--status`。
 CI 的 `tray-build` 作业每次现编一份，并与仓库里的 EXE 做行为与字面量比对。
 
+### 端口
+
+每个客户端 profile 有独立的 UI / CDP / 锁端口，托盘按绑定到的 profile 选择，不再假定 47832/9222：
+
+| Profile | UI | CDP | profile 锁 |
+|---|---:|---:|---:|
+| WorkBuddy CN | 47832 | 9222（备用 9226–9232） | 47932 |
+| WorkBuddy AI | 47833 | 9223（备用 9233–9239） | 47933 |
+| CodeBuddy CN | 47834 | 9224 | 47934 |
+| CodeBuddy International | 47835 | 9225 | 47935 |
+
+UI 端口被占用时 daemon 会退到 `-30000 / -20000 / -10000` 三档并在数据目录写 `ui-port.json`；
+托盘读这个文件时要求 `profileId` 与自己一致，避免把兄弟 profile 的端口当成自己的。
+
+### 运行边界（不同 Profile 独立运行）
+
+**同一 Profile 同一时间只允许一个后台服务；不同 Profile 可以同时运行。**
+换句话说：WorkBuddy CN 与 WorkBuddy AI 可以各自挂着面板，CodeBuddy CN 与 International 也一样；
+但同一个 profile 不能起两遍。
+
+这里要说清版本差异，否则容易误读成「1.3.1 什么锁都没有」：
+
+| 能力 | 1.3.1 | 1.3.2（本分支） |
+|---|---|---|
+| 后台服务锁 | 已有，`watchdog.js` 按 profile 用 `47932`–`47935`（一 profile 一把） | 同一张表，语义不变 |
+| 不同 profile 并行 | **服务层可以**，但下面三条会互相踩 | 完整可用 |
+| 托盘 | 全局 Mutex `Local\WorkDaddyTraySingleton` —— 整台机器只能有一个托盘 | 每 profile 一个 Mutex |
+| 停止/重启 | 按命令行匹配任意安装目录下的 `watchdog/daemon` 并结束 —— 停一个会连带停掉别的 profile | 只停状态文件 + daemon 锁 + 命令行三方证明属于本实例的那一个 |
+| 生命周期 | 无 IPC 绑定：watchdog 被强杀后 daemon 可能留下，同一 profile 会出现两份 | watchdog ↔ daemon IPC 绑定，退出前等 daemon 真的没了 |
+
+所以 1.3.1 的「只能挂一个面板」来自托盘全局 Mutex 与停止策略，而不是服务锁；1.3.2 补齐的是后两项
+（以及生命周期的有界收尾）。
+
+| 层 | 机制 | 冲突/异常时的表现 |
+|---|---|---|
+| 后台服务 | `watchdog.js` profile 锁 `47932`–`47935`（一 profile 一把） | 同 profile 第二个 watchdog `exit 3`，日志写清 lock 端口 |
+| 旧版兼容 | 1.3.1 用同一张锁表 | 新旧版本同 profile 天然互斥；不同 profile 照常共存 |
+| 已有 daemon | 启动前探本 profile 的 `/api/status`，并核对上一份状态文件里的 `daemonPid` | 上一份 daemon 还没退完 → 等最多 8s，仍在则 `exit 4`；进程身份无法确认同样 `exit 4`，绝不起第二个 |
+| 生命周期 | watchdog ↔ daemon 的 IPC 通道 | watchdog 消失（含被强杀）→ 通道断开 → daemon 自行退出；停止时先等它真退出，确认不了 `exit 5` |
+| 托盘图标 | 每 profile 一个 Mutex `Local\WorkDaddyTraySingleton_<profile>` | 同 profile 第二个托盘静默退出；不同 profile 可各有一个托盘 |
+| 停止/重启 | 只认 `watchdog-state.json`（profile / appDir / dataDir / 两个 PID）+ daemon 的 `.daemon.lock` + 命令行 | 任一项对不上就拒绝并说明原因；超时兜底也只结束状态文件里那一个 pid，绝不按目录枚举 `daemon.js` |
+
+「停止」的判定标准是**服务真的不在了**：先请 daemon 自己退出，等它退出；超时后只允许结束
+`watchdog-state.json` 里那个 `daemonPid`，而且必须同时满足「该 profile 数据目录下的
+`.daemon.lock` 记着同一个 pid」与「该 pid 的命令行指向本安装的 `scripts/daemon.js`」。
+证明不齐（状态文件损坏、pid 被复用、锁文件缺失、dataDir 对不上）时一律返回失败并说明原因，
+不会再像旧版那样「按目录把所有 `daemon.js` 都结束一遍」。watchdog 自己的退出码：
+`3` = 同 profile 已有 watchdog，`4` = 同 profile 已有 daemon（含身份无法确认），
+`5` = 停止未被确认（daemon 可能还活着，状态写 `FAILED`，pid 文件保留供排查）。
+
+托盘判定「已启动」不只是看端口：必须拿到 `/api/status` 里与自己一致的 `profile.id`，绑定了
+数据目录时还要求 `dataDir`（以及 `appDir`，若 daemon 返回）逐项一致 —— `dataDir` 只在
+`x-workdaddy-token` 认证通过时才会返回，所以「同 profile、另一份安装」不会被误认成自己。
+`CDP 已连接` 同样来自 daemon 的 `cdp.connected` / `cdp.port`，不是「端口能连上」。
+「启动」还会等这个身份真正出现（默认 20 秒），子进程提前退出或始终没就绪都报失败并附日志尾。
+
+同一 profile 换了安装目录（或升级了版本）时：
+
+1. 在**旧实例**的托盘菜单点「关闭 WorkDaddy」——它只结束自己那份 watchdog，daemon 随 IPC 断开退出；
+2. 需要的话右键托盘 →「退出托盘」，让出该 profile 的托盘 Mutex；
+3. 启动**新实例**的 `WorkDaddy.lnk`（或登录时自动启动的那份）；
+4. 用新实例托盘的状态行确认 `运行中`，必要时点「恢复 CDP」重新注入面板。
+
+Mutex 用的是 `Local\` 前缀，作用域是**当前 Windows 登录会话**；profile 锁是回环端口，机器级。
+两者作用域不同：真正保证「同一 profile 只有一个后台服务」的是 profile 锁。
+
+`watchdog-state.json` 与 `watchdog.pid` 都写在**该 profile 自己的数据目录**里，所以「谁拥有这份服务」
+是可判定的：换一个 profile 或换一个安装目录，状态文件就不是同一份，StopWd 会拒绝动手。
+
 ## 许可证
 
 [AGPL-3.0](LICENSE)，与上游一致。上游版权归其作者所有；本 fork 的修改同样以 AGPL-3.0 发布。二次分发请保留 `LICENSE` 与来源说明（见 [`docs/upstream-tracking.md`](docs/upstream-tracking.md)）。

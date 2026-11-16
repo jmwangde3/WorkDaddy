@@ -22,6 +22,9 @@ function harness({ targets = [own], unavailable = false, activeProfile = profile
   const cdp = { connected: false, port: null };
   const context = vm.createContext({
     PROFILE: activeProfile, cdp, classifyTarget, isTargetForProfile, selectPageTarget,
+    // 归属判定的路径证据由 daemon 的解析链提供；这里刻意不给（空证据），
+    // 让用例只走 custom target / 已绑定 profile 这两条规则。
+    cdpProfileEvidence: () => ({}),
     process: { env: { WBSWITCH_PROFILE: 'workbuddy-ai' } },
     IS_LINUX: false, CDP_PORT_HINT: 9233, AbortSignal,
     validCdpPort: (p) => p === 9233, readCdpPortFile: () => 9233,

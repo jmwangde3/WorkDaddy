@@ -33,6 +33,7 @@ const net = require('net');
 const { inspectPersona, copyPersona, readPersonaSettings, listPersonaSources, configurePersona, dismissPersonaNotice, syncSharedPersonaForSwitch } = require('./persona.js');
 let sessionSync = require('./session-sync.js');
 const { createSessionPinSync, readPinsInRenderer, applyPinsInRenderer } = require('./session-pin-sync');
+const { installChildLifecycle } = require('./lifecycle-child.js');
 const {createCodeBuddyFiles} = require('./codebuddy-files.js');
 const { createAccountCreditCache } = require('./account-credit-cache.js');
 const { spawn, spawnSync, execFile } = require('child_process');
@@ -56,15 +57,37 @@ const {
   filterVerifiedNodeProcesses,
   parseCimProcessResult,
   resolveWindowsExecutable,
+  resolveWindowsPrivilege,
   sameWindowsPath,
   selectRunningProfileBinary,
   selectPreferredDiscoveredBinary,
 } = require('./windows-process-boundary.js');
-const DAEMON_PRIVILEGE = process.platform === 'win32'
-  ? (process.env.WBSWITCH_NATIVE_LAUNCHER === '1'
-    ? detectNativeWindowsPrivilege(path.resolve(__dirname, '..'), process.env.WBSWITCH_PROFILE || 'workbuddy-cn')
-    : detectWindowsPrivilege())
-  : 'standard';
+// 权限探测失败不能让整个服务起不来：Windows 上这两条探测各要 spawn 一个外部进程
+// （powershell / 原生 helper），被组策略、AppLocker、8 秒超时或 helper 缺失挡住是
+// 真实存在的环境问题。旧逻辑在模块加载期直接 throw，用户看到的现象就是「托盘点了
+// 启动没反应、后台服务根本没起来」，且没有任何可读原因。
+//
+// 退化为 'unknown' 不会放松安全边界：daemon 自己不用这个值做危险动作判定
+// （结束进程走 assertDaemonTerminationIdentity / assertSameProcessIdentity，
+// 启动校验由启动器按自己的探测结果做），它只出现在 /api/status 里。
+function detectDaemonPrivilege() {
+  if (process.platform !== 'win32') return 'standard';
+  const appDir = path.resolve(__dirname, '..');
+  const profileId = process.env.WBSWITCH_PROFILE || 'workbuddy-cn';
+  const nativeDetect = () => detectNativeWindowsPrivilege(appDir, profileId);
+  const shellDetect = () => detectWindowsPrivilege();
+  // 优先走当前启动方式那条路，失败再用另一条：powershell 被挡时原生 helper 通常还能用。
+  const detectors = process.env.WBSWITCH_NATIVE_LAUNCHER === '1'
+    ? [nativeDetect, shellDetect]
+    : [shellDetect, nativeDetect];
+  const { privilege, errors } = resolveWindowsPrivilege(detectors);
+  if (privilege === 'unknown') {
+    DAEMON_PRIVILEGE_WARNING = '无法确认 Windows 运行权限，已退化为 unknown：' + errors.join(' / ');
+  }
+  return privilege;
+}
+let DAEMON_PRIVILEGE_WARNING = '';
+const DAEMON_PRIVILEGE = detectDaemonPrivilege();
 // ws（WebSocketServer）用于 DevTools 代理：Electron 的 CDP server 拒绝带 Origin 的 WS 连接
 // （浏览器必带 Origin → DevTools 前端 "websocket disconnected"），daemon 代理中转去掉 Origin
 let wsLib = null;
@@ -177,7 +200,7 @@ const {
   telemetryEnvironmentOverride,
 } = require('./sentry-report.js');
 const { createUsageReporter } = require('./usage-report.js');
-const { getProfile, profileDataDir, listInstalledModelSources, sharedDataDir } = require('./profiles.js');
+const { getProfile, profileDataDir, listInstalledModelSources, sharedDataDir, isFullWindowsPath, isCodeBuddyBinary } = require('./profiles.js');
 const plat = require('./platform.js');
 const { readWorkBuddyTarget } = require('./workbuddy-target.js');
 const { BINDING, createRendererApiBridge, rendererBridgeSource } = require('./renderer-api-bridge.js');
@@ -734,6 +757,12 @@ const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
 const IS_LINUX = process.platform === 'linux';
+// 数据目录必须是完整绝对路径。Windows 上 "C:foo" / "\foo" / "relative" 都会被
+// path.join 接受，然后 daemon 就写到「当前盘符工作目录」里去了 —— 用户看不到，
+// 备份/账号也跟着分裂。入口（托盘、watchdog、安装器）已经拦了，这里再兜一次底。
+if (IS_WIN && process.env.WBSWITCH_DATA_DIR && !isFullWindowsPath(process.env.WBSWITCH_DATA_DIR)) {
+  throw new Error('WBSWITCH_DATA_DIR 不是完整的绝对路径：' + process.env.WBSWITCH_DATA_DIR);
+}
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
 const WORKDADDY_INSTALL_NAME = PROFILE.appName || (PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy AI' : 'WorkDaddy');
 const sessionExportJobs = createSessionExportJobs({
@@ -1928,6 +1957,30 @@ function log(...args) {
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * 父进程（watchdog）生命周期绑定。
+ *
+ * 必须尽早安装：watchdog 可能在 daemon 完成初始化之前就被强杀，那时也得能收到
+ * IPC 断开并退出。这里只注册监听，不做重活；真正被调用时 log/DATA_DIR/PROFILE
+ * 都已就绪（log 定义在上面几行）。
+ * ------------------------------------------------------------------------- */
+const DAEMON_LIFECYCLE = installChildLifecycle({
+  log,
+  graceMs: 4000,
+  onState: function (snapshot) {
+    try {
+      if (process.send && process.connected) {
+        process.send({ type: 'state', state: snapshot.state, pid: process.pid, reason: snapshot.reason });
+      }
+    } catch (_) {}
+  },
+  onShutdown: function () {
+    try { releaseDaemonLock(); } catch (_) {}
+    try { stopCaffeinate(); } catch (_) {}
+    try { if (AUTH_FILE) fs.unwatchFile(AUTH_FILE); } catch (_) {}
+  },
+});
+
 function isLockPermissionError(error) {
   return !!error && ['EACCES', 'EPERM', 'EROFS'].includes(error.code);
 }
@@ -1974,11 +2027,28 @@ function isCurrentWindowsDaemonProcess(pid) {
   }
 }
 
+// 锁的写句柄会让「只想读内容」的进程撞上共享冲突：托盘用 File.ReadAllText 打开
+// （FileShare.Read，等于拒绝写共享），而我们当时正持有写访问 —— 于是它拿到的永远
+// 是「正由另一进程使用」。但托盘恰恰要靠锁内容证明「这个 pid 就是本目录的 daemon」，
+// 读不到就只能失败关闭，「关闭/重启」的兜底等于失效。
+//
+// 所以创建并写完内容后立刻把句柄降级成只读：单实例语义一点没变（原子创建 + 文件
+// 存在性 + pid 存活检查），只是内容从此可读。
+function downgradeLockToReadOnly() {
+  if (daemonLockFd === null) return;
+  try {
+    fs.closeSync(daemonLockFd);
+    daemonLockFd = fs.openSync(daemonLockPath, 'r');
+  } catch (_) {
+    daemonLockFd = null;
+  }
+}
+
 // launchd 应只启动一个 daemon；启动器的 nohup 兜底和 launchd 异步拉起可能短暂重叠，
 // 用原子创建锁文件把这类竞态变成可观测的单实例退出，而不是两个进程同时清理/注入页面。
 // Windows 数据目录锁不可写时，使用同一台机器用户临时目录中的哈希锁继续保证单实例。
 function acquireDaemonLock() {
-  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), version: DAEMON_VERSION, buildId: DAEMON_BUILD_ID });
+  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), instanceId: INSTANCE_ID, version: DAEMON_VERSION, buildId: DAEMON_BUILD_ID });
   const candidates = [DAEMON_LOCK_FILE];
   if (IS_WIN && DAEMON_LOCK_FALLBACK_FILE !== DAEMON_LOCK_FILE) candidates.push(DAEMON_LOCK_FALLBACK_FILE);
   let fallbackReason = null;
@@ -1989,6 +2059,8 @@ function acquireDaemonLock() {
         daemonLockFd = fs.openSync(lockPath, 'wx', 0o600);
         fs.writeFileSync(daemonLockFd, payload, 'utf8');
         daemonLockPath = lockPath;
+        daemonLockOwned = true;
+        downgradeLockToReadOnly();
         if (lockPath !== DAEMON_LOCK_FILE) reportDaemonLockFallback(fallbackReason || { code: 'EEXIST' });
         log(`[lock] daemon 单实例锁已获取 (pid=${process.pid})`);
         return true;
@@ -2035,9 +2107,12 @@ function acquireDaemonLock() {
 }
 
 function releaseDaemonLock() {
-  if (daemonLockFd === null) return;
-  try { fs.closeSync(daemonLockFd); } catch (_) {}
-  daemonLockFd = null;
+  if (!daemonLockOwned) return;
+  daemonLockOwned = false;
+  if (daemonLockFd !== null) {
+    try { fs.closeSync(daemonLockFd); } catch (_) {}
+    daemonLockFd = null;
+  }
   try {
     const owner = JSON.parse(fs.readFileSync(daemonLockPath, 'utf8'));
     if (Number(owner.pid) === process.pid) fs.unlinkSync(daemonLockPath);
@@ -2206,6 +2281,27 @@ const cdp = {
 };
 
 const DIAGNOSTICS_FILE = path.join(DATA_DIR, 'diagnostics-latest.json');
+// 实例身份：watchdog 用命令行把本次启动的 32 位十六进制 ID 传进来，它同时出现在
+// watchdog 状态文件和 daemon 锁里。托盘只认「命令行、锁、状态三者 instanceId 一致」
+// 的进程 —— 同 profile 共用 AppDir 的两份安装靠它彻底分开。
+const INSTANCE_ARG_PREFIX = '--workdaddy-instance-id=';
+const INSTANCE_ID = (() => {
+  const arg = process.argv.find((item) => item.startsWith(INSTANCE_ARG_PREFIX));
+  if (!arg) return '';
+  const value = arg.slice(INSTANCE_ARG_PREFIX.length);
+  if (!/^[0-9a-f]{32}$/i.test(value)) {
+    try { process.stderr.write('[daemon] 非法的 --workdaddy-instance-id\n'); } catch (_) {}
+    process.exit(64);
+  }
+  return value.toLowerCase();
+})();
+if (process.env.WORKDADDY_SUPERVISED === '1' && !INSTANCE_ID && !PROBE_CLIENT_RUNNING) {
+  // 受 watchdog 托管却没有身份：不进入正常服务启动流程，免得后续无法证明归属。
+  // --probe-client-running 是一次性探测进程，不启动服务、不写锁、不注册 IPC，
+  // 也拿不到 watchdog 的命令行参数，所以不适用这条规则。
+  try { process.stderr.write('[daemon] watchdog 托管模式缺少 --workdaddy-instance-id\n'); } catch (_) {}
+  process.exit(64);
+}
 const DAEMON_LOCK_FILE = path.join(DATA_DIR, '.daemon.lock');
 // Windows 上旧版可能以不同权限创建锁文件，导致当前用户无法覆盖；临时锁按数据目录哈希隔离。
 const DAEMON_LOCK_FALLBACK_FILE = path.join(
@@ -2214,6 +2310,7 @@ const DAEMON_LOCK_FALLBACK_FILE = path.join(
 );
 let daemonLockFd = null;
 let daemonLockPath = DAEMON_LOCK_FILE;
+let daemonLockOwned = false;
 // 注入节流：仅避免 connect 与 loadEventFired 在同一瞬间（<1.5s）重复注入导致闪烁；
 // 但每次页面刷新（含 Command+R）都应重新注入最新代码，因此不用“一次加载只注入一次”的布尔去重，
 // 否则 Electron 重载未触发 loadEventFired 时会遗留旧版本组件。
@@ -2361,13 +2458,13 @@ function targetsBelongToProfile(targets) {
 function isWorkBuddyCdpTarget(target) {
   // 严格归属判定（见 cdp-targets.js）：页面明确属于其他客户端 → 一律拒绝，
   // 未绑定 profile 的旧 daemon 不会再靠标题 "WorkBuddy" 误连兄弟客户端页面。
-  return isTargetForProfile(target, PROFILE);
+  return isTargetForProfile(target, PROFILE, cdpProfileEvidence());
 }
 
 async function getPageTarget(port) {
   const r = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) });
   const list = await r.json();
-  return selectPageTarget(list, PROFILE);
+  return selectPageTarget(list, PROFILE, cdpProfileEvidence());
 }
 
 async function cleanupForeignInjectedTargets(targets) {
@@ -3237,20 +3334,31 @@ function queryWindowsWorkBuddyProcessEnumeration() {
 function resolveWorkBuddyBinary() {
   if (!IS_WIN) return WORKBUDDY_BINARY;
   if (wbBinaryCache) return wbBinaryCache;
+  const isCodeBuddyProfile = PROFILE.kind === 'codebuddy';
   const tryFile = (p) => {
     try {
       const candidate = String(p || '').trim().replace(/^"(.*)"(?:,\d+)?$/, '$1').replace(/,\d+$/, '');
       if (!candidate || !fs.existsSync(candidate)) return null;
       const resolved = resolveWindowsExecutable(candidate);
       const name = path.win32.basename(resolved).toLowerCase();
-      return PROFILE_BINARY_NAMES.has(name) ? resolved : null;
+      if (!PROFILE_BINARY_NAMES.has(name)) return null;
+      // CodeBuddy CN 与国际版可能共用 CodeBuddy.exe（老版本 CN 就是这个名字），
+      // 文件名本身证明不了身份。必须读安装目录里的 resources/app/product.json：
+      //   CN  → applicationName = buddycn
+      //   国际 → applicationName = buddy
+      // 证明不了就当作「不是我的」：认错会去结束/接管另一个客户端的进程。
+      if (isCodeBuddyProfile && !isCodeBuddyBinary(resolved, PROFILE.id)) return null;
+      return resolved;
     } catch (_) {
       return null;
     }
   };
   const { execFileSync } = require('child_process');
   const psCmd = (cmd) => execFileSync('powershell', ['-NoProfile', '-Command', cmd], { encoding: 'utf8', timeout: 8000, windowsHide: true });
-  const runningBin = selectRunningProfileBinary(PROFILE_BINARY_NAMES, queryWindowsWorkBuddyProcesses());
+  const runningBin = selectRunningProfileBinary(PROFILE_BINARY_NAMES, queryWindowsWorkBuddyProcesses(),
+    fs.realpathSync.native,
+    // 运行进程同样要过身份校验：CN 的进程列表里会同时出现国际版的 CodeBuddy.exe
+    (bin) => !isCodeBuddyProfile || isCodeBuddyBinary(bin, PROFILE.id));
   const configuredTarget = readWorkBuddyTarget({ dataDir: DATA_DIR, profileId: PROFILE.id });
   const configuredBin = tryFile(configuredTarget.binary);
   if (configuredTarget.configured && !configuredBin) {
@@ -3337,6 +3445,31 @@ function resolveWorkBuddyBinary() {
     log('检测到多个 dormant WorkBuddy 安装目录，按发现优先级选择: ' + selected);
   }
   return selected ? (wbBinaryCache = selected) : null;
+}
+
+// CDP 归属判定需要的路径证据：本 profile 客户端到底装在哪个目录。
+// 来源与启动客户端用的是同一条解析链（运行进程 / workbuddy-target.json / 注册表 /
+// 唯一磁盘候选）。解析成功就长期缓存（与 wbBinaryCache 同寿命，安装目录不会自己变）；
+// 失败 60 秒后再试 —— 客户端刚被关掉/刚装好时这段窗口足够短，也不会让每轮清理
+// 循环都去 spawn 一次 powershell。
+const INSTALL_ROOT_FAILURE_RETRY_MS = 60 * 1000;
+let installRootCache = { root: '', retryAt: 0 };
+function workBuddyInstallRoot() {
+  if (!IS_WIN) return WORKBUDDY_APP;
+  if (installRootCache.root) return installRootCache.root;
+  if (installRootCache.retryAt && Date.now() < installRootCache.retryAt) return '';
+  let root = '';
+  try {
+    const binary = resolveWorkBuddyBinary();
+    if (binary) root = path.win32.dirname(binary);
+  } catch (_) { root = ''; }
+  installRootCache = { root, retryAt: root ? 0 : Date.now() + INSTALL_ROOT_FAILURE_RETRY_MS };
+  return root;
+}
+
+function cdpProfileEvidence() {
+  const installRoot = workBuddyInstallRoot();
+  return installRoot ? { installRoot } : {};
 }
 
 function runCommand(command, args, options = {}) {
@@ -4839,7 +4972,7 @@ async function injectWidget(reason, executionContextId) {
   // 防御闸与发现/选页共用归属规则，既隔离兄弟客户端，也尊重自定义安装目录绑定。
   if (cdp.targetUrl) {
     const target = { type: 'page', url: cdp.targetUrl, title: cdp.targetTitle || '', description: cdp.targetDescription || '' };
-    if (!isTargetForProfile(target, PROFILE)) {
+    if (!isTargetForProfile(target, PROFILE, cdpProfileEvidence())) {
       const cls = classifyTarget(target.url, target.title, target.description) || 'unknown';
       log(`[cdp] 目标页面属于 ${cls}（当前 profile=${PROFILE.id}），拒绝注入`);
       return Promise.reject(new Error(`目标页面 ${cls} 不属于当前 profile ${PROFILE.id}`));
@@ -7264,7 +7397,8 @@ const PUBLIC_API_PATHS = new Set([
   // /api/client/relaunch 不在这里：它会重启客户端，属于有副作用的操作。
   // 免认证时任何本机网页（Origin: null 也在 isAllowedApiOrigin 里放行）都能触发，
   // 等于把「重启应用」暴露给任意页面。现在它要求 x-workdaddy-token，
-  // 状态页在渲染时把同一枚 token 嵌进 HTML，fix-cdp.cmd 从 .api-token 读取。
+  // 状态页在渲染时把同一枚 token 嵌进 HTML，fix-cdp.cmd 从 .api-token 读取；
+  // 唯一例外是「完全不像浏览器」的本机启动器（见 LAUNCHER_API_PATHS）。
 ]);
 
 function isAllowedApiOrigin(origin) {
@@ -7287,6 +7421,18 @@ function isAllowedApiOrigin(origin) {
   }
 }
 
+// 桌面托盘和 fix-cdp.cmd 都属于「本机启动器」：它们不一定发得出 token —— 已安装的
+// WorkDaddyTray.exe 就只发一个空 POST，连 User-Agent 都没有。浏览器发起的一律带
+// Origin（file:// 页是 Origin: null，头是存在的）、Referer 或 Sec-Fetch-*，
+// 所以「三个头全没有」足以把本机进程和网页分开。只给这两个必要路径留窄路，
+// 其余有副作用的接口仍然要求 x-workdaddy-token。
+const LAUNCHER_API_PATHS = new Set(['/api/client/relaunch']);
+
+function looksLikeLocalLauncher(req) {
+  return !req.headers.origin && !req.headers.referer &&
+    !req.headers['sec-fetch-site'] && !req.headers['sec-fetch-mode'] && !req.headers['sec-fetch-dest'];
+}
+
 function hasApiToken(req) {
   const supplied = String(req.headers['x-workdaddy-token'] || '');
   const expected = Buffer.from(API_TOKEN, 'utf8');
@@ -7300,7 +7446,11 @@ function isApiRequestAuthorized(req, p) {
   if (PUBLIC_API_PATHS.has(p)) return true;
   // 保留无 Origin 的手动 launcher/curl 注入兼容；诊断面包屑仍需当前 profile token。
   if (!origin && p === '/api/inject') return true;
-  return hasApiToken(req);
+  // 带了 token 就按 token 判：错的 token 不能被「像本机进程」兜过去。
+  if (req.headers['x-workdaddy-token']) return hasApiToken(req);
+  // 托盘「恢复 CDP」走这条路：没有 token，但也没有任何浏览器痕迹。
+  if (LAUNCHER_API_PATHS.has(p) && looksLikeLocalLauncher(req)) return true;
+  return false;
 }
 
 function isAllowedDevtoolsOrigin(origin, upstreamPort) {
@@ -13130,7 +13280,7 @@ function handleApi(req, res) {
         r.on('end', () => {
           try {
             const list = JSON.parse(d);
-            const page = selectPageTarget(list, PROFILE);
+            const page = selectPageTarget(list, PROFILE, cdpProfileEvidence());
             const id = page && page.id;
             if (!id) return resolve(json(res, 500, { ok: false, error: '未找到 WorkBuddy 页面 target' }));
             if (!wsLib) return resolve(json(res, 500, { ok: false, error: 'ws 代理库未加载，无法打开 DevTools' }));
@@ -14211,6 +14361,11 @@ const sessionCwdRepairTimer = setInterval(() => {
 }, 5000);
 sessionCwdRepairTimer.unref && sessionCwdRepairTimer.unref();
 log('WorkBuddy 多账号切换器启动 (CDP 模式)');
+// 绑定的来源必须落在日志里：托盘 / 快捷方式启动时环境变量可能根本不存在，
+// 而 CDP 归属判定曾经依赖它，现场只能看到「注入一直失败」看不出原因。
+log(`[init] 绑定: profile=${PROFILE.id} source=${process.env.WBSWITCH_PROFILE ? 'env' : 'default'} ` +
+  `dataDir=${process.env.WBSWITCH_DATA_DIR ? 'env' : 'default'} privilege=${DAEMON_PRIVILEGE}`);
+if (DAEMON_PRIVILEGE_WARNING) log(`[init] ${DAEMON_PRIVILEGE_WARNING}`);
 log(`登录信息文件: ${currentAuthFile() || '(未唯一确认)'}`);
 log(`备份目录: ${DATA_DIR}`);
 updateDebug('daemon-start', { authFile: currentAuthFile(), dataDir: DATA_DIR, appPath: IS_WIN ? WORKDADDY_DIR_WIN : macWorkDaddyAppPath(), apiPort: UI_PORT_BASE });
@@ -14228,6 +14383,7 @@ if (PROFILE.capabilities.builtinAutomations === false) {
 }
 restoreSleepMode();
 startServer();
+DAEMON_LIFECYCLE.markRunning();
 cdpLoop();
 if (codeBuddyNative) setInterval(() => { if (!accountSwitchInProgress) scheduleBackup('native-auth'); }, 15000);
 // Migrate legacy target row baselines off the switch hot path. This is a
@@ -14250,17 +14406,14 @@ if (!IS_PORTABLE_WIN) {
   updateTimer.unref && updateTimer.unref();
 }
 
+// 停止统一走生命周期模块：IPC 断开 / watchdog 的 shutdown 消息 / SIGTERM 三条路径
+// 都会进同一个幂等实现，清理（释放 daemon 锁、CDP、定时器）只执行一次。
+// Windows 上被强杀时 SIGTERM 处理不会执行，能兜住孤儿的是 IPC 断开那条。
 process.on('SIGTERM', () => {
   log('收到 SIGTERM，退出');
-  releaseDaemonLock();
-  try { stopCaffeinate(); } catch (_) {}
-  try {
-    if (AUTH_FILE) fs.unwatchFile(AUTH_FILE);
-  } catch (_) {}
-  process.exit(0);
+  DAEMON_LIFECYCLE.stop('SIGTERM');
 });
 process.on('SIGINT', () => {
-  releaseDaemonLock();
-  process.exit(0);
+  DAEMON_LIFECYCLE.stop('SIGINT');
 });
 process.on('exit', releaseDaemonLock);

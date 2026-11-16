@@ -94,6 +94,124 @@ function Get-DirSizeMb {
     return [math]::Round($sum / 1MB, 1)
 }
 
+# ---- 安装实例绑定（install-binding.json）----
+# 一个用户可以同时装多份 WorkDaddy（不同盘、不同 profile、不同数据目录）。
+# install-state.json 落在 DataDir 里，而 DataDir 允许自定义；托盘过去按
+# %APPDATA%\WorkDaddy\install-state.json 这个固定路径读，自定义 DataDir 的实例
+# 就绑错了（或读不到）。绑定文件跟着程序走：<AppDir>\install-binding.json，
+# 托盘从自己受控的 scripts 目录推回 AppDir，永远读的是「这一份安装」。
+$script:BindingFileName = 'install-binding.json'
+$script:ProfileIds = @('workbuddy-cn', 'workbuddy-ai', 'codebuddy-cn', 'codebuddy-intl')
+
+function Get-BindingPath {
+    param([string]$AppDir)
+    return (Join-Path ([IO.Path]::GetFullPath($AppDir).TrimEnd('\')) $script:BindingFileName)
+}
+
+function Test-KnownProfileId {
+    param([string]$Id)
+    $v = [string]$Id
+    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+    foreach ($p in $script:ProfileIds) { if ($p -ceq $v) { return $true } }
+    return $false
+}
+
+# Windows 完整绝对路径判断。Path.IsPathRooted() 对 "C:foo" 与 "\foo" 都返回
+# true，但两者都是「相对当前目录 / 相对当前盘」，不能当数据目录传给守护进程。
+function Test-FullWindowsPath {
+    param([string]$Path)
+    $v = [string]$Path
+    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+    if ($v -match '^[A-Za-z]:(?![\\/])') { return $false }
+    if ($v -match '^[\\/](?![\\/])') { return $false }
+    if ($v -match '^\\\\[^\\/]+[\\/][^\\/]+') { return $true }
+    return ($v -match '^[A-Za-z]:[\\/]')
+}
+
+function Test-DataDirSafe {
+    param([string]$DataDir, [string]$AppDir)
+    if (-not (Test-FullWindowsPath $DataDir)) { return ('不是完整绝对路径：' + $DataDir) }
+    $full = ''
+    try { $full = [IO.Path]::GetFullPath($DataDir).TrimEnd('\') } catch { return ('路径无法规范化：' + $DataDir) }
+    if ([string]::IsNullOrWhiteSpace($full)) { return '路径为空' }
+    if ($full -match '^[A-Za-z]:$') { return '拒绝把数据目录设为盘根' }
+    if ($AppDir) {
+        $app = ''
+        try { $app = [IO.Path]::GetFullPath($AppDir).TrimEnd('\') } catch { $app = '' }
+        if ($app) {
+            if ($full.Equals($app, [StringComparison]::OrdinalIgnoreCase)) { return '数据目录不能与程序目录相同' }
+            if ($full.StartsWith($app + '\', [StringComparison]::OrdinalIgnoreCase)) { return '数据目录不能位于程序目录内' }
+        }
+    }
+    return ''
+}
+
+function Test-BindingPayload {
+    param([string]$Path, [string]$AppDir, [string]$ClientProfile, [string]$DataDir)
+    $o = Read-JsonFile $Path
+    if (-not $o) { return 'JSON 解析失败' }
+    if ([int]$o.schema -ne 1) { return ('schema 不符：' + [string]$o.schema) }
+    if (-not (Test-KnownProfileId ([string]$o.clientProfile))) { return ('clientProfile 非法：' + [string]$o.clientProfile) }
+    if ([string]$o.clientProfile -cne $ClientProfile) { return ('clientProfile 与安装参数不一致：' + [string]$o.clientProfile) }
+    if (-not (Test-FullWindowsPath ([string]$o.dataDir))) { return ('dataDir 不是完整绝对路径：' + [string]$o.dataDir) }
+    $wantData = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
+    $gotData = [IO.Path]::GetFullPath([string]$o.dataDir).TrimEnd('\')
+    if (-not $gotData.Equals($wantData, [StringComparison]::OrdinalIgnoreCase)) { return ('dataDir 与安装参数不一致：' + $gotData) }
+    if ([string]::IsNullOrWhiteSpace([string]$o.appDir)) { return 'appDir 为空' }
+    $wantApp = [IO.Path]::GetFullPath($AppDir).TrimEnd('\')
+    $gotApp = [IO.Path]::GetFullPath([string]$o.appDir).TrimEnd('\')
+    if (-not $gotApp.Equals($wantApp, [StringComparison]::OrdinalIgnoreCase)) { return ('appDir 不是本次安装：' + $gotApp) }
+    return ''
+}
+
+# 原子写：临时文件 → 校验 → 替换 → 再校验。任何一步失败都让调用方回滚，
+# 不允许出现「程序装好了但绑定还指向旧目录」或「绑定换了但安装回滚了」。
+function Write-InstallBinding {
+    param([string]$AppDir, [string]$ClientProfile, [string]$DataDir, [string]$Stamp)
+    if (-not (Test-KnownProfileId $ClientProfile)) { throw ('clientProfile 非法：' + $ClientProfile) }
+    $bad = Test-DataDirSafe -DataDir $DataDir -AppDir $AppDir
+    if ($bad) { throw ('数据目录不可用：' + $bad) }
+    $path = Get-BindingPath $AppDir
+    $tmp = Join-Path $AppDir ('.install-binding.tmp-' + $Stamp + '.json')
+    Write-JsonFile -Path $tmp -Value ([ordered]@{
+        schema        = 1
+        clientProfile = $ClientProfile
+        dataDir       = ([IO.Path]::GetFullPath($DataDir).TrimEnd('\'))
+        appDir        = ([IO.Path]::GetFullPath($AppDir).TrimEnd('\'))
+        updatedAt     = (Get-Date).ToUniversalTime().ToString('o')
+    })
+    $err = Test-BindingPayload -Path $tmp -AppDir $AppDir -ClientProfile $ClientProfile -DataDir $DataDir
+    if ($err) {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw ('绑定文件校验失败：' + $err)
+    }
+    if (Test-Path -LiteralPath $path) {
+        [IO.File]::Replace($tmp, $path, ($path + '.bak'), $true)
+    } else {
+        Move-Item -LiteralPath $tmp -Destination $path -Force
+    }
+    $err = Test-BindingPayload -Path $path -AppDir $AppDir -ClientProfile $ClientProfile -DataDir $DataDir
+    if ($err) { throw ('绑定文件提交后校验失败：' + $err) }
+    return $path
+}
+
+# 卸载/回滚用：只认「这份绑定确实属于当前安装」的删除。别的实例的绑定、
+# 被改成别处的绑定一律不碰，返回拒绝理由。
+function Test-BindingOwnership {
+    param([string]$Path, [string]$AppDir)
+    if (-not (Test-Path -LiteralPath $Path)) { return '绑定文件不存在' }
+    $o = Read-JsonFile $Path
+    if (-not $o) { return '绑定文件不是合法 JSON，拒绝删除' }
+    if ([string]::IsNullOrWhiteSpace([string]$o.appDir)) { return '绑定文件没有 appDir，拒绝删除' }
+    $want = [IO.Path]::GetFullPath($AppDir).TrimEnd('\')
+    $got = ''
+    try { $got = [IO.Path]::GetFullPath([string]$o.appDir).TrimEnd('\') } catch { return '绑定文件 appDir 不合法，拒绝删除' }
+    if (-not $got.Equals($want, [StringComparison]::OrdinalIgnoreCase)) {
+        return ('绑定文件属于另一个安装（' + $got + '），拒绝删除')
+    }
+    return ''
+}
+
 function Get-FreeSpaceMb {
     param([string]$Path)
     $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path))
