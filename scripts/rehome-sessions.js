@@ -125,22 +125,40 @@ async function planSpaceMirror(db, targetUid) {
        FROM spaces WHERE ${SPACE_ACTIVE}
       ORDER BY COALESCE(sort_order, 999999) ASC, created_at ASC`
   );
-  // 同一 name 在多个账号下各有一份：统一取最早创建的那份当模板，结果与切号顺序无关。
+  // 同一 name 在多个账号下各有一份：统一取「created_at 最早、id 最小」那份当模板，
+  // 结果与切号顺序无关（并列时用 id 兜底，避免顺序不定的库返回顺序）。
   const byName = new Map();
   for (const row of rows) {
     const name = String(row.name || '');
     if (!name) continue;
     const cur = byName.get(name);
-    if (!cur || Number(row.created_at) < Number(cur.created_at)) byName.set(name, row);
+    const a = Number(row.created_at || 0);
+    const b = cur ? Number(cur.created_at || 0) : NaN;
+    if (!cur || a < b || (a === b && String(row.id) < String(cur.id))) byName.set(name, row);
   }
-  const targetByName = new Map(
-    rows.filter((r) => String(r.user_id) === targetUid).map((r) => [String(r.name), r])
-  );
+  const targetRows = rows.filter((r) => String(r.user_id) === targetUid);
+  const targetByName = new Map();
+  const duplicateTargets = [];
+  for (const r of targetRows) {
+    const n = String(r.name);
+    if (targetByName.has(n)) { duplicateTargets.push(n); continue; }
+    targetByName.set(n, r);
+  }
   const inserts = [];
   const remaps = [];
   const own = [];
+  const conflicts = [];
   for (const [name, tpl] of byName) {
     const mine = targetByName.get(name);
+    const tplPath = normalizePath(tpl.primary_folder_path || '');
+    const minePath = mine ? normalizePath(mine.primary_folder_path || '') : '';
+    // 同名不等于同一分组：两边都写明了目录且目录不同 → 视为不同逻辑分组，
+    // 不镜像、不改挂，只把归位目标限定到目标账号自己那份。
+    if (mine && tplPath && minePath && tplPath !== minePath) {
+      conflicts.push({ name, template: tpl.primary_folder_path, target: mine.primary_folder_path });
+      own.push({ id: String(mine.id), name });
+      continue;
+    }
     const targetId = mine ? String(mine.id) : crypto.randomUUID();
     if (!mine) inserts.push({ template: tpl, id: targetId, name });
     own.push({ id: targetId, name });
@@ -150,7 +168,10 @@ async function planSpaceMirror(db, targetUid) {
       .filter((id) => id !== targetId);
     if (srcIds.length) remaps.push({ name, targetId, srcIds });
   }
-  return { available: true, templates: byName.size, inserts, remaps, own };
+  return {
+    available: true, templates: byName.size, inserts, remaps, own,
+    conflicts, duplicateTargets,
+  };
 }
 
 /** 统一斜杠 + 小写，只用于路径前缀比较。 */
@@ -166,29 +187,57 @@ function normalizePath(p) {
 async function planCwdAdoption(db, targetUid, ownSpaces) {
   if (!ownSpaces || !ownSpaces.length) return { bySpace: [], total: 0 };
   const anchored = await db.all(
-    `SELECT s.cwd AS cwd, sp.name AS name
+    `SELECT s.user_id AS uid, s.cwd AS cwd, sp.name AS name
        FROM sessions s JOIN spaces sp ON sp.id = s.space_id
-      WHERE s.space_id IS NOT NULL AND s.cwd IS NOT NULL AND s.cwd <> ''`
+      WHERE s.space_id IS NOT NULL AND s.cwd IS NOT NULL AND s.cwd <> ''
+        AND (s.deleted_at IS NULL OR s.deleted_at = -1)
+        AND (sp.deleted_at IS NULL OR sp.deleted_at = -1)`
   );
-  const roots = new Map();
-  for (const row of anchored) {
-    const name = String(row.name || '');
-    const cwd = normalizePath(row.cwd);
-    if (!name) continue;
-    const idx = cwd.lastIndexOf('/' + name.toLowerCase());
-    if (idx <= 0) continue;
-    const root = cwd.slice(0, idx);
-    roots.set(root, (roots.get(root) || 0) + 1);
+  // 取「最靠前」那次同名目录出现：`H:/AI工作区/workspace/proj/workspace` 的根是
+  // `H:/AI工作区`，不是 `H:/AI工作区/workspace/proj`。
+  const tally = (filter) => {
+    const roots = new Map();
+    for (const row of anchored) {
+      if (filter && !filter(row)) continue;
+      const name = String(row.name || '');
+      if (!name) continue;
+      const cwd = normalizePath(row.cwd);
+      const idx = cwd.indexOf('/' + name.toLowerCase());
+      if (idx <= 0) continue;
+      const root = cwd.slice(0, idx);
+      roots.set(root, (roots.get(root) || 0) + 1);
+    }
+    return roots;
+  };
+  const pick = (roots) => {
+    let root = '';
+    let best = 0;
+    let sum = 0;
+    for (const [candidate, n] of roots) {
+      sum += n;
+      if (n > best) { best = n; root = candidate; }
+    }
+    return { root, best, sum };
+  };
+  // 优先用目标账号自己的样本；它一条已归组会话都没有时，才回退全局，
+  // 且只在众数足够集中时采用 —— 宁可少归位，也不要按别人的目录结构错归。
+  let { root, best, sum } = pick(tally((r) => String(r.uid) === targetUid));
+  let source = 'target';
+  if (!root) {
+    const fallback = pick(tally(null));
+    if (fallback.root && fallback.sum > 0 && fallback.best / fallback.sum >= 0.8) {
+      root = fallback.root;
+      best = fallback.best;
+      sum = fallback.sum;
+      source = 'global';
+    }
   }
-  let root = '';
-  let best = 0;
-  for (const [candidate, n] of roots) {
-    if (n > best) { best = n; root = candidate; }
-  }
-  if (!root) return { bySpace: [], total: 0, root: null };
+  if (!root) return { bySpace: [], total: 0, root: null, source: null };
 
   const loose = await db.all(
-    "SELECT id, cwd FROM sessions WHERE user_id = ? AND space_id IS NULL AND cwd IS NOT NULL AND cwd <> ''",
+    `SELECT id, cwd FROM sessions
+      WHERE user_id = ? AND space_id IS NULL AND cwd IS NOT NULL AND cwd <> ''
+        AND (deleted_at IS NULL OR deleted_at = -1)`,
     [targetUid]
   );
   const groups = new Map();
@@ -208,34 +257,52 @@ async function planCwdAdoption(db, targetUid, ownSpaces) {
     groups.get(hit.id).ids.push(String(row.id));
   }
   const bySpace = [...groups.values()];
-  return { bySpace, total: bySpace.reduce((n, g) => n + g.ids.length, 0), root };
+  return {
+    bySpace,
+    total: bySpace.reduce((n, g) => n + g.ids.length, 0),
+    root,
+    source,
+    confidence: sum ? best / sum : null,
+  };
 }
 
 function spaceInsertStatement(insert, targetUid, now) {
   const tpl = insert.template;
+  // 只继承「分组身份」相关字段。目录、置顶、排序属于账号偏好，不跨账号复制：
+  // A 把分组置顶、把目录指向 H:/x，不代表 B 也要这样。
+  // INSERT ... WHERE NOT EXISTS：计划在事务外生成，若客户端在此期间已建了同名分组，
+  // 这条语句自动跳过，不会产生同名重复行。
   return {
     sql: `INSERT INTO spaces (id, user_id, device_id, name, primary_folder_path, create_folder_path,
             pinned, sort_order, status, transport, conversation_origin, deleted_at,
             created_at, updated_at, source_kind)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          SELECT ?, ?, ?, ?, NULL, NULL, 0, NULL, ?, ?, ?, -1, ?, ?, ?
+           WHERE NOT EXISTS (
+             SELECT 1 FROM spaces
+              WHERE user_id = ? AND name = ? AND ${SPACE_ACTIVE}
+           )`,
     params: [
       insert.id,
       targetUid,
       tpl.device_id || '',
       insert.name,
-      tpl.primary_folder_path === undefined ? null : tpl.primary_folder_path,
-      tpl.create_folder_path === undefined ? null : tpl.create_folder_path,
-      Number(tpl.pinned || 0),
-      tpl.sort_order === undefined ? null : tpl.sort_order,
       tpl.status || 'active',
       tpl.transport || 'local',
       tpl.conversation_origin === undefined ? null : tpl.conversation_origin,
-      -1,
       now,
       now,
-      tpl.source_kind === undefined ? 'seed' : tpl.source_kind,
+      tpl.source_kind === undefined || tpl.source_kind === null ? 'seed' : tpl.source_kind,
+      targetUid,
+      insert.name,
     ],
   };
+}
+
+/** SQLite 变量上限因版本而异（999 / 32766），重语句一律分块，分块仍在同一事务内。 */
+function chunk(list, size) {
+  const out = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
 }
 
 async function countSpaceRemaps(db, remaps, targetUid, scope) {
@@ -495,6 +562,11 @@ function createRehomeRunner(options = {}) {
       adopted: adoption.total,
       adoptedDetail: adoption.bySpace.map((g) => ({ name: g.name, sessions: g.ids.length })),
       root: adoption.root || null,
+      rootSource: adoption.source || null,
+      rootConfidence: adoption.confidence === undefined ? null : adoption.confidence,
+      // 同名但目录不同的分组、以及目标账号自身的重复同名分组：只报不合并。
+      conflicts: mirror.conflicts || [],
+      duplicateTargets: mirror.duplicateTargets || [],
     };
     const spaceWrites = mirror.inserts.length + remapCounts.total + adoption.total;
 
@@ -545,19 +617,27 @@ function createRehomeRunner(options = {}) {
     for (const insert of mirror.inserts) {
       statements.push(spaceInsertStatement(insert, targetUid, now));
     }
+    // IN 列表分块：SQLite 变量上限因版本而异（常见 999 / 32766），
+    // 大账号一次上千条会直接让整个切号事务回滚。分块但不分事务。
     for (const rm of mirror.remaps) {
-      const placeholders = rm.srcIds.map(() => '?').join(', ');
-      statements.push({
-        sql: `UPDATE sessions SET space_id = ? WHERE user_id = ? AND space_id IN (${placeholders})`,
-        params: [rm.targetId, targetUid, ...rm.srcIds],
-      });
+      for (const part of chunk(rm.srcIds, 400)) {
+        const placeholders = part.map(() => '?').join(', ');
+        statements.push({
+          sql: `UPDATE sessions SET space_id = ?, updated_at = ?
+                 WHERE user_id = ? AND space_id IN (${placeholders})`,
+          params: [rm.targetId, now, targetUid, ...part],
+        });
+      }
     }
     for (const group of adoption.bySpace) {
-      const placeholders = group.ids.map(() => '?').join(', ');
-      statements.push({
-        sql: `UPDATE sessions SET space_id = ? WHERE id IN (${placeholders}) AND space_id IS NULL`,
-        params: [group.spaceId, ...group.ids],
-      });
+      for (const part of chunk(group.ids, 400)) {
+        const placeholders = part.map(() => '?').join(', ');
+        statements.push({
+          sql: `UPDATE sessions SET space_id = ?, updated_at = ?
+                 WHERE id IN (${placeholders}) AND space_id IS NULL`,
+          params: [group.spaceId, now, ...part],
+        });
+      }
     }
     let changed = null;
     if (statements.length) {

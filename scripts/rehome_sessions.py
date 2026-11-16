@@ -82,6 +82,11 @@ def norm(p) -> str:
     return str(p or "").replace("\\", "/").rstrip("/").lower()
 
 
+def chunk(items, size):
+    """SQLite 变量上限因版本而异（999 / 32766），重语句一律分块，但仍在同一事务里。"""
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
 def plan_spaces(con, uid):
     """返回 spaces 镜像计划；库里没有 spaces 表时返回 None（老库）。"""
     if not con.execute(
@@ -100,21 +105,40 @@ def plan_spaces(con, uid):
             "source_kind", "created_at"]
     records = [dict(zip(keys, r)) for r in rows]
 
-    # 同一 name 多账号各一份：统一取最早创建的那份当模板，结果与切号顺序无关。
+    # 同一 name 多账号各一份：统一取「created_at 最早、id 最小」那份当模板，
+    # 结果与切号顺序无关（并列时用 id 兜底）。
     templates = {}
     for rec in records:
         name = str(rec["name"] or "")
         if not name:
             continue
         cur = templates.get(name)
-        if cur is None or int(rec["created_at"] or 0) < int(cur["created_at"] or 0):
+        if cur is None or (int(rec["created_at"] or 0), str(rec["id"])) < (
+                int(cur["created_at"] or 0), str(cur["id"])):
             templates[name] = rec
 
-    mine = {str(r["name"]): r for r in records if str(r["user_id"]) == uid}
+    mine, duplicate_targets = {}, []
+    for r in records:
+        if str(r["user_id"]) != uid:
+            continue
+        n = str(r["name"])
+        if n in mine:
+            duplicate_targets.append(n)
+            continue
+        mine[n] = r
 
-    inserts, remaps, own = [], [], []
+    inserts, remaps, own, conflicts = [], [], [], []
     for name, tpl in templates.items():
         own_rec = mine.get(name)
+        tpl_path = norm(tpl["primary_folder_path"] or "")
+        mine_path = norm(own_rec["primary_folder_path"] or "") if own_rec else ""
+        # 同名不等于同一分组：两边都写明了目录且不同 → 不镜像、不改挂，只保留自己那份。
+        if own_rec is not None and tpl_path and mine_path and tpl_path != mine_path:
+            conflicts.append({"name": name,
+                              "template": tpl["primary_folder_path"],
+                              "target": own_rec["primary_folder_path"]})
+            own.append({"id": str(own_rec["id"]), "name": name})
+            continue
         target_id = str(own_rec["id"]) if own_rec else str(uuid.uuid4())
         if own_rec is None:
             inserts.append({"template": tpl, "id": target_id, "name": name})
@@ -138,24 +162,52 @@ def plan_spaces(con, uid):
 
     # 按 cwd 归位：有些会话只改了 user_id 没挂分组，仍散在「最近列表」。
     adopt, adopt_detail, root = [], [], None
+    root_source, root_conf = None, None
     anchored = con.execute(
-        "SELECT s.cwd, sp.name FROM sessions s JOIN spaces sp ON sp.id = s.space_id"
+        "SELECT s.user_id, s.cwd, sp.name FROM sessions s JOIN spaces sp ON sp.id = s.space_id"
         " WHERE s.space_id IS NOT NULL AND s.cwd IS NOT NULL AND s.cwd <> ''"
+        " AND (s.deleted_at IS NULL OR s.deleted_at = -1)"
+        " AND (sp.deleted_at IS NULL OR sp.deleted_at = -1)"
     ).fetchall()
-    roots = {}
-    for cwd, name in anchored:
-        c, nm = norm(cwd), str(name or "").lower()
-        if not nm:
-            continue
-        idx = c.rfind("/" + nm)
-        if idx <= 0:
-            continue
-        roots[c[:idx]] = roots.get(c[:idx], 0) + 1
-    if roots:
-        root = max(roots.items(), key=lambda kv: kv[1])[0]
+
+    def tally(uid_filter=None):
+        roots = {}
+        for suid, cwd, name in anchored:
+            if uid_filter and str(suid) != uid_filter:
+                continue
+            c, nm = norm(cwd), str(name or "").lower()
+            if not nm:
+                continue
+            # 取「最靠前」那次同名目录出现：H:/AI工作区/workspace/proj/workspace 的根是 H:/AI工作区
+            idx = c.find("/" + nm)
+            if idx <= 0:
+                continue
+            roots[c[:idx]] = roots.get(c[:idx], 0) + 1
+        return roots
+
+    def pick(roots):
+        if not roots:
+            return None, 0, 0
+        total = sum(roots.values())
+        best = max(roots.items(), key=lambda kv: kv[1])
+        return best[0], best[1], total
+
+    root, best, total = pick(tally(uid))
+    if root:
+        root_source = "target"
+        root_conf = best / total if total else None
+    else:
+        fb_root, fb_best, fb_total = pick(tally(None))
+        # 全局回退只在众数足够集中时采用：宁可少归位，也不要按别人的目录结构错归。
+        if fb_root and fb_total and fb_best / fb_total >= 0.8:
+            root, root_source = fb_root, "global"
+            root_conf = fb_best / fb_total
+
+    if root:
         loose = con.execute(
             "SELECT id, cwd FROM sessions WHERE user_id = ? AND space_id IS NULL"
-            " AND cwd IS NOT NULL AND cwd <> ''", (uid,)
+            " AND cwd IS NOT NULL AND cwd <> ''"
+            " AND (deleted_at IS NULL OR deleted_at = -1)", (uid,)
         ).fetchall()
         groups = {}
         for sid, cwd in loose:
@@ -186,23 +238,35 @@ def plan_spaces(con, uid):
         "adopt_total": sum(len(g["ids"]) for g in adopt),
         "adopt_detail": adopt_detail,
         "root": root,
+        "root_source": root_source,
+        "root_conf": root_conf,
+        # 同名但目录不同的分组、目标账号自身的重复同名分组：只报不合并。
+        "conflicts": conflicts,
+        "duplicate_targets": duplicate_targets,
     }
 
 
 def space_insert(insert, uid, now):
+    """只继承分组身份相关字段；目录/置顶/排序属于账号偏好，不跨账号复制。
+
+    WHERE NOT EXISTS：计划在事务外生成，若客户端在此期间已建了同名分组，
+    这条语句自动跳过，不产生同名重复行。
+    """
     tpl = insert["template"]
     cols = ["id", "user_id", "device_id", "name", "primary_folder_path", "create_folder_path",
             "pinned", "sort_order", "status", "transport", "conversation_origin",
             "deleted_at", "created_at", "updated_at", "source_kind"]
-    vals = [
+    vals_all = [
         insert["id"], uid, tpl["device_id"] or "", insert["name"],
-        tpl["primary_folder_path"], tpl["create_folder_path"],
-        int(tpl["pinned"] or 0), tpl["sort_order"], tpl["status"] or "active",
+        None, None,
+        0, None, tpl["status"] or "active",
         tpl["transport"] or "local", tpl["conversation_origin"], -1, now, now,
         tpl["source_kind"] if tpl["source_kind"] is not None else "seed",
     ]
-    sql = "INSERT INTO spaces (%s) VALUES (%s)" % (", ".join(cols), ", ".join("?" * len(cols)))
-    return sql, vals
+    sql = ("INSERT INTO spaces (%s) SELECT %s"
+           " WHERE NOT EXISTS (SELECT 1 FROM spaces WHERE user_id = ? AND name = ? AND %s)"
+           % (", ".join(cols), ", ".join("?" * len(cols)), SPACE_ACTIVE))
+    return sql, vals_all + [uid, insert["name"]]
 
 
 def main() -> None:
@@ -293,18 +357,23 @@ def main() -> None:
             for insert in plan["inserts"]:
                 sql, vals = space_insert(insert, uid, now)
                 con.execute(sql, vals)
+            # IN 列表分块：SQLite 变量上限因版本而异（999 / 32766），大账号会整事务回滚。
             for rm in plan["remaps"]:
-                marks = ",".join("?" * len(rm["src_ids"]))
-                con.execute(
-                    "UPDATE sessions SET space_id = ? WHERE user_id = ? AND space_id IN (%s)" % marks,
-                    [rm["target_id"], uid] + rm["src_ids"],
-                )
+                for part in chunk(rm["src_ids"], 400):
+                    marks = ",".join("?" * len(part))
+                    con.execute(
+                        "UPDATE sessions SET space_id = ?, updated_at = ?"
+                        " WHERE user_id = ? AND space_id IN (%s)" % marks,
+                        [rm["target_id"], now, uid] + part,
+                    )
             for group in plan["adopt"]:
-                marks = ",".join("?" * len(group["ids"]))
-                con.execute(
-                    "UPDATE sessions SET space_id = ? WHERE id IN (%s) AND space_id IS NULL" % marks,
-                    [group["space_id"]] + group["ids"],
-                )
+                for part in chunk(group["ids"], 400):
+                    marks = ",".join("?" * len(part))
+                    con.execute(
+                        "UPDATE sessions SET space_id = ?, updated_at = ?"
+                        " WHERE id IN (%s) AND space_id IS NULL" % marks,
+                        [group["space_id"], now] + part,
+                    )
         con.commit()
         print("已接管会话    : %d 条（单事务提交）" % n)
         if plan is not None:

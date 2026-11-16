@@ -58,10 +58,22 @@ async function main() {
   await db.run(INSERT_SPACE, [SPACE_WORKSPACE_A, A, 'dev-1', 'workspace', 0, 'active', 'local', -1, 1002, 1002, 'seed']);
   await db.run(INSERT_SPACE, [SPACE_COMPUTER_B, B, 'dev-1', '电脑相关', 0, 'active', 'local', -1, 1003, 1003, 'seed']);
 
+  // 同名但目录明确不同 → 不是同一个逻辑分组，必须只报不合并不改挂。
+  await db.run('INSERT INTO spaces (id, user_id, device_id, name, primary_folder_path, pinned, ' +
+    'status, transport, deleted_at, created_at, updated_at, source_kind) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ['s-conflict-a', A, 'dev-1', '项目X', 'H:/proj/x', 0, 'active', 'local', -1, 1010, 1010, 'seed']);
+  await db.run('INSERT INTO spaces (id, user_id, device_id, name, primary_folder_path, pinned, ' +
+    'status, transport, deleted_at, created_at, updated_at, source_kind) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ['s-conflict-b', B, 'dev-1', '项目X', 'C:/work/x', 0, 'active', 'local', -1, 1011, 1011, 'seed']);
+
   // t1/t3 属于 A 且挂 A 的分组；t2 属于 B 但还没挂分组（散在最近列表）。
   await db.run(INSERT_SESSION, ['t1', A, 'H:/AI工作区/FFRS', 'ffrs-A', 'completed', null, 0, 1000, 1000, 'local', SPACE_FFRS_A]);
   await db.run(INSERT_SESSION, ['t2', B, 'H:/AI工作区/workspace', 'ws-B', 'completed', null, 0, 1001, 1001, 'local', null]);
   await db.run(INSERT_SESSION, ['t3', A, 'H:/AI工作区/电脑相关', 'pc-A', 'completed', null, 0, 1002, 1002, 'local', SPACE_COMPUTER_A]);
+  // t4 是 B 的回收站会话：cwd 看起来落在 workspace 下，但已删除，不能自动归位。
+  await db.run(INSERT_SESSION, ['t4', B, 'H:/AI工作区/workspace', 'trash-B', 'completed', 1, 0, 1003, 1003, 'local', null]);
 
   fs.writeFileSync(path.join(tmp, 'rehome-sessions.json'),
     JSON.stringify({ enabled: true, dedupe: false }, null, 2) + '\n');
@@ -72,10 +84,12 @@ async function main() {
   assert.equal(dry.ok, true, 'dry run ok');
   assert.equal(dry.affected, 2, 'A 的 t1/t3 会被接管');
   assert.deepEqual(dry.spaces.created.sort(), ['FFRS', 'workspace'], 'B 缺两个分组');
-  assert.equal(dry.spaces.adopted, 1, 't2 按目录归位');
+  assert.ok(!dry.spaces.created.includes('项目X'), '同名但目录不同 → 不镜像');
+  assert.ok(dry.spaces.conflicts.some((c) => c.name === '项目X'), '冲突要出现在报告里');
+  assert.equal(dry.spaces.adopted, 1, 't2 按目录归位（回收站的 t4 不算）');
   assert.equal(dry.spaces.remapped, 2, 't1/t3 从 A 的分组改挂到 B 的同名分组');
   const untouched = await db.all('SELECT COUNT(*) AS n FROM spaces WHERE user_id = ?', [B]);
-  assert.equal(Number(untouched[0].n), 1, '干跑不写库');
+  assert.equal(Number(untouched[0].n), 2, '干跑不写库');
 
   // 真跑
   const applied = await runner.run(B);
@@ -85,13 +99,13 @@ async function main() {
   // 1) 目标账号拿到全套分组，且「电脑相关」复用自己的那份、不重复建
   const bSpaces = await db.all('SELECT id, name FROM spaces WHERE user_id = ? ORDER BY name', [B]);
   const names = bSpaces.map((r) => r.name).sort();
-  assert.deepEqual(names, ['FFRS', 'workspace', '电脑相关'], 'B 现在有全部三个分组');
+  assert.deepEqual(names, ['FFRS', 'workspace', '电脑相关', '项目X'], 'B 现在有全部四个分组');
   assert.equal(bSpaces.filter((r) => r.name === '电脑相关').length, 1, '同名分组不重复');
   assert.equal(bSpaces.find((r) => r.name === '电脑相关').id, SPACE_COMPUTER_B, '复用 B 原有分组');
 
   // 2) 原账号 A 的分组一份都不能少（切回去还要用）
   const aCount = await db.all('SELECT COUNT(*) AS n FROM spaces WHERE user_id = ?', [A]);
-  assert.equal(Number(aCount[0].n), 3, 'A 的分组保持原样');
+  assert.equal(Number(aCount[0].n), 4, 'A 的分组保持原样');
 
   // 3) 会话全归 B，并挂到 B 自己的同名分组
   const sessions = await db.all('SELECT id, user_id, space_id FROM sessions ORDER BY id');
@@ -104,6 +118,11 @@ async function main() {
   assert.equal(byId.t1.space_id, bFfrs, 't1 改挂到 B 新建的 FFRS');
   const bWorkspace = bSpaces.find((r) => r.name === 'workspace').id;
   assert.equal(byId.t2.space_id, bWorkspace, 't2 按 cwd 归位到 workspace');
+  assert.equal(byId.t4.space_id, null, '回收站会话不自动归位');
+  const conflictRow = await db.all("SELECT primary_folder_path FROM spaces WHERE id = 's-conflict-b'");
+  assert.equal(conflictRow[0].primary_folder_path, 'C:/work/x', '冲突分组保留目标账号自己的目录');
+  const conflictCount = await db.all("SELECT COUNT(*) AS n FROM spaces WHERE name = '项目X'");
+  assert.equal(Number(conflictCount[0].n), 2, '冲突分组不新增副本');
 
   // 4) 幂等：再跑一次零写入、零备份
   const second = await runner.run(B);
@@ -118,7 +137,7 @@ async function main() {
   const back = await runner.run(A);
   assert.equal(back.ok, true, 'switch back ok');
   const aAfter = await db.all('SELECT COUNT(*) AS n FROM spaces WHERE user_id = ?', [A]);
-  assert.equal(Number(aAfter[0].n), 3, '切回 A 分组齐全');
+  assert.equal(Number(aAfter[0].n), 4, '切回 A 分组齐全');
   assert.deepEqual(back.spaces.created, [], '切回 A 不需要新建分组');
 
   fs.rmSync(tmp, { recursive: true, force: true });
