@@ -121,7 +121,7 @@ launcher.cmd
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/rehome/status` | `{enabled, dbPath, backend, configPath, backupDir, lastRun}` |
-| POST | `/api/rehome/config` | body `{"enabled": true|false}` |
+| POST | `/api/rehome/config` | body `{"enabled": true/false}` |
 | POST | `/api/rehome/run` | body `{"uid":"...", "dryRun": true}`；`uid` 缺省取当前账号 |
 | GET | `/api/sessions` | 响应新增 `rehomeEnabled` |
 | POST | `/api/switch` | 响应新增 `rehome: {ok, affected, backup, ...}` |
