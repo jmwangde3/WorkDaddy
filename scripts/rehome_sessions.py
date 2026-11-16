@@ -145,9 +145,14 @@ def plan_spaces(con, uid):
                 if str(r["name"]) == name and str(r["user_id"]) != uid]
 
     for name, tpl in templates.items():
-        # 目标账号自己就有两份同名分组：身份有歧义，不镜像 / 不改挂 / 不归位。
+        # 目标账号自己就有两份同名分组：身份有歧义，不镜像 / 不改挂 / 不归位；
+        # 但源账号该分组上的会话仍要 detach，不能留成跨账号引用。
         if name in dup_set:
             conflicts.append({"name": name, "reason": "duplicate-target"})
+            ids = [str(r["id"]) for r in records
+                   if str(r["name"]) == name and str(r["user_id"]) != uid]
+            if ids:
+                detach.append({"name": name, "src_ids": ids})
             continue
         own_rec = mine.get(name)
         tpl_path = norm(tpl["primary_folder_path"] or "")
