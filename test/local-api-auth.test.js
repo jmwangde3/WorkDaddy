@@ -39,12 +39,28 @@ function request(headers = {}) {
   return { headers };
 }
 
-test('relaunch 必须带 token：免认证名单里不再有这个路径', () => {
+test('relaunch 不在免认证名单，但允许「没有浏览器痕迹」的本机启动器', () => {
   assert.equal(helpers.PUBLIC_API_PATHS.has('/api/client/relaunch'), false,
     '/api/client/relaunch 有副作用，不能留在免认证名单里');
 
-  const noToken = helpers.isApiRequestAuthorized(request({}), '/api/client/relaunch');
-  assert.equal(noToken, false, '无 token 必须拒绝');
+  // 已安装的 WorkDaddyTray.exe 只发一个空 POST：没有 token，也没有 Origin / Referer /
+  // Sec-Fetch-*。不放行它，「恢复 CDP」永远是「请求失败」。
+  assert.equal(helpers.isApiRequestAuthorized(request({}), '/api/client/relaunch'), true,
+    '本机启动器（无任何浏览器头）必须放行');
+});
+
+test('带任何浏览器痕迹的 relaunch 一律拒绝', () => {
+  const browserish = [
+    { origin: 'null' },
+    { referer: 'http://127.0.0.1:47832/' },
+    { 'sec-fetch-site': 'same-origin' },
+    { 'sec-fetch-mode': 'cors' },
+    { 'sec-fetch-dest': 'empty' },
+  ];
+  for (const headers of browserish) {
+    assert.equal(helpers.isApiRequestAuthorized(request(headers), '/api/client/relaunch'), false,
+      '浏览器痕迹必须拒绝：' + JSON.stringify(headers));
+  }
 });
 
 test('错误 token 被拒绝，正确 token 通过', () => {

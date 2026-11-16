@@ -7376,7 +7376,8 @@ const PUBLIC_API_PATHS = new Set([
   // /api/client/relaunch 不在这里：它会重启客户端，属于有副作用的操作。
   // 免认证时任何本机网页（Origin: null 也在 isAllowedApiOrigin 里放行）都能触发，
   // 等于把「重启应用」暴露给任意页面。现在它要求 x-workdaddy-token，
-  // 状态页在渲染时把同一枚 token 嵌进 HTML，fix-cdp.cmd 从 .api-token 读取。
+  // 状态页在渲染时把同一枚 token 嵌进 HTML，fix-cdp.cmd 从 .api-token 读取；
+  // 唯一例外是「完全不像浏览器」的本机启动器（见 LAUNCHER_API_PATHS）。
 ]);
 
 function isAllowedApiOrigin(origin) {
@@ -7399,6 +7400,18 @@ function isAllowedApiOrigin(origin) {
   }
 }
 
+// 桌面托盘和 fix-cdp.cmd 都属于「本机启动器」：它们不一定发得出 token —— 已安装的
+// WorkDaddyTray.exe 就只发一个空 POST，连 User-Agent 都没有。浏览器发起的一律带
+// Origin（file:// 页是 Origin: null，头是存在的）、Referer 或 Sec-Fetch-*，
+// 所以「三个头全没有」足以把本机进程和网页分开。只给这两个必要路径留窄路，
+// 其余有副作用的接口仍然要求 x-workdaddy-token。
+const LAUNCHER_API_PATHS = new Set(['/api/client/relaunch']);
+
+function looksLikeLocalLauncher(req) {
+  return !req.headers.origin && !req.headers.referer &&
+    !req.headers['sec-fetch-site'] && !req.headers['sec-fetch-mode'] && !req.headers['sec-fetch-dest'];
+}
+
 function hasApiToken(req) {
   const supplied = String(req.headers['x-workdaddy-token'] || '');
   const expected = Buffer.from(API_TOKEN, 'utf8');
@@ -7412,7 +7425,11 @@ function isApiRequestAuthorized(req, p) {
   if (PUBLIC_API_PATHS.has(p)) return true;
   // 保留无 Origin 的手动 launcher/curl 注入兼容；诊断面包屑仍需当前 profile token。
   if (!origin && p === '/api/inject') return true;
-  return hasApiToken(req);
+  // 带了 token 就按 token 判：错的 token 不能被「像本机进程」兜过去。
+  if (req.headers['x-workdaddy-token']) return hasApiToken(req);
+  // 托盘「恢复 CDP」走这条路：没有 token，但也没有任何浏览器痕迹。
+  if (LAUNCHER_API_PATHS.has(p) && looksLikeLocalLauncher(req)) return true;
+  return false;
 }
 
 function isAllowedDevtoolsOrigin(origin, upstreamPort) {
