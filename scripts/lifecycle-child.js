@@ -97,25 +97,27 @@ function installChildLifecycle(options) {
 
     let finished = false;
 
-    function finish(via) {
+    // ok=false 表示清理没完成（抛错或 graceMs 超时）：这时进程必须 FAILED + exit 1，
+    // 不能伪装成正常退出。watchdog 会把非零退出码记成「停止未确认」，而不是 STOPPED。
+    function finish(via, ok) {
       if (finished) return;
       finished = true;
       try { clearTimeout(deadline); } catch (_) {}
       state.stopped = true;
-      state.state = STATE_STOPPED;
+      state.state = ok === false ? STATE_FAILED : STATE_STOPPED;
       state.exitVia = via;
       state.since = new Date().toISOString();
       notify();
-      // 落盘窗口：process.send / stdout 都是异步的，立刻 exit 会把 STOPPED 吞掉。
-      const flush = setTimeout(function () { process.exit(0); }, flushMs);
+      // 落盘窗口：process.send / stdout 都是异步的，立刻 exit 会把状态吞掉。
+      const flush = setTimeout(function () { process.exit(ok === false ? 1 : 0); }, flushMs);
       if (flush.unref) flush.unref();
     }
 
     // 硬超时：清理或子进程收尾卡住时也必须退出，否则「父进程已死、子进程还在」
     // 这个孤儿场景就没有被真正解决。它是唯一上界，不再有第二条更早的退出路径。
     const deadline = setTimeout(function () {
-      safeLog('[lifecycle] 清理超过 ' + graceMs + 'ms，强制退出');
-      finish('timeout');
+      safeLog('[lifecycle] 清理超过 ' + graceMs + 'ms，强制退出（FAILED）');
+      finish('timeout', false);
     }, graceMs);
     if (deadline.unref) deadline.unref();
 
@@ -123,18 +125,18 @@ function installChildLifecycle(options) {
     try {
       result = onShutdown(state.reason);
     } catch (error) {
-      safeLog('[lifecycle] 清理抛错（仍退出）：' + (error && error.message ? error.message : String(error)));
-      finish('error');
+      safeLog('[lifecycle] 清理抛错（FAILED）：' + (error && error.message ? error.message : String(error)));
+      finish('error', false);
       return;
     }
     if (result && typeof result.then === 'function') {
-      result.then(function () { finish('done'); }, function (error) {
-        safeLog('[lifecycle] 清理失败（仍退出）：' + (error && error.message ? error.message : String(error)));
-        finish('error');
+      result.then(function () { finish('done', true); }, function (error) {
+        safeLog('[lifecycle] 清理失败（FAILED）：' + (error && error.message ? error.message : String(error)));
+        finish('error', false);
       });
       return;
     }
-    finish('done');
+    finish('done', true);
   }
 
   if (state.managed) {

@@ -274,6 +274,59 @@ async function main() {
     assert(/仍有服务/.test(log) && /停止未确认/.test(log), '日志应明确写出未确认的原因：' + log.split('\n').slice(-5).join(' | '));
     assert(fs.existsSync(path.join(ctx.dataDir, 'watchdog.pid')), '停止未确认时应保留 pid 文件作为证据');
   });
+  // 自定义 preload：先杀掉 daemon（让 watchdog 的 child 变 null），再触发 SIGTERM。
+  // 这样能稳定复现「没有 child，但服务还在」的 no-child 分支。
+  await test('child 已退出但服务仍在：no-child 分支必须 exit 5', async () => {
+    const ctx = make('life-nochild', 'workbuddy-ai');
+    const dir = fixture.tmpRoot('life-killchild');
+    const statePath = path.join(ctx.dataDir, 'watchdog-state.json');
+    const preloadFile = path.join(dir, 'kill-child-then-sigterm.js');
+    fs.writeFileSync(preloadFile, `'use strict';
+const fs = require('fs');
+setTimeout(function () {
+  try {
+    const st = JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}, 'utf8'));
+    if (st && st.daemonPid) { try { process.kill(st.daemonPid); } catch (_) {} }
+  } catch (_) {}
+  setTimeout(function () { try { process.emit('SIGTERM'); } catch (_) {} }, 500);
+}, 4000);
+`);
+    const proc = fixture.startWatchdog(ctx, {
+      STUB_SURVIVE_KILL: '1',
+      WORKDADDY_STOP_STABLE_MS: '1500',
+    }, ['-r', preloadFile]);
+    started.push(proc);
+    await waitRunning(ctx);
+    await fixture.waitFor(() => fixture.listeningDaemonPids(ctx).length >= 1, 20000, '孙进程接管端口');
+    const code = await fixture.waitExit(proc, 40000);
+    assert(code === 5, 'child 没了但服务还在，必须 exit 5，实际 ' + code + '：' + proc.out);
+    const state = fixture.readStateFile(ctx);
+    assert(state && state.state === 'FAILED', '状态必须是 FAILED：' + JSON.stringify(state));
+    assert(/stop-unconfirmed/.test(state.reason || ''), 'reason 应写 stop-unconfirmed：' + state.reason);
+    assert(fs.existsSync(path.join(ctx.dataDir, 'watchdog.pid')), '停止未确认时应保留 pid 证据');
+  });
+
+  await test('延迟接管端口：不能在服务回来之前写 STOPPED（exit 5）', async () => {
+    const ctx = make('life-delay-takeover', 'workbuddy-cn');
+    const preload = sigtermPreload(2000);
+    const proc = fixture.startWatchdog(ctx, {
+      STUB_SURVIVE_KILL: '1',
+      STUB_IGNORE_SHUTDOWN: '1',
+      STUB_GRANDCHILD_DELAY_MS: '1200',
+      WORKDADDY_DAEMON_EXIT_WAIT_MS: '600',
+      WORKDADDY_FORCE_CONFIRM_MS: '1500',
+      WORKDADDY_STOP_STABLE_MS: '1600',
+    }, ['-r', preload]);
+    started.push(proc);
+    await waitRunning(ctx);
+    const code = await fixture.waitExit(proc, 40000);
+    assert(code === 5, '端口在稳定窗口内被接管，必须 exit 5，实际 ' + code + '：' + proc.out);
+    const state = fixture.readStateFile(ctx);
+    assert(state && state.state === 'FAILED', '状态必须是 FAILED：' + JSON.stringify(state));
+    const port = await fixture.statusOf(ctx.uiPort);
+    assert(port && port.profile.id === 'workbuddy-cn', '孙进程应确实接管了端口（否则测的就不是这件事）');
+  });
+
 }
 
 (async () => {

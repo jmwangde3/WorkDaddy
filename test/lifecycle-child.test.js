@@ -152,7 +152,7 @@ async function main() {
     assert(record.exitedAt - record.startedAt >= 280, '总耗时应覆盖清理时间，实际 ' + (record.exitedAt - record.startedAt) + 'ms');
   });
 
-  await test('清理卡死（Promise 永不 resolve）：graceMs 到点强制退出', async () => {
+  await test('清理卡死（Promise 永不 resolve）：graceMs 到点强制退出，FAILED / exit 1', async () => {
     const ctx = makeCase('hang');
     const record = spawnChild(ctx, { mode: 'hang', graceMs: 400 });
     await waitEvent(ctx, 'state', 5000);
@@ -160,22 +160,24 @@ async function main() {
     record.child.send({ type: 'shutdown' });
     const code = await waitExit(record, 10000);
     const elapsed = Date.now() - startedAt;
-    assert(code === 0, '仍应退出（不能挂着），实际 ' + code);
+    assert(code === 1, '清理未完成必须以 1 退出（不能伪装成正常停止），实际 ' + code);
     assert(elapsed < 5000, '必须有上界，实际 ' + elapsed + 'ms');
     const exit = exitEvent(ctx);
     assert(exit && exit.snapshot.exitVia === 'timeout', 'exitVia 应为 timeout，实际 ' + (exit && exit.snapshot.exitVia));
+    assert(exit.snapshot.state === 'FAILED', '超时后状态必须是 FAILED：' + JSON.stringify(exit.snapshot));
     assert(events(ctx).some((e) => e.name === 'log' && /强制退出/.test(e.payload.text || '')), '日志应写明强制退出');
   });
 
-  await test('清理抛错：仍然退出，exitVia=error', async () => {
+  await test('清理抛错：仍然退出，FAILED / exit 1', async () => {
     const ctx = makeCase('throw');
     const record = spawnChild(ctx, { mode: 'throw', graceMs: 2000 });
     await waitEvent(ctx, 'state', 5000);
     record.child.send({ type: 'shutdown' });
     const code = await waitExit(record, 10000);
-    assert(code === 0, '应退出，实际 ' + code);
+    assert(code === 1, '清理失败必须以 1 退出，实际 ' + code);
     const exit = exitEvent(ctx);
     assert(exit && exit.snapshot.exitVia === 'error', 'exitVia 应为 error，实际 ' + (exit && exit.snapshot.exitVia));
+    assert(exit.snapshot.state === 'FAILED', '抛错后状态必须是 FAILED：' + JSON.stringify(exit.snapshot));
   });
 
   await test('重复 shutdown / 断开：清理只执行一次（幂等）', async () => {
