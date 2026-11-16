@@ -16,7 +16,7 @@ const path = require('node:path');
 
 const { verify } = require('../tools/verify-release-assets.js');
 
-const VERSION = '1.3.1';
+const VERSION = require('../package.json').version;
 const COMMIT = '0123456789abcdef0123456789abcdef01234567';
 const OTHER_COMMIT = 'fedcba9876543210fedcba9876543210fedcba98';
 const tmpBase = path.join(__dirname, '..', 'tmp');
