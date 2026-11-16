@@ -168,8 +168,11 @@ async function planSpaceMirror(db, targetUid) {
 
   for (const [name, tpl] of byName) {
     // 目标账号自己就有两份同名分组：身份有歧义，不镜像 / 不改挂 / 不归位。
+    // 但源账号该分组上的会话同样不能留着跨账号引用，一并 detach。
     if (dupSet.has(name)) {
       conflicts.push({ name, reason: 'duplicate-target' });
+      const ids = srcIdsOf(name);
+      if (ids.length) detach.push({ name, srcIds: ids });
       continue;
     }
     const mine = targetByName.get(name);
@@ -280,15 +283,21 @@ async function planCwdAdoption(db, targetUid, ownSpaces, options = {}) {
   }
   if (!root) return { bySpace: [], total: 0, root: null, source: null };
 
-  // 归位与接管共用同一套资格判定：范围没放开 cloud 时，cloud 行不参与归位。
+  // 归位与接管共用同一套资格判定：传了 scope 就直接复用它的 where，别在本地
+  // 再拼一套「deleted_at IS NULL OR -1」——那会把 local 账号里已删除的行也算进
+  // 可归位对象，写出来的范围和接管范围对不上。
   const transportGuard = options.transportAware && !options.allowCloud
     ? "AND COALESCE(transport, 'local') = 'local'"
     : '';
+  const qualified = options.scope && options.scope.where
+    ? `(${options.scope.where})`
+    : `(deleted_at IS NULL OR deleted_at = -1) ${transportGuard}`;
+  const qualifiedParams = options.scope && options.scope.where ? (options.scope.params || []) : [];
   const loose = await db.all(
     `SELECT id, cwd FROM sessions
       WHERE user_id = ? AND space_id IS NULL AND cwd IS NOT NULL AND cwd <> ''
-        AND (deleted_at IS NULL OR deleted_at = -1) ${transportGuard}`,
-    [targetUid]
+        AND ${qualified}`,
+    [targetUid, ...qualifiedParams]
   );
   const groups = new Map();
   for (const row of loose) {
@@ -358,15 +367,15 @@ function chunk(list, size) {
 async function countSpaceRemaps(db, remaps, targetUid, scope) {
   let total = 0;
   const detail = [];
-  // 计数器要在「改 user_id 之前」看清最终归属：既算已经属于目标账号的行，
-  // 也算本次会被接管的行（同一事务里先改 user_id、再改 space_id）。
-  const inScope = scope && scope.where ? ` OR (${scope.where})` : '';
-  const inScopeParams = scope && scope.where ? (scope.params || []) : [];
+  // 计数口径与写端一致：事务里先按 scope 改 user_id，再改 space_id，
+  // 所以「scope 内且挂在源账号同名分组上」就是最终会被改挂的行。
+  const scopeWhere = scope && scope.where ? scope.where : 'user_id = ?';
+  const scopeParams = scope && scope.where ? (scope.params || []) : [targetUid];
   for (const rm of remaps) {
     const placeholders = rm.srcIds.map(() => '?').join(', ');
     const row = await db.all(
-      `SELECT COUNT(*) AS n FROM sessions WHERE space_id IN (${placeholders}) AND (user_id = ?${inScope})`,
-      [...rm.srcIds, targetUid, ...inScopeParams]
+      `SELECT COUNT(*) AS n FROM sessions WHERE space_id IN (${placeholders}) AND (${scopeWhere})`,
+      [...rm.srcIds, ...scopeParams]
     );
     const n = Number((row && row[0] && row[0].n) || 0);
     if (n > 0) detail.push({ name: rm.name, sessions: n });
@@ -606,22 +615,21 @@ function createRehomeRunner(options = {}) {
       ? await planCwdAdoption(db, targetUid, mirror.own, {
         allowCloud: !!scope.cloud,
         transportAware: !!scope.transportAware,
+        scope,
       })
       : { bySpace: [], total: 0 };
     // 冲突分组：会话不改挂，但必须脱离「别人账号的分组」，否则就是跨账号孤儿引用。
-    // 计数要算上「本次会被接管的会话」（此刻它们还属于源账号），否则第一次切号会漏。
+    // 计数口径与写端一致：事务里先按 scope 改 user_id，所以「scope 内且挂在这些
+    // space 上」就是最终会被 detach 的行，不再自己拼 user_id / deleted_at 条件。
     let detachTotal = 0;
     const detachPlan = [];
-    const detachScope = scope && scope.where ? ` OR (${scope.where})` : '';
-    const detachScopeParams = scope && scope.where ? (scope.params || []) : [];
     for (const d of mirror.detach || []) {
       for (const part of chunk(d.srcIds, 400)) {
         const placeholders = part.map(() => '?').join(', ');
         const row = await db.all(
           `SELECT COUNT(*) AS n FROM sessions
-            WHERE space_id IN (${placeholders}) AND (user_id = ?${detachScope})
-              AND (deleted_at IS NULL OR deleted_at = -1)`,
-          [...part, targetUid, ...detachScopeParams]
+            WHERE space_id IN (${placeholders}) AND (${scope.where})`,
+          [...part, ...(scope.params || [])]
         );
         const n = Number((row && row[0] && row[0].n) || 0);
         if (n > 0) { detachPlan.push({ part, n }); detachTotal += n; }
@@ -708,8 +716,8 @@ function createRehomeRunner(options = {}) {
                     ORDER BY created_at ASC, id ASC LIMIT 1
                  ), updated_at = ?
                  WHERE user_id = ? AND space_id IN (${placeholders})
-                   AND (deleted_at IS NULL OR deleted_at = -1)`,
-          params: [targetUid, rm.name, now, targetUid, ...part],
+                   AND (${scope.where})`,
+          params: [targetUid, rm.name, now, targetUid, ...part, ...(scope.params || [])],
         });
       }
     }
@@ -719,17 +727,18 @@ function createRehomeRunner(options = {}) {
       statements.push({
         sql: `UPDATE sessions SET space_id = NULL, updated_at = ?
                WHERE user_id = ? AND space_id IN (${placeholders})
-                 AND (deleted_at IS NULL OR deleted_at = -1)`,
-        params: [now, targetUid, ...dp.part],
+                 AND (${scope.where})`,
+        params: [now, targetUid, ...dp.part, ...(scope.params || [])],
       });
     }
     for (const group of adoption.bySpace) {
       for (const part of chunk(group.ids, 400)) {
         const placeholders = part.map(() => '?').join(', ');
         statements.push({
-          sql: `UPDATE sessions SET space_id = ?, updated_at = ?
-                 WHERE id IN (${placeholders}) AND space_id IS NULL`,
-          params: [group.spaceId, now, ...part],
+        sql: `UPDATE sessions SET space_id = ?, updated_at = ?
+               WHERE id IN (${placeholders}) AND space_id IS NULL
+                 AND user_id = ? AND (${scope.where})`,
+        params: [group.spaceId, now, ...part, targetUid, ...(scope.params || [])],
         });
       }
     }

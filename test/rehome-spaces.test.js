@@ -80,6 +80,7 @@ async function main() {
   // 目标账号自带两份同名分组：身份有歧义，不能挑一份继续 remap。
   await db.run(INS_SPACE_PATH, ['s-dup-b1', B, 'dev-1', '重复组', null, 0, 'active', 'local', -1, 1030, 1030, 'seed']);
   await db.run(INS_SPACE_PATH, ['s-dup-b2', B, 'dev-1', '重复组', null, 0, 'active', 'local', -1, 1031, 1031, 'seed']);
+  await db.run(INS_SPACE_PATH, ['s-dup-a1', A, 'dev-1', '重复组', null, 0, 'active', 'local', -1, 1032, 1032, 'seed']);
 
   // t1/t3 属于 A 且挂 A 的分组；t2 属于 B 但还没挂分组（散在最近列表）。
   await db.run(INSERT_SESSION, ['t1', A, 'H:/AI工作区/FFRS', 'ffrs-A', 'completed', null, 0, 1000, 1000, 'local', SPACE_FFRS_A]);
@@ -91,6 +92,8 @@ async function main() {
   await db.run(INSERT_SESSION, ['t5', A, 'H:/shared', 'shared-A', 'completed', null, 0, 1004, 1004, 'local', 's-shared-a']);
   // t7 的 cwd 是 workspace2：目录边界要挡住，不能被 workspace 抢走。
   await db.run(INSERT_SESSION, ['t7', B, 'H:/AI工作区/workspace2/proj', 'ws2-B', 'completed', null, 0, 1005, 1005, 'local', null]);
+  // t8：A 的会话挂在 A 自己的「重复组」上，而 B 有两份同名分组 → 必须 detach，不能留在 A 的分组里。
+  await db.run(INSERT_SESSION, ['t8', A, 'H:/AI工作区/重复组', 'dup-A', 'completed', null, 0, 1006, 1006, 'local', 's-dup-a1']);
 
   fs.writeFileSync(path.join(tmp, 'rehome-sessions.json'),
     JSON.stringify({ enabled: true, dedupe: false }, null, 2) + '\n');
@@ -99,7 +102,7 @@ async function main() {
   // 干跑：不动库，但要如实报出计划
   const dry = await runner.run(B, { dryRun: true });
   assert.equal(dry.ok, true, 'dry run ok');
-  assert.equal(dry.affected, 3, 'A 的 t1/t3/t5 会被接管');
+  assert.equal(dry.affected, 4, 'A 的 t1/t3/t5/t8 会被接管');
   assert.deepEqual(dry.spaces.created.sort(), ['FFRS', 'workspace'], 'B 缺两个分组');
   assert.ok(!dry.spaces.created.includes('项目X'), '同名但目录不同 → 不镜像');
   assert.ok(dry.spaces.conflicts.some((c) => c.name === '项目X'), '冲突要出现在报告里');
@@ -128,7 +131,7 @@ async function main() {
 
   // 2) 原账号 A 的分组一份都不能少（切回去还要用）
   const aCount = await db.all('SELECT COUNT(*) AS n FROM spaces WHERE user_id = ?', [A]);
-  assert.equal(Number(aCount[0].n), 5, 'A 的分组保持原样');
+  assert.equal(Number(aCount[0].n), 6, 'A 的分组保持原样');
 
   // 3) 会话全归 B，并挂到 B 自己的同名分组
   const sessions = await db.all('SELECT id, user_id, space_id FROM sessions ORDER BY id');
@@ -145,6 +148,8 @@ async function main() {
   assert.equal(byId.t5.user_id, B, 't5 会话归 B');
   assert.equal(byId.t5.space_id, null, '冲突分组上的会话被 detach，不留在别人分组');
   assert.equal(byId.t7.space_id, null, 'workspace2 不被 workspace 抢走');
+  assert.equal(byId.t8.user_id, B, 't8 会话归 B');
+  assert.equal(byId.t8.space_id, null, 'duplicate-target 分组上的会话同样 detach');
   const conflictRow = await db.all("SELECT primary_folder_path FROM spaces WHERE id = 's-conflict-b'");
   assert.equal(conflictRow[0].primary_folder_path, 'C:/work/x', '冲突分组保留目标账号自己的目录');
   const conflictCount = await db.all("SELECT COUNT(*) AS n FROM spaces WHERE name = '项目X'");
