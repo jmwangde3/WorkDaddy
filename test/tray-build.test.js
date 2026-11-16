@@ -199,7 +199,12 @@ function userStrings(file) {
 
 /** 字面量是否出现在文件里：#US 堆（ldstr）或元数据 #Strings（UTF-8，如 DllImport 模块名）。 */
 function hasLiteral(file, set, s) {
-  if (set.has(s)) return true;
+  // csc 会把相邻的常量拼成一个整串：源码里的 " --workdaddy-instance-id=" 会被
+  // 折进 "\" --workdaddy-instance-id=" 之类更长的 #US 项（正的注释里也提过这个
+  // 折叠）。只要它作为子串出现在任一用户字符串里，就证明这个字面量进了二进制。
+  for (const u of set) {
+    if (u === s || u.includes(s)) return true;
+  }
   // #Strings 堆是 UTF-8；DllImport("kernel32.dll") 这类名字只在那里
   return fs.readFileSync(file).includes(Buffer.from(s, 'utf8'));
 }
@@ -368,6 +373,14 @@ function main() {
     const missingRepo = standalone.filter((s) => !hasLiteral(committedExe, repoStrs, s));
     assert.deepEqual(missingFresh.slice(0, 10), [], '现编产物缺源码字面量：' + JSON.stringify(missingFresh.slice(0, 10)));
     assert.deepEqual(missingRepo.slice(0, 10), [], '仓库 EXE 缺当前源码里的字面量：' + missingRepo.slice(0, 10).join(' | '));
+  });
+
+  test('托盘：instanceId 参数确实编进了两个 EXE', () => {
+    for (const exe of [outExe, committedExe]) {
+      const strs = userStrings(exe);
+      assert.ok([...strs].some((s) => s.indexOf('--workdaddy-instance-id=') >= 0),
+        path.basename(exe) + ' 缺少 --workdaddy-instance-id= 启动参数字面量');
+    }
   });
 
   test('托盘：EXE 里的中文界面串都来自当前源码（反查）', () => {

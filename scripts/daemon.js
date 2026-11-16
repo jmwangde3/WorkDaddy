@@ -2048,7 +2048,7 @@ function downgradeLockToReadOnly() {
 // 用原子创建锁文件把这类竞态变成可观测的单实例退出，而不是两个进程同时清理/注入页面。
 // Windows 数据目录锁不可写时，使用同一台机器用户临时目录中的哈希锁继续保证单实例。
 function acquireDaemonLock() {
-  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), version: DAEMON_VERSION, buildId: DAEMON_BUILD_ID });
+  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), instanceId: INSTANCE_ID, version: DAEMON_VERSION, buildId: DAEMON_BUILD_ID });
   const candidates = [DAEMON_LOCK_FILE];
   if (IS_WIN && DAEMON_LOCK_FALLBACK_FILE !== DAEMON_LOCK_FILE) candidates.push(DAEMON_LOCK_FALLBACK_FILE);
   let fallbackReason = null;
@@ -2281,6 +2281,27 @@ const cdp = {
 };
 
 const DIAGNOSTICS_FILE = path.join(DATA_DIR, 'diagnostics-latest.json');
+// 实例身份：watchdog 用命令行把本次启动的 32 位十六进制 ID 传进来，它同时出现在
+// watchdog 状态文件和 daemon 锁里。托盘只认「命令行、锁、状态三者 instanceId 一致」
+// 的进程 —— 同 profile 共用 AppDir 的两份安装靠它彻底分开。
+const INSTANCE_ARG_PREFIX = '--workdaddy-instance-id=';
+const INSTANCE_ID = (() => {
+  const arg = process.argv.find((item) => item.startsWith(INSTANCE_ARG_PREFIX));
+  if (!arg) return '';
+  const value = arg.slice(INSTANCE_ARG_PREFIX.length);
+  if (!/^[0-9a-f]{32}$/i.test(value)) {
+    try { process.stderr.write('[daemon] 非法的 --workdaddy-instance-id\n'); } catch (_) {}
+    process.exit(64);
+  }
+  return value.toLowerCase();
+})();
+if (process.env.WORKDADDY_SUPERVISED === '1' && !INSTANCE_ID && !PROBE_CLIENT_RUNNING) {
+  // 受 watchdog 托管却没有身份：不进入正常服务启动流程，免得后续无法证明归属。
+  // --probe-client-running 是一次性探测进程，不启动服务、不写锁、不注册 IPC，
+  // 也拿不到 watchdog 的命令行参数，所以不适用这条规则。
+  try { process.stderr.write('[daemon] watchdog 托管模式缺少 --workdaddy-instance-id\n'); } catch (_) {}
+  process.exit(64);
+}
 const DAEMON_LOCK_FILE = path.join(DATA_DIR, '.daemon.lock');
 // Windows 上旧版可能以不同权限创建锁文件，导致当前用户无法覆盖；临时锁按数据目录哈希隔离。
 const DAEMON_LOCK_FALLBACK_FILE = path.join(

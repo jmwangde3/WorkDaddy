@@ -517,8 +517,10 @@ function main() {
     assert(/Local\\WorkDaddyTraySingleton_" \+ s_profile/.test(cs), '托盘 Mutex 应按 profile 生成');
     assert(!/@"Local\\WorkDaddyTraySingleton"/.test(cs), '不应再使用全局 Mutex 名');
     // StopWd 先做归属校验（profile + appDir + 命令行），再动手。
-    assert(/private static string ReadOwnership\(out int watchdogPid, out int daemonPid\)/.test(cs),
-      'StopWd 应先做归属校验');
+    assert(/private static string ReadOwnership\(out int watchdogPid, out int daemonPid,\s*out string instanceId/.test(cs),
+      'StopWd 应先做归属校验（含 instanceId）');
+    assert(/instanceId 不是 32 位十六进制|IsInstanceId/.test(cs),
+      '归属校验必须验证 instanceId 是 32 位十六进制');
     assert(/属于另一个安装/.test(cs), 'StopWd 应拒绝停止别的安装的服务');
     assert(/拒绝停止/.test(cs), 'StopWd 应在身份不明时拒绝');
     assert(/dataDir 与本实例不一致/.test(cs), '状态文件的 dataDir 必须与当前绑定一致');

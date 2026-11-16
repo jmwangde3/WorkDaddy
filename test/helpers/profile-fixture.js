@@ -47,6 +47,8 @@ const grandchild = process.env.STUB_GRANDCHILD === '1';
 const surviveKill = process.env.STUB_SURVIVE_KILL === '1';
 const noListen = process.env.STUB_NO_LISTEN === '1';
 const lockFile = path.join(dataDir, '.daemon.lock');
+const instanceArg = process.argv.find((item) => item.startsWith('--workdaddy-instance-id='));
+const instanceId = instanceArg ? instanceArg.slice('--workdaddy-instance-id='.length).toLowerCase() : '';
 const record = (name, payload) => {
   try { fs.writeFileSync(path.join(outDir, name), JSON.stringify(payload, null, 2)); } catch (_) {}
 };
@@ -68,7 +70,7 @@ let ownsLock = false;
 if (!grandchild) {
   try {
     lockFd = fs.openSync(lockFile, 'wx', 0o600);
-    fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, startedAt: stubStartedAt, version: 'stub' }), 'utf8');
+    fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, startedAt: stubStartedAt, instanceId: instanceId, version: 'stub' }), 'utf8');
     ownsLock = true;
     fs.closeSync(lockFd);
     lockFd = fs.openSync(lockFile, 'r');
@@ -145,13 +147,16 @@ const handler = (req, res) => {
 };
 
 // 孙进程：一直重试直到抢到端口 —— 父进程死后它接管，模拟「daemon 被杀但服务还在」。
+// STUB_GRANDCHILD_DELAY_MS 让它延迟一段时间才第一次监听：模拟「端口先空出来、
+// 过一会儿才被接管」，专门用来验证停止确认不能只看一瞬间。
 if (grandchild) {
+  const startDelay = Number(process.env.STUB_GRANDCHILD_DELAY_MS || 0);
   const attempt = () => {
     const s = http.createServer(handler);
     s.once('error', () => setTimeout(attempt, 100));
     s.listen(port, '127.0.0.1', () => record('listening-' + process.pid + '.json', { pid: process.pid, port, grandchild: true }));
   };
-  attempt();
+  if (startDelay > 0) setTimeout(attempt, startDelay); else attempt();
 } else {
   const startListening = () => {
     if (noListen) return;
@@ -218,6 +223,8 @@ function makeInstall(options) {
     dataDir,
     outDir,
     profile,
+    // 与托盘 StartWd 同一个规则：每次启动一份新身份，watchdog 传给 daemon。
+    instanceId: require('crypto').randomBytes(16).toString('hex'),
     lockPort: opts.lockPort || freePort(),
     uiPort: opts.uiPort || freePort(),
     watchdogPid: 0,
@@ -248,6 +255,8 @@ function startWatchdog(ctx, extraEnv, nodeArgs) {
   // 连带杀死整棵子树，那样「daemon 是否自己退出」就永远测不出来。
   const args = (nodeArgs || []).slice();
   args.push(path.join(ctx.scripts, 'watchdog.js'));
+  // 与托盘一致：每次启动给一个实例 ID，watchdog 再传给 daemon。
+  args.push('--workdaddy-instance-id=' + ctx.instanceId);
   const child = spawn(process.execPath, args, {
     env: baseEnv(ctx, extraEnv),
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -266,14 +275,17 @@ function startWatchdog(ctx, extraEnv, nodeArgs) {
 // 直接拉起一个「没有 IPC 托管」的 daemon：旧版 watchdog 拉起的 daemon 就是这样，
 // 也正是「watchdog 没了、daemon 还在」那个需要超时兜底的场景。
 function startDetachedDaemon(ctx, extraEnv) {
-  const child = spawn(process.execPath, [path.join(ctx.scripts, 'daemon.js')], {
+  const child = spawn(process.execPath, [
+    path.join(ctx.scripts, 'daemon.js'),
+    '--workdaddy-instance-id=' + ctx.instanceId,
+  ], {
     env: baseEnv(ctx, extraEnv),
     stdio: 'ignore',
     windowsHide: true,
     detached: true,
   });
   try { child.unref(); } catch (_) {}
-  return { pid: child.pid };
+  return { pid: child.pid, instanceId: ctx.instanceId };
 }
 
 async function waitListening(ctx, pid, timeoutMs) {

@@ -72,22 +72,33 @@ function deadPid() {
 }
 
 function writeState(ctx, patch) {
+  const current = fixture.readStateFile(ctx) || {};
   const state = {
-    schema: 1,
+    schema: 2,
     profile: ctx.profile,
+    // 替身 daemon 与 watchdog 都用 ctx.instanceId；状态文件还没写出来时（例如
+    // 直接 detached 拉起 daemon 的用例）必须以它为准，否则会伪造出一份与锁
+    // 不一致的身份，把「归属证明成立」的用例误判成拒绝。
+    instanceId: ctx.instanceId || current.instanceId || 'f'.repeat(32),
     pid: ctx.watchdogPid,
     daemonPid: null,
     appDir: ctx.appDir,
     dataDir: ctx.dataDir,
     state: 'RUNNING',
-    startedAt: new Date().toISOString(),
+    startedAt: current.startedAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   fs.writeFileSync(path.join(ctx.dataDir, 'watchdog-state.json'), JSON.stringify(Object.assign(state, patch), null, 2));
 }
 
-function writeDaemonLock(ctx, pid) {
-  fs.writeFileSync(path.join(ctx.dataDir, '.daemon.lock'), JSON.stringify({ pid, startedAt: new Date().toISOString(), version: 'stub' }));
+function writeDaemonLock(ctx, pid, instanceId, startedAt) {
+  const state = fixture.readStateFile(ctx) || {};
+  fs.writeFileSync(path.join(ctx.dataDir, '.daemon.lock'), JSON.stringify({
+    pid,
+    startedAt: startedAt || new Date().toISOString(),
+    instanceId: instanceId === undefined ? (state.instanceId || 'f'.repeat(32)) : instanceId,
+    version: 'stub',
+  }));
 }
 
 async function main() {
@@ -173,7 +184,7 @@ async function main() {
 
     const r = stopTray(cn);
     assert(/stop = False/.test(r.cli), '没有 daemonPid 就不能报成功：' + r.cli);
-    assert(/pid|无法/.test(r.cli), '应说明无法确认 daemon：' + r.cli);
+    assert(/服务在应答|无法确认|pid/.test(r.cli), '应说明无法确认 daemon：' + r.cli);
     assert(fixture.alive(stuck.pid), '证明不齐时不得结束进程');
     assert(fixture.readStateFile(cn) !== null, '停止失败时不应删掉状态文件（要留下证据）');
   });
@@ -193,6 +204,76 @@ async function main() {
     assert(fixture.alive(bDaemon), 'B 的 daemon 不得被结束');
     const status = await fixture.statusOf(b.uiPort);
     assert(status && status.profile.id === 'workbuddy-cn', 'B 应继续应答');
+  });
+
+  // ---- 实例身份（instanceId）相关 ----
+
+  await test('watchdog PID 被复用（CN 记录指向 AI 的 watchdog）→ 拒绝结束', async () => {
+    const cn = install('own-wdreuse-cn', 'workbuddy-cn');
+    const ai = install('own-wdreuse-ai', 'workbuddy-ai', { appDir: cn.appDir });
+    start(ai);
+    await waitRunning(ai);
+    const aiState = fixture.readStateFile(ai);
+    const aiDaemon = aiState.daemonPid;
+
+    // CN 的旧记录：watchdog pid 写成 AI 的实际 pid，instanceId 还是 CN 自己的。
+    writeState(cn, { pid: ai.watchdogPid, daemonPid: null, instanceId: 'a'.repeat(32) });
+
+    const r = stopTray(cn);
+    assert(/stop = False/.test(r.cli), '必须拒绝结束：' + r.cli);
+    assert(/instanceId|不一致/.test(r.cli), '应指出 instanceId 不一致：' + r.cli);
+    assert(fixture.alive(ai.watchdogPid), 'AI watchdog 不得被结束');
+    assert(fixture.alive(aiDaemon), 'AI daemon 不得被结束');
+    const status = await fixture.statusOf(ai.uiPort);
+    assert(status && status.profile.id === 'workbuddy-ai', 'AI 应继续应答：' + JSON.stringify(status));
+  });
+
+  await test('daemon PID 被复用（CN 锁指向 AI 的 daemon）→ 拒绝结束', async () => {
+    const cn = install('own-dreuse-cn', 'workbuddy-cn');
+    const ai = install('own-dreuse-ai', 'workbuddy-ai', { appDir: cn.appDir });
+    start(ai);
+    await waitRunning(ai);
+    const aiDaemon = fixture.readStateFile(ai).daemonPid;
+
+    writeState(cn, { pid: deadPid(), daemonPid: aiDaemon, instanceId: 'b'.repeat(32) });
+    writeDaemonLock(cn, aiDaemon, 'b'.repeat(32));
+
+    const r = stopTray(cn);
+    assert(/stop = False/.test(r.cli), '必须拒绝结束：' + r.cli);
+    assert(/instanceId|不一致|归属/.test(r.cli), '应说明归属证明失败：' + r.cli);
+    assert(fixture.alive(aiDaemon), 'AI daemon 不得被结束');
+    assert(fixture.readStateFile(cn) !== null, '失败时必须保留状态证据');
+  });
+
+  await test('daemonPid 尚未写入：不得凭「端口暂时无响应」报停止成功', async () => {
+    const cn = install('own-race-cn', 'workbuddy-cn');
+    // daemon 延迟 2.5s 才开始监听：Stop 会在它还没开始服务时就执行。
+    start(cn, { STUB_STARTUP_DELAY_MS: '2500' });
+    await fixture.waitFor(() => Boolean(fixture.readStateFile(cn)), 20000, '状态文件出现');
+    // 抹掉 daemonPid，模拟「watchdog 已 spawn、状态还没写」的竞态。
+    writeState(cn, { daemonPid: null });
+    const instanceId = (fixture.readStateFile(cn) || {}).instanceId;
+
+    const r = stopTray(cn);
+    await fixture.delay(3000);
+    const leftovers = fixture.listeningDaemonPids(cn);
+    assert(leftovers.length === 0, '停止后不应留下仍在监听的 daemon：' + JSON.stringify(leftovers));
+    const status = await fixture.statusOf(cn.uiPort);
+    assert(!status, '端口不应继续应答：' + JSON.stringify(status));
+    assert(/stop = True/.test(r.cli), '等待实例进程退出后应收敛为成功：' + r.cli);
+    assert(instanceId && instanceId.length === 32, '状态文件应带 instanceId');
+  });
+
+  await test('强杀后服务仍被孙进程接管：不得报告停止成功', async () => {
+    const cn = install('own-survivor-cn', 'workbuddy-cn');
+    start(cn, { STUB_SURVIVE_KILL: '1' });
+    await waitRunning(cn);
+    const daemon = fixture.readStateFile(cn).daemonPid;
+
+    const r = stopTray(cn);
+    assert(/stop = False/.test(r.cli), '服务仍被接管时必须失败关闭：' + r.cli);
+    assert(fixture.readStateFile(cn) !== null, '失败时必须保留状态证据');
+    assert(fixture.alive(daemon) || fixture.listeningDaemonPids(cn).length > 0, '服务应仍在（说明不是虚报成功）');
   });
 
   await test('无关的 node 进程（命令行不含本安装 daemon.js）不会被结束', async () => {

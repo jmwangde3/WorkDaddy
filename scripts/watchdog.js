@@ -104,6 +104,27 @@ const ORPHAN_WAIT_MS = envInt('WORKDADDY_ORPHAN_WAIT_MS', 8000, 0, 60000);
 const DAEMON_EXIT_WAIT_MS = envInt('WORKDADDY_DAEMON_EXIT_WAIT_MS', 6000, 0, 60000);
 // 强制结束后等它真的消失的时间（TerminateProcess 是异步生效的）。
 const FORCE_CONFIRM_MS = envInt('WORKDADDY_FORCE_CONFIRM_MS', 2000, 0, 60000);
+// 停止确认的稳定窗口：进程没了、端口没人应答，要连续成立这么久才算真的停了。
+// 只探一次会被「孙进程延迟接管端口」骗过去。
+const STOP_STABLE_MS = envInt('WORKDADDY_STOP_STABLE_MS', 1500, 400, 20000);
+
+// 实例身份：托盘每次真正拉起 watchdog 都会生成一个新的 32 位十六进制 ID，
+// watchdog 原样传给 daemon，再写进状态文件和 daemon 锁。它是「这一份服务」的
+// 唯一标识 —— 同 profile 的旧状态、被复用的 PID 都靠它排除。
+const INSTANCE_ARG_PREFIX = '--workdaddy-instance-id=';
+
+function resolveInstanceId() {
+  const arg = process.argv.find((item) => item.startsWith(INSTANCE_ARG_PREFIX));
+  const value = arg
+    ? arg.slice(INSTANCE_ARG_PREFIX.length)
+    : require('crypto').randomBytes(16).toString('hex');
+  if (!/^[0-9a-f]{32}$/i.test(value)) {
+    throw new Error('invalid instance id');
+  }
+  return value.toLowerCase();
+}
+
+const INSTANCE_ID = resolveInstanceId();
 
 const STATE = {
   state: 'STARTING',
@@ -115,6 +136,9 @@ const STATE = {
 
 let child = null;
 let lastDaemonPid = 0;
+// 最后一次看到 daemon 的退出结果：正常停止过程中 daemon 自己报清理失败（非零退出码）
+// 时，watchdog 不能假装 STOPPED。
+let lastDaemonExit = null;
 let stopping = false;
 let restartDelay = 3000;
 let restartTimer = null;
@@ -137,8 +161,9 @@ function writeState(next) {
   if (next) Object.assign(STATE, next);
   STATE.updatedAt = new Date().toISOString();
   const payload = {
-    schema: 1,
+    schema: 2,
     profile: PROFILE.id,
+    instanceId: INSTANCE_ID,
     pid: process.pid,
     daemonPid: STATE.daemonPid || null,
     appDir: APP_DIR,
@@ -236,15 +261,33 @@ async function waitForNoProfileDaemon(budgetMs) {
   return port;
 }
 
-// 停止之后的确认：连探几次，全都无人应答才算真的停了。
-// 只探一次会被「孙进程刚抢到端口」这种时序骗过去 —— 那一刻返回 0，下一秒服务又回来了。
-async function daemonStillServing() {
-  for (let i = 0; i < 3; i += 1) {
+// 停止之后的确认：每 200ms 探一次本 profile 的所有候选端口，连续 STOP_STABLE_MS
+// 都没有任何实例应答才算真的停了。只探一次会被「孙进程刚抢到端口」这种时序骗过去
+// —— 那一刻返回 0，下一秒服务又回来了。
+async function daemonStillServing(stableMs) {
+  const budget = Number.isFinite(stableMs) ? stableMs : STOP_STABLE_MS;
+  const started = Date.now();
+  while (true) {
     const port = await liveProfileDaemonPort();
     if (port) return port;
-    if (i < 2) await delay(200);
+    if (Date.now() - started >= budget) return 0;
+    await delay(200);
   }
-  return 0;
+}
+
+function readDaemonLock() {
+  try { return JSON.parse(fs.readFileSync(DAEMON_LOCK_FILE, 'utf8')); } catch (_) { return null; }
+}
+
+// 「本实例的 daemon 还活着吗」：只认锁文件里 instanceId 与本次启动一致、且 pid 还
+// 在的那个。锁里的 pid 属于别的实例（PID 复用、兄弟 profile）一律不算。
+function instanceDaemonAlive() {
+  const lock = readDaemonLock();
+  const pid = Number(lock && lock.pid);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return 0;
+  const id = String((lock && lock.instanceId) || '').toLowerCase();
+  if (id !== INSTANCE_ID) return 0;
+  return pidAlive(pid) ? pid : 0;
 }
 
 /* --------------------------- 上一个 daemon 的身份 --------------------------- */
@@ -287,7 +330,11 @@ async function waitForPreviousDaemon(budgetMs) {
 
 function startDaemon() {
   if (stopping) return;
-  const args = ['--experimental-sqlite', DAEMON_FILE];
+  const args = [
+    '--experimental-sqlite',
+    DAEMON_FILE,
+    INSTANCE_ARG_PREFIX + INSTANCE_ID,
+  ];
   log('启动 daemon: ' + process.execPath + ' ' + args.join(' '));
   writeState({ state: 'STARTING' });
   try {
@@ -317,6 +364,7 @@ function startDaemon() {
   });
   current.on('error', (error) => log('daemon 启动错误: ' + (error && error.message ? error.message : String(error))));
   current.on('exit', (code, signal) => {
+    lastDaemonExit = { code, signal, stoppedByUs: stopping, at: Date.now() };
     child = null;
     STATE.daemonPid = null;
     if (stopping) {
@@ -353,8 +401,9 @@ function finishShutdown(reason, ok) {
 }
 
 // 等自己 spawn 的那个子进程真的退出；返回 false 表示超时（它还在）。
-function waitChildExit(budgetMs) {
-  const target = child;
+// 明确接收目标进程，不在函数内部重新读全局 child —— 否则 child 被 exit 处理器置空后，
+// 这里会把「已经退出」误判成「无需等待」，或者反过来等错对象。
+function waitChildExit(target, budgetMs) {
   if (!target) return Promise.resolve(true);
   return new Promise((resolve) => {
     let settled = false;
@@ -377,20 +426,37 @@ async function shutdown() {
   stopping = true;
   writeState({ state: 'STOPPING', reason: 'signal' });
   log('watchdog 收到停止信号，结束 daemon');
-  if (!child) {
+
+  const target = child;
+  const pid = target && target.pid;
+
+  if (!target) {
+    // 没有 child 不等于没有服务：上一份 daemon 可能还活着（本实例的 daemon 锁、
+    // profile 端口都是证据）。只要还有一处无法确认，就必须 exit 5 并保留证据。
+    const port = await daemonStillServing();
+    const alivePid = instanceDaemonAlive();
+    if (port || alivePid) {
+      finishShutdown('没有可结束的 daemon 句柄，但' +
+        (alivePid ? '本实例 daemon 仍在运行（pid=' + alivePid + '）' : '') +
+        (alivePid && port ? '，' : '') +
+        (port ? '本 profile 仍有服务在 ui=' + port + ' 应答' : ''), false);
+      return;
+    }
     finishShutdown('no-daemon', true);
     return;
   }
-  const pid = child.pid;
-  try { child.send({ type: 'shutdown' }); } catch (error) {
+
+  let forced = false;
+  try { target.send({ type: 'shutdown' }); } catch (error) {
     log('shutdown 消息发送失败（继续等进程退出）：' + errText(error));
   }
-  if (!(await waitChildExit(DAEMON_EXIT_WAIT_MS))) {
+  if (!(await waitChildExit(target, DAEMON_EXIT_WAIT_MS))) {
+    forced = true;
     log('daemon 未在 ' + DAEMON_EXIT_WAIT_MS + 'ms 内退出，强制结束 pid=' + pid);
     let killError = '';
-    try { child.kill(); } catch (error) { killError = errText(error); }
+    try { target.kill(); } catch (error) { killError = errText(error); }
     if (killError) log('强制结束 pid=' + pid + ' 失败：' + killError);
-    if (!(await waitChildExit(FORCE_CONFIRM_MS))) {
+    if (!(await waitChildExit(target, FORCE_CONFIRM_MS))) {
       finishShutdown('强制结束后 daemon（pid=' + pid + '）仍未退出' +
         (killError ? '，kill 错误：' + killError : ''), false);
       return;
@@ -401,6 +467,17 @@ async function shutdown() {
   const port = await daemonStillServing();
   if (port) {
     finishShutdown('daemon 进程已退出，但本 profile 仍有服务在 ui=' + port + ' 应答', false);
+    return;
+  }
+  // 同一实例的 daemon 还没走干净（锁里记着同一个 instanceId 且 pid 还活着）。
+  const alivePid = instanceDaemonAlive();
+  if (alivePid) {
+    finishShutdown('本实例 daemon 仍在运行（pid=' + alivePid + '）', false);
+    return;
+  }
+  // 正常停止路径上 daemon 自己报清理失败：不能写成 STOPPED。
+  if (!forced && lastDaemonExit && lastDaemonExit.code !== 0) {
+    finishShutdown('daemon 退出码 ' + lastDaemonExit.code + '（清理未完成）', false);
     return;
   }
   finishShutdown('daemon-exited', true);

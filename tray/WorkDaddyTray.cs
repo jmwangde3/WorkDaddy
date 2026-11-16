@@ -31,6 +31,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Management;
@@ -905,7 +906,12 @@ namespace WorkDaddyTray
             {
                 ProcessStartInfo psi = new ProcessStartInfo();
                 psi.FileName = FindNode();
-                psi.Arguments = "\"" + s_watchdog + "\"";
+                // 每次真正拉起新 watchdog 都生成一个新身份：它写进 watchdog 状态文件、
+                // 传给 daemon、再进 daemon 锁。托盘停止时只认「三者一致」的那一份，
+                // 同 profile 共用 AppDir 的另一个实例、被复用的 PID 都靠它排除。
+                string instanceId = Guid.NewGuid().ToString("N");
+                psi.Arguments = "\"" + s_watchdog + "\"" +
+                    " --workdaddy-instance-id=" + instanceId;
                 psi.WorkingDirectory = s_scripts;
                 // UseShellExecute=true 让 shell 分配自己的句柄，不继承托盘 (winexe)
                 // 的无效标准句柄；Hidden 隐藏 node 的控制台窗口。
@@ -1018,7 +1024,9 @@ namespace WorkDaddyTray
             s_stopError = "";
             int watchdogPid;
             int daemonPid;
-            string ownershipError = ReadOwnership(out watchdogPid, out daemonPid);
+            string instanceId;
+            DateTime stateStartedAt;
+            string ownershipError = ReadOwnership(out watchdogPid, out daemonPid, out instanceId, out stateStartedAt);
             if (!string.IsNullOrEmpty(ownershipError))
             {
                 s_stopError = ownershipError;
@@ -1038,40 +1046,61 @@ namespace WorkDaddyTray
 
             // 归属证明必须在结束任何进程之前取：daemon 优雅退出会删掉自己的锁文件。
             string proof = "";
-            if (daemonPid > 0) proof = DaemonOwnershipProof(daemonPid);
+            if (daemonPid > 0) proof = DaemonOwnershipProof(daemonPid, instanceId);
 
             if (watchdogPid > 0 && ProcessAlive(watchdogPid))
             {
                 string reason;
-                if (!KillOwnedProcess(watchdogPid, "watchdog", out reason))
+                if (!KillOwnedProcess(watchdogPid, "watchdog", instanceId, out reason))
                 {
                     s_stopError = reason;
                     return false;
                 }
             }
 
-            // 1) 正常路径：新 daemon 靠 IPC 断开自己退出。
-            if (WaitForDaemonExit(daemonPid, StopWaitMs()))
+            // 1) 正常路径：daemon 靠 IPC 断开自己退出。
+            if (WaitForDaemonExit(daemonPid, instanceId, StopWaitMs()))
             {
                 CleanupStaleRuntimeFiles();
                 return true;
             }
 
-            // 2) 超时兜底：只允许结束「状态文件 + daemon 锁 + 命令行」三者一致的
-            //    那一个 pid。绝不按目录枚举 daemon.js —— CN 与 AI 可能共用同一个
-            //    AppDir，命令行完全一样，枚举就等于把兄弟 profile 一起杀掉。
+            // 保护 A：daemonPid 缺失（watchdog 刚 spawn、状态还没写）时，不能因为
+            // 「端口暂时没人应答」就报成功 —— 那个 daemon 可能正在启动。只有
+            // instanceId 找不到任何残留进程、端口也持续无人应答，才算真的停了。
+            if (daemonPid <= 0)
+            {
+                List<int> leftovers = FindInstanceDaemons(instanceId);
+                if (leftovers.Count > 0)
+                {
+                    s_stopError = "watchdog 已结束，但本实例的 daemon 仍在运行（pid=" +
+                        string.Join(",", leftovers.Select(p => p.ToString()).ToArray()) + "），停止未完成";
+                    return false;
+                }
+                if (FindDaemonPort() > 0)
+                {
+                    s_stopError = "watchdog 已结束，但本 Profile 仍有服务在应答，停止未完成";
+                    return false;
+                }
+                CleanupStaleRuntimeFiles();
+                return true;
+            }
+
+            // 2) 超时兜底：只允许结束「状态文件 + daemon 锁 + 命令行（含 instanceId）」
+            //    三者一致的这一个 pid。绝不按目录枚举 daemon.js —— CN 与 AI 可能共用
+            //    同一个 AppDir，枚举就等于把兄弟 profile 一起杀掉。
             if (!string.IsNullOrEmpty(proof))
             {
                 s_stopError = "watchdog 已结束，但 daemon 未在超时内退出；" + proof;
                 return false;
             }
             string killReason;
-            if (!KillProofedDaemon(daemonPid, out killReason))
+            if (!KillOwnedProcess(daemonPid, "daemon", instanceId, out killReason))
             {
                 s_stopError = killReason;
                 return false;
             }
-            if (!WaitForDaemonExit(daemonPid, StopConfirmMs()))
+            if (!WaitForDaemonExit(daemonPid, instanceId, StopConfirmMs()))
             {
                 s_stopError = "daemon 仍在运行（pid=" + daemonPid + "），停止未完成";
                 return false;
@@ -1106,15 +1135,59 @@ namespace WorkDaddyTray
             return string.IsNullOrEmpty(dir) ? "" : Path.Combine(dir, "watchdog.pid");
         }
 
+        // 四个 profile 是唯一合法取值：状态文件里的 profile 不在白名单就拒绝停止，
+        // 免得一份被改过的记录把停止动作引到别的安装上。（白名单本身见 ProfileIds。）
+
+        private static bool IsInstanceId(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length != 32) return false;
+            foreach (char c in value)
+            {
+                bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                if (!hex) return false;
+            }
+            return true;
+        }
+
+        // SimpleJson 只给 double：小数、负数、溢出都不能用 (int)(double) 截断过去。
+        private static bool TryPositiveInt(object value, out int result)
+        {
+            result = 0;
+            if (!(value is double)) return false;
+            double d = (double)value;
+            if (double.IsNaN(d) || double.IsInfinity(d)) return false;
+            if (d < 1 || d > int.MaxValue) return false;
+            if (Math.Floor(d) != d) return false;
+            result = (int)d;
+            return true;
+        }
+
+        private static bool TryIsoTime(object value, out DateTime result)
+        {
+            result = DateTime.MinValue;
+            string text = value as string;
+            if (string.IsNullOrEmpty(text)) return false;
+            // RoundtripKind 不能和 AdjustToUniversal 混用（会抛 ArgumentException），
+            // 先按 RoundtripKind 解析，再自己折算成 UTC。
+            if (!DateTime.TryParse(text, CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind, out result)) return false;
+            if (result.Kind != DateTimeKind.Utc) result = result.ToUniversalTime();
+            return true;
+        }
+
         // 返回空串表示「可以停（pid>0）」或「没在跑（pid==0）」；否则是拒绝原因。
         //
-        // 状态文件必须同时证明三件事才允许动手：profile 是本实例的、appDir 是本安装的、
-        // dataDir 是本实例绑定的那个。少任何一条都可能是「同 profile、另一份安装」的
-        // 记录被搬过来了 —— CN 与 AI 甚至可以共用同一个 AppDir，只有 dataDir 能区分。
-        private static string ReadOwnership(out int watchdogPid, out int daemonPid)
+        // 状态文件必须同时证明四件事才允许动手：profile 是本实例的、appDir 是本安装的、
+        // dataDir 是本实例绑定的那个、instanceId 是本实例启动时生成的那个。少任何一条
+        // 都可能是「同 profile、另一份安装」的记录被搬过来了 —— CN 与 AI 甚至可以共用
+        // 同一个 AppDir，只有 dataDir 和 instanceId 能区分。
+        private static string ReadOwnership(out int watchdogPid, out int daemonPid,
+            out string instanceId, out DateTime stateStartedAt)
         {
             watchdogPid = 0;
             daemonPid = 0;
+            instanceId = "";
+            stateStartedAt = DateTime.MinValue;
             string stateFile = StateFile();
             bool hasState = !string.IsNullOrEmpty(stateFile) && File.Exists(stateFile);
             if (hasState)
@@ -1123,14 +1196,17 @@ namespace WorkDaddyTray
                 try { o = SimpleJson.ParseObject(File.ReadAllText(stateFile)); }
                 catch (Exception ex) { return "状态文件不可解析：" + ex.Message; }
                 object v;
-                if (!o.TryGetValue("schema", out v) || !(v is double) || (int)(double)v != 1)
-                {
-                    return "状态文件 schema 不支持，拒绝停止";
-                }
+                if (!o.TryGetValue("schema", out v) || !(v is double)) return "状态文件缺 schema";
+                double schemaValue = (double)v;
+                if (schemaValue != 1 && schemaValue != 2) return "状态文件 schema 不支持（" + schemaValue + "），拒绝停止";
+                bool schema2 = schemaValue == 2;
+
                 if (!o.TryGetValue("profile", out v) || !(v is string)) return "状态文件缺 profile";
-                if (!string.Equals((string)v, s_profile, StringComparison.Ordinal))
+                string gotProfile = ((string)v).Trim();
+                if (!IsKnownProfile(gotProfile)) return "状态文件的 profile 不在白名单（" + gotProfile + "），拒绝停止";
+                if (!string.Equals(gotProfile, s_profile, StringComparison.Ordinal))
                 {
-                    return "该服务属于另一个 Profile（" + (string)v + "），拒绝停止";
+                    return "该服务属于另一个 Profile（" + gotProfile + "），拒绝停止";
                 }
                 if (!o.TryGetValue("appDir", out v) || !(v is string)) return "状态文件缺 appDir";
                 string gotApp = NormalizeIdentityPath(((string)v).Trim());
@@ -1148,9 +1224,32 @@ namespace WorkDaddyTray
                 {
                     return "状态文件的 dataDir 与本实例不一致（" + gotData + "），拒绝停止";
                 }
-                if (!o.TryGetValue("pid", out v) || !(v is double)) return "状态文件缺 pid";
-                watchdogPid = (int)(double)v;
-                if (o.TryGetValue("daemonPid", out v) && v is double) daemonPid = (int)(double)v;
+                if (!o.TryGetValue("pid", out v) || !TryPositiveInt(v, out watchdogPid))
+                {
+                    return "状态文件的 pid 不是有效正整数，拒绝停止";
+                }
+                if (o.TryGetValue("daemonPid", out v) && !(v is string))
+                {
+                    // null 合法（daemonPid 可以为空），但必须能解析成正整数。
+                    if (!TryPositiveInt(v, out daemonPid) && v != null)
+                    {
+                        return "状态文件的 daemonPid 不是有效正整数，拒绝停止";
+                    }
+                }
+                if (!o.TryGetValue("startedAt", out v) || !TryIsoTime(v, out stateStartedAt))
+                {
+                    return "状态文件缺合法 startedAt，无法证明实例身份，拒绝停止";
+                }
+                if (schema2)
+                {
+                    if (!o.TryGetValue("instanceId", out v) || !(v is string) || !IsInstanceId(((string)v).Trim()))
+                    {
+                        return "状态文件缺合法 instanceId，拒绝停止";
+                    }
+                    instanceId = ((string)v).Trim().ToLowerInvariant();
+                }
+                // schema 1 没有 instanceId：保留读取兼容，但归属证明会退到
+                // 「startedAt + 进程启动时间 + 锁」三合一，证明不了就拒绝强杀。
                 return "";
             }
 
@@ -1180,12 +1279,13 @@ namespace WorkDaddyTray
         }
 
         // daemon 的归属证明：本 profile 数据目录里 daemon 自己写的 .daemon.lock 必须
-        // 记着同一个 pid，且该 pid 的命令行指向本安装的 daemon.js。
+        // 记着同一个 pid、同一个 instanceId、并且 startedAt 与该进程的启动时间吻合。
         //
         // 为什么不能只看命令行：CN 与 AI 可以共用同一个 AppDir，两个 daemon.js 的
-        // 命令行逐字相同。唯一能区分它们的是「按数据目录存放」的锁文件与状态文件。
+        // 命令行除了 instanceId 完全一样。没有 instanceId 的旧状态则退到
+        // 「锁 pid + 锁 startedAt + 进程启动时间 + 命令行」四合一，证明不了就拒绝。
         // 返回空串 = 证明成立；否则是拒绝原因。
-        private static string DaemonOwnershipProof(int daemonPid)
+        private static string DaemonOwnershipProof(int daemonPid, string instanceId)
         {
             if (daemonPid <= 0) return "状态文件没有记录 daemonPid，无法证明 daemon 归属";
             string dir = RuntimeDataDir();
@@ -1198,19 +1298,57 @@ namespace WorkDaddyTray
                 else return "缺少 daemon 锁文件（" + Path.Combine(dir, ".daemon.lock") + "），无法证明 daemon 归属";
             }
             int lockPid;
+            string lockInstance;
+            DateTime lockStarted;
             try
             {
                 Dictionary<string, object> o = SimpleJson.ParseObject(File.ReadAllText(lockFile));
                 object v;
-                if (!o.TryGetValue("pid", out v) || !(v is double)) return "daemon 锁文件缺 pid：" + lockFile;
-                lockPid = (int)(double)v;
+                if (!o.TryGetValue("pid", out v) || !TryPositiveInt(v, out lockPid))
+                {
+                    return "daemon 锁文件缺合法 pid：" + lockFile;
+                }
+                lockInstance = "";
+                if (o.TryGetValue("instanceId", out v) && v is string)
+                {
+                    lockInstance = ((string)v).Trim().ToLowerInvariant();
+                }
+                if (!o.TryGetValue("startedAt", out v) || !TryIsoTime(v, out lockStarted))
+                {
+                    return "daemon 锁文件缺合法 startedAt：" + lockFile;
+                }
             }
             catch (Exception ex) { return "daemon 锁文件不可解析：" + ex.Message; }
+
             if (lockPid != daemonPid)
             {
                 return "daemon 锁文件记录的 pid=" + lockPid + " 与状态文件 daemonPid=" + daemonPid +
                     " 不一致（PID 可能已被复用），拒绝结束";
             }
+            if (!string.IsNullOrEmpty(instanceId))
+            {
+                if (!string.Equals(lockInstance, instanceId, StringComparison.OrdinalIgnoreCase))
+                {
+                    return "daemon 锁文件的 instanceId 与状态文件不一致（锁可能属于另一个实例），拒绝结束";
+                }
+            }
+            else if (!string.IsNullOrEmpty(lockInstance))
+            {
+                // 状态是旧版（没有 instanceId），锁却有：两者不是同一代记录，拒绝。
+                return "daemon 锁文件带 instanceId 而状态文件没有（新旧记录混用），拒绝结束";
+            }
+
+            // 启动时间必须与锁写入时间吻合：PID 被复用、或者锁是上一份 daemon 留下的，
+            // 这一步都会把它挡下来。daemon 写完锁就进入服务流程，误差只来自进程启动本身。
+            DateTime processStart;
+            string startProblem = ProcessStartTime(daemonPid, out processStart);
+            if (!string.IsNullOrEmpty(startProblem)) return startProblem;
+            TimeSpan skew = processStart - lockStarted.ToUniversalTime();
+            if (skew < TimeSpan.FromSeconds(-10) || skew > TimeSpan.FromSeconds(15))
+            {
+                return "pid=" + daemonPid + " 的启动时间与 daemon 锁记录的 startedAt 不吻合，拒绝结束";
+            }
+
             string commandLine = CommandLineOf(daemonPid);
             if (string.IsNullOrEmpty(commandLine))
             {
@@ -1220,7 +1358,62 @@ namespace WorkDaddyTray
             {
                 return "pid=" + daemonPid + " 的命令行不像本安装的 daemon，拒绝结束";
             }
+            if (!string.IsNullOrEmpty(instanceId))
+            {
+                string needle = "--workdaddy-instance-id=" + instanceId;
+                if (commandLine.IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    return "pid=" + daemonPid + " 的命令行不带本实例的 instanceId，拒绝结束";
+                }
+            }
             return "";
+        }
+
+        private static string ProcessStartTime(int pid, out DateTime startUtc)
+        {
+            startUtc = DateTime.MinValue;
+            try
+            {
+                using (Process proc = Process.GetProcessById(pid))
+                {
+                    startUtc = proc.StartTime.ToUniversalTime();
+                    return "";
+                }
+            }
+            catch (Exception ex)
+            {
+                return "无法读取 pid=" + pid + " 的启动时间：" + ex.Message;
+            }
+        }
+
+        // 本实例（instanceId 一致）的 daemon 进程：命令行同时带本安装的 daemon.js 和
+        // 这个 ID。只用来确认「还有没有残留」，绝不用来批量结束进程。
+        private static List<int> FindInstanceDaemons(string instanceId)
+        {
+            List<int> pids = new List<int>();
+            if (string.IsNullOrEmpty(instanceId)) return pids;
+            string expected = Path.Combine(s_scripts, "daemon.js");
+            string needle = "--workdaddy-instance-id=" + instanceId;
+            try
+            {
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'node.exe'"))
+                using (ManagementObjectCollection rows = searcher.Get())
+                {
+                    foreach (ManagementObject mo in rows)
+                    {
+                        string cmd = mo["CommandLine"] as string;
+                        if (string.IsNullOrEmpty(cmd)) continue;
+                        if (!PathMatches(cmd, expected)) continue;
+                        if (cmd.IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        int pid;
+                        try { pid = Convert.ToInt32(mo["ProcessId"]); } catch { continue; }
+                        if (pid > 0 && ProcessAlive(pid)) pids.Add(pid);
+                    }
+                }
+            }
+            catch { }
+            return pids;
         }
 
         // daemon 在数据目录不可写时会退到临时目录的哈希锁（见 daemon.js）。这里按同一
@@ -1241,24 +1434,54 @@ namespace WorkDaddyTray
             catch { return ""; }
         }
 
-        // 兜底结束：先重新验证一次归属（两次检查之间 PID 可能已被复用），再结束。
-        private static bool KillProofedDaemon(int daemonPid, out string error)
+        // 结束「已证明归属」的进程：结束前重新读命令行，确认还是同一份脚本 + 同一个
+        // instanceId；结束后必须等到真的退出。超时 / 读不到命令行 / 身份不符都是失败，
+        // 绝不在超时后默认返回成功。
+        private static bool KillOwnedProcess(int pid, string role, string instanceId, out string error)
         {
             error = "";
-            if (daemonPid <= 0) { error = "无法确定 daemon 的 pid，拒绝结束"; return false; }
-            if (!ProcessAlive(daemonPid)) return true;
-            string proof = DaemonOwnershipProof(daemonPid);
-            if (!string.IsNullOrEmpty(proof)) { error = proof; return false; }
+            if (pid <= 0) { error = "无法确定 " + role + " 的 pid，拒绝结束"; return false; }
+            if (!ProcessAlive(pid)) return true;
+            string expected = Path.Combine(s_scripts, role == "watchdog" ? "watchdog.js" : "daemon.js");
+            string commandLine = CommandLineOf(pid);
+            if (string.IsNullOrEmpty(commandLine))
+            {
+                error = "无法读取 pid=" + pid + " 的命令行，拒绝结束";
+                return false;
+            }
+            if (!PathMatches(commandLine, expected))
+            {
+                error = "pid=" + pid + " 的命令行不像本安装的 " + role + "，拒绝结束";
+                return false;
+            }
+            if (!string.IsNullOrEmpty(instanceId))
+            {
+                string needle = "--workdaddy-instance-id=" + instanceId;
+                if (commandLine.IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    error = "pid=" + pid + " 的 instanceId 与状态文件不一致，拒绝结束";
+                    return false;
+                }
+            }
             try
             {
-                using (Process proc = Process.GetProcessById(daemonPid)) { proc.Kill(); }
+                using (Process proc = Process.GetProcessById(pid))
+                {
+                    if (proc.HasExited) return true;
+                    proc.Kill();
+                    if (!proc.WaitForExit(StopConfirmMs()))
+                    {
+                        error = "结束 " + role + "（pid=" + pid + "）超时，进程仍在运行";
+                        return false;
+                    }
+                    return proc.HasExited;
+                }
             }
             catch (Exception ex)
             {
-                error = "结束 daemon pid=" + daemonPid + " 失败：" + ex.Message;
+                error = "结束 " + role + "（pid=" + pid + "）失败：" + ex.Message;
                 return false;
             }
-            return true;
         }
 
         private static bool PathMatches(string commandLine, string expectedPath)
@@ -1330,16 +1553,36 @@ namespace WorkDaddyTray
             return true;
         }
 
-        // daemon 真的不在了 = 记录的 pid 已退出 **且** 本 profile 的 /api/status 无人应答。
-        // 只看 pid 会漏掉「父进程死了、孙进程还在服务」；只看端口会漏掉「还没开始监听」。
-        // daemonPid 缺失（旧版记录）时只剩端口这一条证据，确认不了就返回 false。
-        private static bool WaitForDaemonExit(int daemonPid, int timeoutMs)
+        // daemon 真的不在了 = 记录的 pid 已退出 **且** 本 profile 的 /api/status 无人应答
+        // **且** 没有同 instanceId 的残留进程，并且这三条连续成立至少 1500ms。
+        // 只看一次会被「孙进程延迟接管端口」骗过去；只看 pid 会漏掉孙进程；只看端口
+        // 会漏掉「还没开始监听」的启动竞态。
+        private static bool WaitForDaemonExit(int daemonPid, string instanceId, int timeoutMs)
         {
             int waited = 0;
+            int stable = 0;
+            DateTime lastScan = DateTime.MinValue;
+            bool noInstanceProc = true;
             while (true)
             {
                 bool pidGone = daemonPid <= 0 || !ProcessAlive(daemonPid);
-                if (pidGone && FindDaemonPort() <= 0) return true;
+                bool portQuiet = FindDaemonPort() <= 0;
+                if (pidGone && portQuiet)
+                {
+                    // WMI 全表扫描很贵：最多 1s 一次，足够覆盖 1500ms 的稳定窗口。
+                    if ((DateTime.UtcNow - lastScan).TotalMilliseconds >= 1000)
+                    {
+                        noInstanceProc = FindInstanceDaemons(instanceId).Count == 0;
+                        lastScan = DateTime.UtcNow;
+                    }
+                    if (noInstanceProc)
+                    {
+                        stable += 200;
+                        if (stable >= 1500) return true;
+                    }
+                    else stable = 0;
+                }
+                else stable = 0;
                 if (waited >= timeoutMs) return false;
                 Thread.Sleep(200);
                 waited += 200;
@@ -1769,9 +2012,12 @@ namespace WorkDaddyTray
                 string pid = o.TryGetValue("pid", out v) ? Convert.ToString(v) : "";
                 string dataDir = o.TryGetValue("dataDir", out v) ? Convert.ToString(v) : "";
                 int daemonPid = o.TryGetValue("daemonPid", out v) && v is double ? (int)(double)v : 0;
-                string proof = daemonPid > 0 ? DaemonOwnershipProof(daemonPid) : "n/a";
-                return "profile=" + profile + " state=" + state + " watchdog=" + pid +
+                string instanceId = o.TryGetValue("instanceId", out v) ? Convert.ToString(v) : "";
+                int schema = o.TryGetValue("schema", out v) && v is double ? (int)(double)v : 0;
+                string proof = daemonPid > 0 ? DaemonOwnershipProof(daemonPid, instanceId) : "n/a";
+                return "schema=" + schema + " profile=" + profile + " state=" + state + " watchdog=" + pid +
                     " daemon=" + (daemonPid > 0 ? daemonPid.ToString() : "(none)") +
+                    " instance=" + (string.IsNullOrEmpty(instanceId) ? "(none)" : instanceId) +
                     " dataDir=" + dataDir +
                     " proof=" + (proof.Length == 0 ? "ok" : proof);
             }
