@@ -141,7 +141,7 @@
     "upstreamFileHashesByVersionNote": "部署闸门把任一已知上游代际都判为 pristine-upstream：装 1.2.20 或 1.2.22 原版都说明「没打过我们的补丁」，覆盖都会丢上游修复，都该中止。只按最新代际判会漏掉旧安装。",
     "localFileHashes": {
       "daemon.js": {
-        "sha256": "23bd43f916c535b1861227456e5fc3b66a2a9c2417146d626a88c4fb876a4867",
+        "sha256": "f2ce7409f6ba1b9cc743b196389142fd8f97485fda02a41ab56a8e55423b1eb6",
         "size": 777145
       },
       "inject.js": {
