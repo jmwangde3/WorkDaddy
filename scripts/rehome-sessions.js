@@ -103,6 +103,161 @@ async function dedupeBackgroundSessions(db, dataRoot, opts = {}) {
   return { ...result, mode, plan };
 }
 
+/**
+ * spaces 是**账号级**实体：客户端按 `spaces.user_id = 当前 uid` 渲染左侧分组。
+ * 只接管 sessions.user_id 时，分组仍留在原账号名下 → 切号后「会话在最近列表、
+ * 分组不见了」。这里按 name 做幂等镜像：目标账号缺哪个分组就补一份（新 id，
+ * 不删原账号的那份），再把目标账号下挂在「别人同名分组」上的会话改挂到自己的
+ * 同名分组。切回原账号时它自己那份还在，两边都能看到同一套分组。
+ */
+const SPACE_ACTIVE = "COALESCE(status, 'active') = 'active' AND (deleted_at IS NULL OR deleted_at = -1)";
+
+async function planSpaceMirror(db, targetUid) {
+  const hasSpaces = await db.all(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'spaces'"
+  );
+  if (!hasSpaces || !hasSpaces.length) {
+    return { available: false, templates: 0, inserts: [], remaps: [] };
+  }
+  const rows = await db.all(
+    `SELECT id, user_id, device_id, name, primary_folder_path, create_folder_path,
+            pinned, sort_order, status, transport, conversation_origin, source_kind, created_at
+       FROM spaces WHERE ${SPACE_ACTIVE}
+      ORDER BY COALESCE(sort_order, 999999) ASC, created_at ASC`
+  );
+  // 同一 name 在多个账号下各有一份：统一取最早创建的那份当模板，结果与切号顺序无关。
+  const byName = new Map();
+  for (const row of rows) {
+    const name = String(row.name || '');
+    if (!name) continue;
+    const cur = byName.get(name);
+    if (!cur || Number(row.created_at) < Number(cur.created_at)) byName.set(name, row);
+  }
+  const targetByName = new Map(
+    rows.filter((r) => String(r.user_id) === targetUid).map((r) => [String(r.name), r])
+  );
+  const inserts = [];
+  const remaps = [];
+  const own = [];
+  for (const [name, tpl] of byName) {
+    const mine = targetByName.get(name);
+    const targetId = mine ? String(mine.id) : crypto.randomUUID();
+    if (!mine) inserts.push({ template: tpl, id: targetId, name });
+    own.push({ id: targetId, name });
+    const srcIds = rows
+      .filter((r) => String(r.name) === name && String(r.user_id) !== targetUid)
+      .map((r) => String(r.id))
+      .filter((id) => id !== targetId);
+    if (srcIds.length) remaps.push({ name, targetId, srcIds });
+  }
+  return { available: true, templates: byName.size, inserts, remaps, own };
+}
+
+/** 统一斜杠 + 小写，只用于路径前缀比较。 */
+function normalizePath(p) {
+  return String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+/**
+ * 把「没挂分组的会话」按 cwd 归位：会话所在目录落在某个分组目录之下（含子目录）
+ * 就归到那个分组。分组目录 = <root>/<space name>，root 取该账号已归组会话的众数根，
+ * 避免不同机器/不同工作区根时猜错。
+ */
+async function planCwdAdoption(db, targetUid, ownSpaces) {
+  if (!ownSpaces || !ownSpaces.length) return { bySpace: [], total: 0 };
+  const anchored = await db.all(
+    `SELECT s.cwd AS cwd, sp.name AS name
+       FROM sessions s JOIN spaces sp ON sp.id = s.space_id
+      WHERE s.space_id IS NOT NULL AND s.cwd IS NOT NULL AND s.cwd <> ''`
+  );
+  const roots = new Map();
+  for (const row of anchored) {
+    const name = String(row.name || '');
+    const cwd = normalizePath(row.cwd);
+    if (!name) continue;
+    const idx = cwd.lastIndexOf('/' + name.toLowerCase());
+    if (idx <= 0) continue;
+    const root = cwd.slice(0, idx);
+    roots.set(root, (roots.get(root) || 0) + 1);
+  }
+  let root = '';
+  let best = 0;
+  for (const [candidate, n] of roots) {
+    if (n > best) { best = n; root = candidate; }
+  }
+  if (!root) return { bySpace: [], total: 0, root: null };
+
+  const loose = await db.all(
+    "SELECT id, cwd FROM sessions WHERE user_id = ? AND space_id IS NULL AND cwd IS NOT NULL AND cwd <> ''",
+    [targetUid]
+  );
+  const groups = new Map();
+  for (const row of loose) {
+    const cwd = normalizePath(row.cwd);
+    let hit = null;
+    for (const sp of ownSpaces) {
+      const name = String(sp.name || '').toLowerCase();
+      if (!name) continue;
+      if (cwd === root + '/' + name || cwd.startsWith(root + '/' + name + '/')) {
+        // 同名多义时取最长名，避免 workspace 抢走 xx-workspace
+        if (!hit || name.length > hit.name.length) hit = { id: sp.id, name: sp.name };
+      }
+    }
+    if (!hit) continue;
+    if (!groups.has(hit.id)) groups.set(hit.id, { spaceId: hit.id, name: hit.name, ids: [] });
+    groups.get(hit.id).ids.push(String(row.id));
+  }
+  const bySpace = [...groups.values()];
+  return { bySpace, total: bySpace.reduce((n, g) => n + g.ids.length, 0), root };
+}
+
+function spaceInsertStatement(insert, targetUid, now) {
+  const tpl = insert.template;
+  return {
+    sql: `INSERT INTO spaces (id, user_id, device_id, name, primary_folder_path, create_folder_path,
+            pinned, sort_order, status, transport, conversation_origin, deleted_at,
+            created_at, updated_at, source_kind)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    params: [
+      insert.id,
+      targetUid,
+      tpl.device_id || '',
+      insert.name,
+      tpl.primary_folder_path === undefined ? null : tpl.primary_folder_path,
+      tpl.create_folder_path === undefined ? null : tpl.create_folder_path,
+      Number(tpl.pinned || 0),
+      tpl.sort_order === undefined ? null : tpl.sort_order,
+      tpl.status || 'active',
+      tpl.transport || 'local',
+      tpl.conversation_origin === undefined ? null : tpl.conversation_origin,
+      -1,
+      now,
+      now,
+      tpl.source_kind === undefined ? 'seed' : tpl.source_kind,
+    ],
+  };
+}
+
+async function countSpaceRemaps(db, remaps, targetUid, scope) {
+  let total = 0;
+  const detail = [];
+  // 计数器要在「改 user_id 之前」看清最终归属：既算已经属于目标账号的行，
+  // 也算本次会被接管的行（同一事务里先改 user_id、再改 space_id）。
+  const inScope = scope && scope.where ? ` OR (${scope.where})` : '';
+  const inScopeParams = scope && scope.where ? (scope.params || []) : [];
+  for (const rm of remaps) {
+    const placeholders = rm.srcIds.map(() => '?').join(', ');
+    const row = await db.all(
+      `SELECT COUNT(*) AS n FROM sessions WHERE space_id IN (${placeholders}) AND (user_id = ?${inScope})`,
+      [...rm.srcIds, targetUid, ...inScopeParams]
+    );
+    const n = Number((row && row[0] && row[0].n) || 0);
+    if (n > 0) detail.push({ name: rm.name, sessions: n });
+    total += n;
+  }
+  return { total, detail };
+}
+
 function createRehomeRunner(options = {}) {
   const dataDir = String(options.dataDir || '');          // WorkDaddy 配置/备份目录
   const dataRoot = String(options.dataRoot || '');        // WorkBuddy 状态根（含 projects/）
@@ -324,6 +479,25 @@ function createRehomeRunner(options = {}) {
     const byUid = rows.map((r) => ({ uid: String(r.user_id || ''), count: Number(r.n || 0) }));
     const affected = byUid.filter((r) => r.uid !== targetUid).reduce((sum, r) => sum + r.count, 0);
 
+    // 分组（spaces）也要跟着账号走：镜像缺的分组 + 把会话改挂到自己的同名分组。
+    const mirror = await planSpaceMirror(db, targetUid);
+    const remapCounts = mirror.remaps.length
+      ? await countSpaceRemaps(db, mirror.remaps, targetUid, scope)
+      : { total: 0, detail: [] };
+    // 上一轮可能只改了 user_id 没挂分组：按 cwd 落点把散落在「最近列表」的会话归位。
+    const adoption = mirror.available ? await planCwdAdoption(db, targetUid, mirror.own) : { bySpace: [], total: 0 };
+    const spaceReport = {
+      available: mirror.available,
+      templates: mirror.templates,
+      created: mirror.inserts.map((i) => i.name),
+      remapped: remapCounts.total,
+      remappedDetail: remapCounts.detail,
+      adopted: adoption.total,
+      adoptedDetail: adoption.bySpace.map((g) => ({ name: g.name, sessions: g.ids.length })),
+      root: adoption.root || null,
+    };
+    const spaceWrites = mirror.inserts.length + remapCounts.total + adoption.total;
+
     // 老库有 -1 行且用户没有显式承认 → 不写库。这不是「提醒」，是硬停：
     // 我们无法证明这些行是活的还是回收站，改归属可能把已删会话搬给新账号。
     if (ambiguity.blocking && !ambiguity.acknowledged && !dryRun) {
@@ -344,6 +518,7 @@ function createRehomeRunner(options = {}) {
       return {
         ok: true, dryRun: true, affected, byUid, backup: null,
         scope: scope.description, scopeReport, ambiguity,
+        spaces: spaceReport,
         blocked: ambiguity.blocking && !ambiguity.acknowledged,
         dedupe: { skipped: 'manual-only' },
       };
@@ -351,7 +526,7 @@ function createRehomeRunner(options = {}) {
 
     // WAL 模式下直接复制主库文件会拿到不完整快照，用 VACUUM INTO 生成一致性备份。
     let backupPath = null;
-    if (affected > 0) {
+    if (affected > 0 || spaceWrites > 0) {
       fs.mkdirSync(backupRoot, { recursive: true });
       backupPath = path.join(backupRoot, `workbuddy-${stamp()}.db`);
       await db.run(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
@@ -359,10 +534,29 @@ function createRehomeRunner(options = {}) {
     }
 
     const statements = [];
+    // 顺序有语义：先改会话归属，再补分组，最后把会话改挂到目标账号自己的同名分组。
     if (affected > 0) {
       statements.push({
         sql: `UPDATE sessions SET user_id = ? WHERE ${scope.where} AND user_id <> ?`,
         params: [targetUid, ...scope.params, targetUid],
+      });
+    }
+    const now = Date.now();
+    for (const insert of mirror.inserts) {
+      statements.push(spaceInsertStatement(insert, targetUid, now));
+    }
+    for (const rm of mirror.remaps) {
+      const placeholders = rm.srcIds.map(() => '?').join(', ');
+      statements.push({
+        sql: `UPDATE sessions SET space_id = ? WHERE user_id = ? AND space_id IN (${placeholders})`,
+        params: [rm.targetId, targetUid, ...rm.srcIds],
+      });
+    }
+    for (const group of adoption.bySpace) {
+      const placeholders = group.ids.map(() => '?').join(', ');
+      statements.push({
+        sql: `UPDATE sessions SET space_id = ? WHERE id IN (${placeholders}) AND space_id IS NULL`,
+        params: [group.spaceId, ...group.ids],
       });
     }
     let changed = null;
@@ -375,6 +569,7 @@ function createRehomeRunner(options = {}) {
       affected: changed === null ? affected : changed,
       byUid, backup: backupPath, backend: db.backend,
       scope: scope.description, scopeReport, ambiguity,
+      spaces: spaceReport,
       dedupe: { skipped: 'manual-only' },
     };
   }

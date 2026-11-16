@@ -12,9 +12,25 @@
 |---|---|---|
 | 全局层 | skill / mcp / 插件 / 规则 / 设置 / 工作区文件 / 消息 JSONL / 产物 / `workspaces` 表 / `workspace_trust_decisions` | **不动**，无账号维度，切号天然还在 |
 | 断点一 | `sessions.user_id` | **本改造**：切号后原地改归属 |
+| 断点三 | `spaces.user_id`（左侧分组） | **本改造**：按 name 幂等镜像 + 会话改挂 + cwd 归位 |
 | 断点二 | `<uuid>/startup-route.json` | `setup-rehome.ps1` 一次性硬链接 |
 | 工作记忆 | `user-<uuid>-personal/MEMORY.md` | `setup-rehome.ps1` 一次性硬链接 |
 | 人设 / 专家团 / 账号级 memory | 实测三份内容全同 / 全为空壳 / 全局 | 不动 |
+
+### 1.1 为什么必须一起接管 `spaces`
+
+客户端只渲染 `spaces.user_id = 当前 uid` 的分组。只改 `sessions.user_id` 时，
+分组仍挂在原账号名下 —— 切回原账号（或被切到的账号）表现为「会话还在最近列表、
+左侧分组不见了」。所以 rehome 现在在一个事务里做四件事：
+
+1. `sessions.user_id` → 当前账号；
+2. **spaces 镜像**：以全库同名分组中最早创建的那份为模板，给当前账号补缺（新 id，
+   原账号那份保留 —— 切回去它自己那套还在）；
+3. **改挂**：`sessions.space_id` 从「别人同名分组」改到当前账号自己的同名分组；
+4. **cwd 归位**：`space_id IS NULL` 的会话，若 cwd 落在 `<root>/<分组名>/…` 之下
+   （root 取该账号已归组会话的众数根），就归到那个分组，不再散在最近列表。
+
+全部幂等：第二次执行零写入、零备份。回归用例 `test/rehome-spaces.test.js`。
 
 **rehome = 一条 `UPDATE sessions SET user_id = ?`**，单事务完成。会话 ID 不变、始终只有一份、零复制、零分叉。与 WorkDaddy 自带的「复制会话」（生成新 ID + 复制 JSONL/产物 + 插一行）互斥，本模式优先。
 
@@ -42,6 +58,7 @@ autoCopyJob / automationSync   # WorkDaddy 原有流程照常
 | `scripts/inject.js` | 改 | 「会话」Tab 新增「接管会话归属」开关（`wbs-sess-rehome`），状态/事件/批量模式联动 |
 | `scripts/setup-rehome.ps1` | 新增 | 一次性硬链接 `startup-route.json` 与 `MEMORY.md`，支持 `-DryRun`、自动发现账号目录、自动备份、幂等 |
 | `test/rehome-sessions.test.js` | 新增 | 临时库回归测试：干跑不写、排除口径、备份、幂等、开关、空 uid |
+| `test/rehome-spaces.test.js` | 新增 | 分组镜像回归：补缺不重复、原账号那份保留、会话改挂、cwd 归位、二次执行零写入、切回原账号分组齐全 |
 
 ## 3. 安装与启用
 
