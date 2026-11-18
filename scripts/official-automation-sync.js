@@ -88,6 +88,12 @@ function isLive(row) {
   return row.deleted_at == null && row.status !== 'ARCHIVED';
 }
 
+// 两种归属模型：
+//   move（默认）同一任务全局只有一行，切号时把 owner_user_id 转给目标账号；
+//   copy（旧模型）每个账号各复制一行，切号时保证每个账号都有一份。
+// move 解决「一个定时任务每个账号各一条」：任务跟着当前登录账号走，不产生副本。
+const SYNC_MODES = new Set(['move', 'copy']);
+
 function mappingGraph(mapping) {
   const graph = new Map();
   const connect = (left, right) => {
@@ -150,10 +156,51 @@ function createOfficialAutomationSync(options = {}) {
   const idFactory = options.idFactory || (() => crypto.randomUUID());
   if (!db || typeof db.all !== 'function') throw new TypeError('缺少官方定时任务数据库');
 
+  function resolveMode() {
+    if (typeof options.getMode === 'function') {
+      try { return SYNC_MODES.has(options.getMode()) ? options.getMode() : 'move'; } catch (_) { return 'move'; }
+    }
+    return SYNC_MODES.has(options.mode) ? options.mode : 'move';
+  }
+
+  // 旧版 WorkBuddy 的 automations 表还没有 space_id 列；missing 时按无分组处理。
+  let spaceColumn = null;
+  async function hasSpaceColumn() {
+    if (spaceColumn !== null) return spaceColumn;
+    try { await db.all('SELECT space_id FROM automations LIMIT 1'); spaceColumn = true; }
+    catch (_) { spaceColumn = false; }
+    return spaceColumn;
+  }
+
+  async function readSpaceId(id) {
+    if (!(await hasSpaceColumn())) return '';
+    try {
+      const rows = await db.all('SELECT space_id FROM automations WHERE id = ? LIMIT 1', [id]);
+      return rows.length && rows[0].space_id != null ? String(rows[0].space_id).trim() : '';
+    } catch (_) { return ''; }
+  }
+
+  // 任务转移账号后，分组引用必须改成目标账号自己的同名分组，否则客户端会引用
+  // 别的账号的分组行。找不到同名分组就置空，宁可不分组也不跨账号悬空。
+  async function resolveSpaceFor(spaceId, targetUid) {
+    if (!spaceId) return '';
+    try {
+      const rows = await db.all('SELECT name FROM spaces WHERE id = ? LIMIT 1', [spaceId]);
+      const name = rows.length ? String(rows[0].name || '').trim() : '';
+      if (!name) return '';
+      const target = await db.all(
+        'SELECT id FROM spaces WHERE user_id = ? AND name = ? AND COALESCE(deleted_at, -1) = -1 ORDER BY created_at ASC LIMIT 1',
+        [targetUid, name]
+      );
+      return target.length ? String(target[0].id).trim() : '';
+    } catch (_) { return ''; }
+  }
+
   async function reconcile(sourceValue, targetValue) {
     const sourceUid = cleanUid(sourceValue);
     const targetUid = cleanUid(targetValue);
-    const result = { copied: 0, updated: 0, removed: 0, skipped: 0, total: 0 };
+    const mode = resolveMode();
+    const result = { mode, copied: 0, updated: 0, moved: 0, removed: 0, skipped: 0, total: 0 };
     if (!sourceUid || !targetUid || sourceUid === targetUid) return result;
 
     // Reconcile the union for all saved accounts, including a third account's
@@ -199,7 +246,51 @@ function createOfficialAutomationSync(options = {}) {
     const freshnessOrder = (a, b) => taskFreshness(b) - taskFreshness(a) ||
       Number(b.owner_user_id === sourceUid) - Number(a.owner_user_id === sourceUid) ||
       nodeKey(a.owner_user_id, a.id).localeCompare(nodeKey(b.owner_user_id, b.id));
-    for (const members of groups) {
+    if (mode === 'move') {
+      const withSpace = await hasSpaceColumn();
+      const transferSql = withSpace
+        ? 'UPDATE automations SET owner_user_id = ?, space_id = ? WHERE id = ? AND owner_user_id = ?'
+        : 'UPDATE automations SET owner_user_id = ? WHERE id = ? AND owner_user_id = ?';
+      for (const members of groups) {
+        if (!members.length) continue;
+        // 同 copy 模型：一次真实的定义修改压过「只是跑过一次」的更新时间。
+        const changed = members.filter((row) => {
+          const previous = snapshots[nodeKey(row.owner_user_id, row.id)];
+          return previous && previous !== fingerprint(row);
+        });
+        const canonical = [...(changed.length ? changed : members)].sort(freshnessOrder)[0];
+        // 规范行已删除：删除同步到所有副本，反向切号也不复活。
+        if (!isLive(canonical)) {
+          for (const row of members) if (isLive(row)) retired[nodeKey(row.owner_user_id, row.id)] = true;
+          continue;
+        }
+        result.total++;
+        // 其余副本一律停用（软删除，可恢复）：同一任务全局只留一行。
+        for (const row of members) {
+          if (row.id === canonical.id || !isLive(row)) continue;
+          retired[nodeKey(row.owner_user_id, row.id)] = true;
+        }
+        if (canonical.owner_user_id === targetUid) {
+          result.skipped++;
+          nextSnapshots[nodeKey(targetUid, canonical.id)] = fingerprint(canonical);
+          continue;
+        }
+        if (withSpace) {
+          const ownSpace = await readSpaceId(canonical.id);
+          const nextSpace = ownSpace ? await resolveSpaceFor(ownSpace, targetUid) : '';
+          statements.push({ sql: transferSql, params: [targetUid, nextSpace || null, canonical.id, canonical.owner_user_id] });
+        } else {
+          statements.push({ sql: transferSql, params: [targetUid, canonical.id, canonical.owner_user_id] });
+        }
+        mapping[taskKey(canonical.owner_user_id, canonical.id, targetUid)] = {
+          targetAutomationId: canonical.id,
+          sourceUpdatedAt: canonical.updated_at == null ? null : String(canonical.updated_at),
+        };
+        nextSnapshots[nodeKey(targetUid, canonical.id)] = fingerprint(canonical);
+        result.moved++;
+      }
+    }
+    if (mode === 'copy') for (const members of groups) {
       if (!members.length) continue;
       // A genuine definition edit beats an unchanged copy whose updated_at
       // merely advanced during execution. On first migration use latest edit.

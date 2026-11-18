@@ -50,9 +50,16 @@ test('account task sync scopes source tasks and preserves target edits', () => {
 test('sync setting is explicit and disabled by default', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-automation-sync-setting-'));
   try {
-    assert.deepEqual(sync.readAutomationSyncSettings(dir), { enabled: false });
-    assert.deepEqual(sync.writeAutomationSyncSettings(dir, true), { enabled: true });
-    assert.deepEqual(sync.readAutomationSyncSettings(dir), { enabled: true });
+    assert.deepEqual(sync.readAutomationSyncSettings(dir), { enabled: false, mode: 'move' });
+    assert.deepEqual(sync.writeAutomationSyncSettings(dir, true), { enabled: true, mode: 'move' });
+    assert.deepEqual(sync.readAutomationSyncSettings(dir), { enabled: true, mode: 'move' });
+    const file = path.join(dir, 'automation-sync.json');
+    fs.writeFileSync(file, JSON.stringify({ enabled: true, mode: 'copy' }));
+    assert.deepEqual(sync.readAutomationSyncSettings(dir), { enabled: true, mode: 'copy' });
+    // 开关写入不能把已有的归属模式冲掉。
+    assert.deepEqual(sync.writeAutomationSyncSettings(dir, false), { enabled: false, mode: 'copy' });
+    fs.writeFileSync(file, JSON.stringify({ enabled: true, mode: 'nonsense' }));
+    assert.deepEqual(sync.readAutomationSyncSettings(dir), { enabled: true, mode: 'move' });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

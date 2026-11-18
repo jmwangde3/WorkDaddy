@@ -738,8 +738,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 //        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
 // 1.3.1：可靠性 + 安全加固（不新增功能）。tag、本常量、package.json 三者必须一致，
 //        release.yml 会当场比对，不一致就拒绝发布。
-const DAEMON_VERSION = '1.3.6';
-const DAEMON_BUILD_ID = 'release-1.3.6-full-fork';
+const DAEMON_VERSION = '1.3.7';
+const DAEMON_BUILD_ID = 'release-1.3.7-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -5217,6 +5217,8 @@ const officialAutomationSyncEngine = PROFILE.kind === 'workbuddy'
     dataDir: DATA_DIR,
     db: SESSION_DB,
     getAccountUids: () => listAccounts(DATA_DIR).map(account => assertSessionAccountIdentity(account.uid)),
+    // move = 单份任务跟着当前账号走；copy = 旧的多账号各一份模型。
+    getMode: () => readAutomationSyncSettings(DATA_DIR).mode,
   })
   : null;
 const CODEBUDDY_SESSIONS = PROFILE.kind === 'codebuddy' ? createCodeBuddySessionStore({

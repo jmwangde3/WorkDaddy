@@ -33,7 +33,8 @@ async function fixture(t, accounts = ['a', 'b', 'h']) {
     await db.run(`INSERT INTO automations (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`, Object.values(row));
   };
   const mappingFile = path.join(dataDir, 'official-automation-sync.json');
-  const buildSync = (options = {}) => createOfficialAutomationSync({ dataDir, db, getAccountUids: () => accounts, ...options });
+  // 本文件锁定旧的多账号复制契约（mode=copy）；单份任务模型见 official-automation-sync-move.test.js。
+  const buildSync = (options = {}) => createOfficialAutomationSync({ dataDir, db, getAccountUids: () => accounts, mode: 'copy', ...options });
   const live = owner => db.all("SELECT * FROM automations WHERE owner_user_id = ? AND deleted_at IS NULL AND status <> 'ARCHIVED' ORDER BY name", [owner]);
   const names = async owner => (await live(owner)).map(r => r.name);
   return { db, insert, mappingFile, buildSync, live, names };
