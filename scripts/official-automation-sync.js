@@ -113,6 +113,26 @@ function spaceIdentityOf(row, index) {
   return record && record.name ? normalizeSpaceName(record.name) : '';
 }
 
+// 跨账号分组身份 = 规范化名称；同账号内重名时，路径用于消歧（与 resolveSpaceFor 同口径）。
+// 两条任务的「分组身份是否相同」按这个约定判定，供吸附与迁移冲突共用。
+function spaceSignature(row, index) {
+  if (!index) return { name: '', paths: [] };
+  const id = row && row.space_id != null ? String(row.space_id).trim() : '';
+  if (!id) return { name: '', paths: [] };
+  const record = index.byId ? index.byId.get(id) : index.get(id);
+  if (!record || !record.name) return { name: '', paths: [] };
+  return { name: normalizeSpaceName(record.name), paths: record.paths || [] };
+}
+
+// 名称不同必然不是同一个分组；名称相同但双方都写了目录且完全不重合，说明是两个
+// 恰好同名的不同分组 —— 这时合并/转移会动到用户两条独立的任务，必须 fail-closed。
+function spaceIdentityConflicts(left, right) {
+  if (left.name !== right.name) return true;
+  if (!left.name) return false;
+  if (!left.paths.length || !right.paths.length) return false;
+  return !left.paths.some(value => right.paths.includes(value));
+}
+
 function taskFreshness(row) {
   const value = row.updated_at ?? row.created_at;
   const number = Number(value);
@@ -285,7 +305,7 @@ function createOfficialAutomationSync(options = {}) {
   // 不能证明分组身份一致。若历史 mapping 已经把「定义相同、分组不同」的两个
   // 跨账号任务连在一起，v1 兼容会把它们全部判成未修改，move 就会误并、
   // 甚至软删掉其中一条。这种情形必须报冲突并原样保留，交给人工消歧。
-  function componentHasCrossOwnerGroupDrift(members, legacyOf, identities) {
+  function componentHasCrossOwnerGroupDrift(members, legacyOf, signatures) {
     const live = members.filter(isLive);
     for (let i = 0; i < live.length; i++) {
       for (let j = i + 1; j < live.length; j++) {
@@ -296,7 +316,7 @@ function createOfficialAutomationSync(options = {}) {
         const rightId = nodeKey(right.owner_user_id, right.id);
         // 定义本来就不同：不是「同一定义被拆到两个分组」，交给正常判定。
         if (legacyOf.get(leftId) !== legacyOf.get(rightId)) continue;
-        if ((identities.get(leftId) || '') !== (identities.get(rightId) || '')) return true;
+        if (spaceIdentityConflicts(signatures.get(leftId), signatures.get(rightId))) return true;
       }
     }
     return false;
@@ -329,6 +349,7 @@ function createOfficialAutomationSync(options = {}) {
     const { graph } = mappingGraph(mapping);
     const byNode = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), row]));
     const identities = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), spaceIdentityOf(row, spaceIndex)]));
+    const signatures = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), spaceSignature(row, spaceIndex)]));
     const hashOf = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), fingerprint(row, identities.get(nodeKey(row.owner_user_id, row.id)))]));
     const legacyOf = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), legacyFingerprint(row)]));
     // 旧快照既可能是 v1（纯定义），也可能是 v2；两者都算「未修改」，
@@ -350,6 +371,15 @@ function createOfficialAutomationSync(options = {}) {
       if (members.length) groups.push(members);
     }
 
+    // 两条 live 行是否只是「恰好同名」：定义相同但分组身份冲突。
+    const spaceSplit = (candidate, group) => group.some(other => {
+      if (!isLive(other)) return false;
+      const left = nodeKey(other.owner_user_id, other.id);
+      const right = nodeKey(candidate.owner_user_id, candidate.id);
+      if (legacyOf.get(left) !== legacyOf.get(right)) return false;
+      return spaceIdentityConflicts(signatures.get(left), signatures.get(right));
+    });
+
     // Adopt identical pre-existing copies one-to-one across different owners.
     // Never collapse intentionally separate tasks in the same account, nor
     // once tasks whose scheduled dates differ. 分组身份已进入 fingerprint，
@@ -359,6 +389,8 @@ function createOfficialAutomationSync(options = {}) {
       const groupHashes = new Set(groups[i].filter(isLive).map(r => hashOf.get(nodeKey(r.owner_user_id, r.id))));
       for (let j = i + 1; j < groups.length; j++) {
         if (!groups[j].length || groups[j].some(r => ownersInGroup.has(r.owner_user_id))) continue;
+        // 同名不同路径的两个分组属于不同任务：不吸附，也不在后续 move 里合并。
+        if (groups[j].some(r => isLive(r) && groupHashes.has(hashOf.get(nodeKey(r.owner_user_id, r.id))) && spaceSplit(r, groups[i]))) continue;
         if (!groups[j].some(r => isLive(r) && groupHashes.has(hashOf.get(nodeKey(r.owner_user_id, r.id))))) continue;
         groups[j].forEach(r => {
           ownersInGroup.add(r.owner_user_id);
@@ -371,6 +403,9 @@ function createOfficialAutomationSync(options = {}) {
 
     const stats = { copied: 0, updated: 0, moved: 0, removed: 0, skipped: 0, total: 0, conflicts: 0 };
     const statements = [];
+    // 即将写入的分组引用：id -> 期望的归属账号。分组索引是事务外预取的，
+    // 提交前必须确认这些分组仍然存活且确实属于该账号，否则会写出悬空引用。
+    const spaceWrites = new Map();
     const usedIds = new Set(rows.map(r => r.id));
     const freshnessOrder = (a, b) => taskFreshness(b) - taskFreshness(a) ||
       Number(b.owner_user_id === sourceUid) - Number(a.owner_user_id === sourceUid) ||
@@ -389,7 +424,7 @@ function createOfficialAutomationSync(options = {}) {
         }
         // 旧 mapping 已把「定义相同、分组不同」的跨账号任务连在一起：v1 兼容
         // 会把它们都判成未修改，继续执行就会误并/误删。原样保留并报冲突。
-        if (componentHasCrossOwnerGroupDrift(members, legacyOf, identities)) {
+        if (componentHasCrossOwnerGroupDrift(members, legacyOf, signatures)) {
           stats.conflicts++;
           continue;
         }
@@ -415,6 +450,7 @@ function createOfficialAutomationSync(options = {}) {
         }
         const ownSpace = withSpace && canonical.space_id != null ? String(canonical.space_id).trim() : '';
         const nextSpace = ownSpace ? resolveSpaceFor(ownSpace, targetUid, spaceIndex) : '';
+        if (nextSpace) spaceWrites.set(nextSpace, targetUid);
         statements.push({
           sql: transferSql,
           params: withSpace
@@ -454,6 +490,7 @@ function createOfficialAutomationSync(options = {}) {
         // 的同名分组，两边哈希相等，只比哈希会跳过 UPDATE，让跨账号悬空引用留下来。
         const spaceChanged = withSpace && ownerSpace !== null
           && String(row ? (row.space_id || '') : '') !== String(ownerSpace || '');
+        if (ownerSpace) spaceWrites.set(ownerSpace, owner);
         if (!row) {
           const id = String(idFactory());
           if (!/^[0-9a-f-]{8,128}$/i.test(id) || usedIds.has(id)) throw new Error('官方定时任务 ID 无效');
@@ -500,6 +537,22 @@ function createOfficialAutomationSync(options = {}) {
         guard: true,
       });
       stats.removed++;
+    }
+
+    // 分组索引是事务外预取的，提交前在这里复核一次：预取之后分组若被删除、
+    // 软删或改属，写进去就是跨账号悬空引用。发现变化整笔回滚，下一轮重新取。
+    if (withSpace && spaceWrites.size) {
+      const ids = [...spaceWrites.keys()];
+      const found = await read(
+        `SELECT id, user_id FROM spaces WHERE id IN (${ids.map(() => '?').join(', ')}) AND COALESCE(deleted_at, -1) = -1`,
+        ids
+      );
+      const alive = new Map(found.map(row => [String(row.id), String(row.user_id || '')]));
+      for (const [id, owner] of spaceWrites) {
+        if (alive.get(id) !== String(owner)) {
+          throw new Error('分组在同步期间被删除或改属，本次同步已回滚');
+        }
+      }
     }
 
     return { stats, statements, lineage, snapshots: nextSnapshots, retired: nextRetired, inserts, mode };
@@ -571,6 +624,13 @@ function createOfficialAutomationSync(options = {}) {
     const result = { mode, copied: 0, updated: 0, moved: 0, removed: 0, skipped: 0, total: 0, conflicts: 0 };
     if (!sourceUid || !targetUid || sourceUid === targetUid) return result;
 
+    // 能力检查必须在写 pending 之前：否则不支持事务的后端会留下一条永远没人能
+    // 处理的欠账，恢复流程每次都会失败重试，永远清不掉。
+    const supportsTx = typeof db.writeTransaction === 'function';
+    if (!supportsTx) {
+      throw new Error('当前数据库后端不支持事务内读取，已拒绝定时任务同步');
+    }
+
     // 阶段 A：先落盘恢复意图，再做任何数据库读取。这样「读取阶段就失败」
     // 也留下记录，restart 后能续做，不会把问题永久留给用户。
     // 重试沿用原始 at（见 writePendingIntent），FIFO 顺序才稳定。
@@ -578,13 +638,6 @@ function createOfficialAutomationSync(options = {}) {
     const mapping = readMapping(mappingFile);
     const state = mapping.__syncState || {};
     const pending = Array.isArray(state.pending) ? state.pending : [];
-
-    // 没有回调式事务的后端无法保证「读取与写入同一事务」：updated_at 守卫与
-    // retired 后置都依赖该保证，copy 与 move 一视同仁，一律拒绝降级路径。
-    const supportsTx = typeof db.writeTransaction === 'function';
-    if (!supportsTx) {
-      throw new Error('当前数据库后端不支持事务内读取，已拒绝定时任务同步');
-    }
 
     // 预取发生在 pending 落盘之后：读取阶段即使被锁，也不丢恢复记录。
     const prefetched = typeof getPrefetch === 'function'

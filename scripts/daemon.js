@@ -755,8 +755,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 //        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
 // 1.3.1：可靠性 + 安全加固（不新增功能）。tag、本常量、package.json 三者必须一致，
 //        release.yml 会当场比对，不一致就拒绝发布。
-const DAEMON_VERSION = '1.3.11';
-const DAEMON_BUILD_ID = 'release-1.3.11-full-fork';
+const DAEMON_VERSION = '1.3.12';
+const DAEMON_BUILD_ID = 'release-1.3.12-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -8481,13 +8481,24 @@ async function resumeOfficialAccountAutomations(reason) {
 // 用户关掉开关只是不想再自动同步，不代表可以永久不把欠账还上。
 // 失败则按指数退避重排，直到队列清空或账号不再匹配（下次切回再续）。
 let automationResumeTimer = null;
+let automationResumeDeadline = 0;
 let automationResumeDelay = 5000;
+function cancelAutomationResume() {
+  if (automationResumeTimer) { clearTimeout(automationResumeTimer); automationResumeTimer = null; }
+  automationResumeDeadline = 0;
+}
 function scheduleAutomationResume(reason) {
-  if (automationResumeTimer) return;
   const delay = Math.min(automationResumeDelay, 300000);
-  automationResumeDelay = Math.min(automationResumeDelay * 2, 300000);
+  const deadline = Date.now() + delay;
+  // 已有更早的定时器就留着；已有更晚的必须按当前退避重排 —— 否则切回目标账号后
+  // 还要等上一轮按「账号不匹配」排下的 60s/300s，退避状态形同虚设（复审 WD-05）。
+  if (automationResumeTimer && automationResumeDeadline <= deadline) return;
+  cancelAutomationResume();
+  automationResumeDeadline = deadline;
+  automationResumeDelay = Math.min(delay * 2, 300000);
   automationResumeTimer = setTimeout(() => {
     automationResumeTimer = null;
+    automationResumeDeadline = 0;
     pumpAutomationResume(reason).catch(() => {});
   }, delay);
   if (automationResumeTimer.unref) automationResumeTimer.unref();
@@ -8505,7 +8516,7 @@ async function pumpAutomationResume(reason) {
     scheduleAutomationResume(reason);
     return { resumed: false };
   }
-  if (!pendingAll.length) { automationResumeDelay = 5000; return { resumed: false, pending: 0 }; }
+  if (!pendingAll.length) { automationResumeDelay = 5000; cancelAutomationResume(); return { resumed: false, pending: 0 }; }
   const mine = activeUid ? pendingAll.filter(item => item.targetUid === activeUid) : [];
   if (!mine.length) {
     // 队列是别的账号的欠账：低频轮询，等切回该账号时再续做。
@@ -8513,6 +8524,8 @@ async function pumpAutomationResume(reason) {
     scheduleAutomationResume(reason);
     return { resumed: false, pending: pendingAll.length };
   }
+  // 轮到本账号了：不再等上一轮按「账号不匹配」排下的长定时器，立即重试。
+  cancelAutomationResume();
   const result = await resumeOfficialAccountAutomations(reason);
   // 「恢复了一部分」不等于「恢复完成」：只要队列里还有该账号的欠账，
   // 就必须继续排下一次重试，否则剩下的那几条会一直躺着。

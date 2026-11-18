@@ -475,3 +475,64 @@ test('部分恢复成功时 resume 必须报告剩余条数，不能只报 resum
   assert.equal(result.pending, 1, '剩余条数必须如实返回，调用方据此继续重试');
   assert.equal(sync.pendingList('b').length, 1);
 });
+
+/* ===== 第四轮复审 WD-04：分组身份约定（同名不同路径） ===== */
+
+test('同名但目录完全不同的两个分组：旧 mapping 关联时判冲突，不合并不删除', async t => {
+  const f = await fixture(t);
+  await f.space('sp-a', 'a', '工作区', { primary_folder_path: 'H:/AI工作区/甲' });
+  await f.space('sp-b', 'b', '工作区', { primary_folder_path: 'H:/AI工作区/乙' });
+  await f.insert('x1', 'a', { updated_at: 3, space_id: 'sp-a' });
+  await f.insert('x2', 'b', { updated_at: 3, space_id: 'sp-b' });
+  const [rowA] = await f.db.all('SELECT * FROM automations WHERE id = ?', ['x1']);
+  const [rowB] = await f.db.all('SELECT * FROM automations WHERE id = ?', ['x2']);
+  fs.writeFileSync(f.mappingFile, JSON.stringify({
+    'a:x1:b': { targetAutomationId: 'x2', sourceUpdatedAt: '3' },
+    __syncState: {
+      snapshots: { 'a:x1': legacyFingerprint(rowA), 'b:x2': legacyFingerprint(rowB) },
+      retired: {},
+    },
+  }));
+
+  const result = await f.buildSync()('a', 'b');
+  assert.equal(result.conflicts, 1, '同名不同路径必须按不同分组处理');
+  assert.equal(result.removed, 0, '冲突时不得软删除');
+  const rows = await f.live();
+  assert.equal(rows.length, 2, '两条任务都必须保留');
+  assert.equal(rows.find(r => r.id === 'x1').owner_user_id, 'a', '冲突时不得转移');
+});
+
+test('同名但目录完全不同的两个分组：没有历史关联时也不吸附合并', async t => {
+  const f = await fixture(t);
+  await f.space('sp-a', 'a', '工作区', { primary_folder_path: 'H:/AI工作区/甲' });
+  await f.space('sp-b', 'b', '工作区', { primary_folder_path: 'H:/AI工作区/乙' });
+  await f.insert('x1', 'a', { updated_at: 3, space_id: 'sp-a' });
+  await f.insert('x2', 'b', { updated_at: 3, space_id: 'sp-b' });
+
+  await f.buildSync()('a', 'b');
+  const rows = await f.live();
+  assert.equal(rows.length, 2, '同名不同路径不得被吸附成一条');
+  assert.equal(rows.filter(r => r.owner_user_id === 'b').length, 2, '各自随切号转移，但不合并');
+});
+
+test('同名且目录一致的跨账号分组仍然可以合并', async t => {
+  const f = await fixture(t);
+  await f.space('sp-a', 'a', '工作区', { primary_folder_path: 'H:/AI工作区/甲' });
+  await f.space('sp-b', 'b', '工作区', { primary_folder_path: 'H:/AI工作区/甲' });
+  await f.insert('x1', 'a', { updated_at: 3, space_id: 'sp-a' });
+  await f.insert('x2', 'b', { updated_at: 3, space_id: 'sp-b' });
+
+  await f.buildSync()('a', 'b');
+  const rows = await f.live();
+  assert.equal(rows.length, 1, '路径一致才是同一个分组，可以收敛成一行');
+  assert.equal(rows[0].space_id, 'sp-b', '分组引用改到目标账号自己的那一份');
+});
+
+test('不支持事务的后端不留下无法处理的 pending', async t => {
+  const f = await fixture(t);
+  await f.insert('only', 'a', { updated_at: 5 });
+  const legacy = { all: f.db.all.bind(f.db), run: f.db.run.bind(f.db) };
+  const sync = f.buildSync({ db: legacy });
+  await assert.rejects(sync('a', 'b'), /不支持事务内读取/);
+  assert.equal(sync.pendingList().length, 0, '能力检查必须先于 pending 落盘');
+});
