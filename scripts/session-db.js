@@ -445,6 +445,35 @@ function createSessionDb(options = {}) {
           if (db) { try { db.close(); } catch (_) {} }
         }
       },
+      // 回调式事务：读取、判定、写入在同一个 BEGIN IMMEDIATE 内完成，
+      // 避免「先 SELECT 再开事务」之间被客户端改动。work 抛错即整体回滚。
+      async writeTransaction(work) {
+        let db;
+        try {
+          db = new sqliteModule.DatabaseSync(dbPath);
+          db.exec('PRAGMA busy_timeout = 5000');
+          db.exec('BEGIN IMMEDIATE');
+          const tx = {
+            all(sql, params = []) {
+              const values = normalizeParameters(sql, params);
+              return db.prepare(sql).all(...values).map((row) => Object.fromEntries(Object.entries(row)));
+            },
+            run(sql, params = []) {
+              const values = normalizeParameters(sql, params);
+              const result = db.prepare(sql).run(...values);
+              return { changes: Number(result.changes), lastInsertRowid: result.lastInsertRowid };
+            },
+          };
+          const output = await work(tx);
+          db.exec('COMMIT');
+          return output;
+        } catch (error) {
+          if (db) { try { db.exec('ROLLBACK'); } catch (_) {} }
+          throw new Error(`sqlite 事务失败: ${error.message}`);
+        } finally {
+          if (db) { try { db.close(); } catch (_) {} }
+        }
+      },
     };
   }
 

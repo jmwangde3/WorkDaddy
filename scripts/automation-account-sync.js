@@ -38,12 +38,18 @@ function isScheduledTask(task) {
     typeof schedule.type === 'string' && schedule.type !== 'manual';
 }
 
+// mode: move = 同一任务只有一行，切号转移归属（默认）；copy = 每个账号各复制一份（旧行为）。
+const SYNC_MODES = new Set(['move', 'copy']);
+
 function readAutomationSyncSettings(dataDir) {
   try {
     const value = JSON.parse(fs.readFileSync(path.join(dataDir, SETTINGS_FILE), 'utf8'));
-    return { enabled: value && value.enabled === true };
+    return {
+      enabled: value && value.enabled === true,
+      mode: value && SYNC_MODES.has(value.mode) ? value.mode : 'move',
+    };
   } catch (_) {
-    return { enabled: false };
+    return { enabled: false, mode: 'move' };
   }
 }
 
@@ -57,12 +63,13 @@ function readBuiltinTaskIds(dataDir) {
 }
 
 function writeAutomationSyncSettings(dataDir, enabled) {
+  const current = readAutomationSyncSettings(dataDir);
   fs.mkdirSync(dataDir, { recursive: true });
   const file = path.join(dataDir, SETTINGS_FILE);
   const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify({ enabled: enabled === true }, null, 2) + '\n', { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify({ enabled: enabled === true, mode: current.mode }, null, 2) + '\n', { mode: 0o600 });
   fs.renameSync(tmp, file);
-  return { enabled: enabled === true };
+  return { enabled: enabled === true, mode: current.mode };
 }
 
 function readAccountAutomations(dataDir, uid) {

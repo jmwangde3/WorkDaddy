@@ -33,7 +33,8 @@ async function fixture(t, accounts = ['a', 'b', 'h']) {
     await db.run(`INSERT INTO automations (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`, Object.values(row));
   };
   const mappingFile = path.join(dataDir, 'official-automation-sync.json');
-  const buildSync = (options = {}) => createOfficialAutomationSync({ dataDir, db, getAccountUids: () => accounts, ...options });
+  // 本文件锁定旧的多账号复制契约（mode=copy）；单份任务模型见 official-automation-sync-move.test.js。
+  const buildSync = (options = {}) => createOfficialAutomationSync({ dataDir, db, getAccountUids: () => accounts, mode: 'copy', ...options });
   const live = owner => db.all("SELECT * FROM automations WHERE owner_user_id = ? AND deleted_at IS NULL AND status <> 'ARCHIVED' ORDER BY name", [owner]);
   const names = async owner => (await live(owner)).map(r => r.name);
   return { db, insert, mappingFile, buildSync, live, names };
@@ -156,10 +157,13 @@ test('failed SQL transaction is retried with the reserved lineage; concurrent ca
   const f = await fixture(t);
   await f.insert('a', 'a');
   let failOnce = true;
-  const sync = f.buildSync({ db: { ...f.db, async transaction(statements) {
-    if (failOnce) { failOnce = false; throw new Error('fixture busy'); }
-    return f.db.transaction(statements);
-  } } });
+  // 生产路径已改为 writeTransaction（读+写同事务）；两条路径都注入同一次失败，
+  // 断言「事务失败后 lineage 仍保留、下次调用可恢复」的契约不变。
+  const fail = () => { if (failOnce) { failOnce = false; throw new Error('fixture busy'); } };
+  const sync = f.buildSync({ db: { ...f.db,
+    async writeTransaction(work) { fail(); return f.db.writeTransaction(work); },
+    async transaction(statements) { fail(); return f.db.transaction(statements); },
+  } });
   await assert.rejects(sync('a', 'b'), /fixture busy/);
   await Promise.all([sync('a', 'b'), sync('a', 'h'), sync('h', 'b')]);
   for (const owner of ['a', 'b', 'h']) assert.equal((await f.live(owner)).length, 1);
