@@ -277,9 +277,17 @@ function createOfficialAutomationSync(options = {}) {
     const candidates = (spaceIndex.byOwner.get(String(targetUid)) || [])
       .filter((row) => normalizeSpaceName(row.name) === wantedName);
     if (!candidates.length) return '';
-    if (candidates.length === 1) return candidates[0].id;
-    // 目标账号存在多个同名分组：只有路径能唯一对上时才绑定，否则宁可不分组。
     const wantedPaths = new Set(record.paths || []);
+    if (candidates.length === 1) {
+      const only = candidates[0];
+      // 只有一个同名候选也不能无条件绑定：双方都写了目录且完全不重合，说明这是
+      // 两个恰好同名的不同分组。此时绑定会把任务挂到无关分组下面，与
+      // spaceIdentityConflicts() 的判定自相矛盾。宁可不分组。
+      const targetPaths = only.paths || [];
+      if (wantedPaths.size && targetPaths.length && !targetPaths.some(value => wantedPaths.has(value))) return '';
+      return only.id;
+    }
+    // 目标账号存在多个同名分组：只有路径能唯一对上时才绑定，否则宁可不分组。
     if (!wantedPaths.size) return '';
     const matched = candidates.filter((row) => row.paths.some((value) => wantedPaths.has(value)));
     return matched.length === 1 ? matched[0].id : '';
@@ -544,13 +552,19 @@ function createOfficialAutomationSync(options = {}) {
     if (withSpace && spaceWrites.size) {
       const ids = [...spaceWrites.keys()];
       const found = await read(
-        `SELECT id, user_id FROM spaces WHERE id IN (${ids.map(() => '?').join(', ')}) AND COALESCE(deleted_at, -1) = -1`,
+        `SELECT id, user_id, name FROM spaces WHERE id IN (${ids.map(() => '?').join(', ')}) AND COALESCE(deleted_at, -1) = -1`,
         ids
       );
-      const alive = new Map(found.map(row => [String(row.id), String(row.user_id || '')]));
+      const alive = new Map(found.map(row => [String(row.id), row]));
       for (const [id, owner] of spaceWrites) {
-        if (alive.get(id) !== String(owner)) {
+        const row = alive.get(id);
+        if (!row || String(row.user_id || '') !== String(owner)) {
           throw new Error('分组在同步期间被删除或改属，本次同步已回滚');
+        }
+        // 名称参与任务身份，预取后被改名同样会让本次判定失效。
+        const expected = spaceIndex.byId.get(id);
+        if (expected && normalizeSpaceName(row.name) !== normalizeSpaceName(expected.name)) {
+          throw new Error('分组在同步期间被改名，本次同步已回滚');
         }
       }
     }
@@ -577,8 +591,13 @@ function createOfficialAutomationSync(options = {}) {
       targetUid,
       mode: SYNC_MODES.has(item.mode) ? item.mode : 'move',
       at: Number(item.at) || 0,
+      // at 相同的两条意图（同一毫秒入队）需要一个稳定的次级键，否则「删旧记录
+      // 再追加」会让重试记录悄悄换位，严格 FIFO 就不成立了。
+      seq: Number(item.seq) || 0,
     };
   }
+
+  const byQueueOrder = (a, b) => (a.at - b.at) || (a.seq - b.seq);
 
   // 事务外预取：账号列表与分组索引不在「读取与写入同一快照」的一致性边界内，
   // 放进 BEGIN IMMEDIATE 只会延长持锁时间（第三轮复审 P2-3）。每次同步只取一次。
@@ -610,8 +629,9 @@ function createOfficialAutomationSync(options = {}) {
       throw new Error(`定时任务待恢复队列已满（${PENDING_LIMIT} 条），请先完成现有恢复`);
     }
     const at = options.keepAt && existing ? existing.at : Date.now();
-    rest.push({ sourceUid, targetUid, mode, at });
-    rest.sort((a, b) => a.at - b.at);
+    const seq = options.keepAt && existing ? existing.seq : rest.reduce((max, item) => Math.max(max, item.seq), 0) + 1;
+    rest.push({ sourceUid, targetUid, mode, at, seq });
+    rest.sort(byQueueOrder);
     mapping.__syncState = { ...state, pending: rest };
     writeMapping(mappingFile, mapping);
     return rest;
@@ -699,7 +719,7 @@ function createOfficialAutomationSync(options = {}) {
       .filter(Boolean)
       .filter(item => item.targetUid === targetUid)
       .filter(item => !isSkipped(item))
-      .sort((a, b) => a.at - b.at);
+      .sort(byQueueOrder);
     let done = 0;
     for (const item of queue) {
       try {
@@ -734,6 +754,11 @@ function createOfficialAutomationSync(options = {}) {
       if (!source || !target || source === target) {
         return { mode: resolved, copied: 0, updated: 0, moved: 0, removed: 0, skipped: 0, total: 0, conflicts: 0 };
       }
+      // 能力检查也要在入口做一次：drain 失败后的 deferred 分支同样会写 pending，
+      // 只靠 reconcile 内的检查会绕过它，给不支持事务的后端留下处理不掉的欠账。
+      if (typeof db.writeTransaction !== 'function') {
+        throw new Error('当前数据库后端不支持事务内读取，已拒绝定时任务同步');
+      }
       const getPrefetch = makePrefetchCache();
       // 先清该目标的旧意图（各自按记录里的原始 mode），再执行本次调用：
       // 最终状态由最新的用户意图决定，旧语义不会在新结果上反悔。
@@ -763,7 +788,7 @@ function createOfficialAutomationSync(options = {}) {
   // （最早的一条），保证调用方的处理顺序与写入顺序一致。
   sync.pendingSync = function pendingSync(targetUid) {
     const wanted = cleanUid(targetUid);
-    const queue = readPendingList().map(normalizePending).filter(Boolean).sort((a, b) => a.at - b.at);
+    const queue = readPendingList().map(normalizePending).filter(Boolean).sort(byQueueOrder);
     const match = wanted ? queue.find(item => item.targetUid === wanted) : queue[0];
     return match || null;
   };
@@ -774,7 +799,7 @@ function createOfficialAutomationSync(options = {}) {
       .map(normalizePending)
       .filter(Boolean)
       .filter(item => !wanted || item.targetUid === wanted)
-      .sort((a, b) => a.at - b.at);
+      .sort(byQueueOrder);
   };
 
   // 按记录里的原始 mode 恢复。一次把该目标账号的待恢复意图全部做完（FIFO）：

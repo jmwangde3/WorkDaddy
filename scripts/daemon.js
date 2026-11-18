@@ -755,8 +755,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 //        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
 // 1.3.1：可靠性 + 安全加固（不新增功能）。tag、本常量、package.json 三者必须一致，
 //        release.yml 会当场比对，不一致就拒绝发布。
-const DAEMON_VERSION = '1.3.12';
-const DAEMON_BUILD_ID = 'release-1.3.12-full-fork';
+const DAEMON_VERSION = '1.3.13';
+const DAEMON_BUILD_ID = 'release-1.3.13-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -8531,7 +8531,9 @@ async function pumpAutomationResume(reason) {
   // 就必须继续排下一次重试，否则剩下的那几条会一直躺着。
   const left = Number(result && result.pending) || 0;
   if (left > 0) {
-    automationResumeDelay = 5000;
+    // 只有确实推进了（drained > 0）才把退避重置回 5s。无条件重置会让「一直失败」
+    // 也停在 5s 反复打库，指数退避形同虚设（复审 P2-02）。
+    if (Number(result && result.drained) > 0) automationResumeDelay = 5000;
     scheduleAutomationResume(reason);
     return result;
   }

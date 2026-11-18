@@ -513,6 +513,8 @@ test('同名但目录完全不同的两个分组：没有历史关联时也不�
   const rows = await f.live();
   assert.equal(rows.length, 2, '同名不同路径不得被吸附成一条');
   assert.equal(rows.filter(r => r.owner_user_id === 'b').length, 2, '各自随切号转移，但不合并');
+  // 身份判定说「不是一个分组」，绑定时也必须一致：不能挂到路径不同的同名分组下。
+  assert.equal(rows.find(r => r.id === 'x1').space_id, null, '同名但路径不同，不得绑定到目标账号的无关分组');
 });
 
 test('同名且目录一致的跨账号分组仍然可以合并', async t => {
@@ -535,4 +537,71 @@ test('不支持事务的后端不留下无法处理的 pending', async t => {
   const sync = f.buildSync({ db: legacy });
   await assert.rejects(sync('a', 'b'), /不支持事务内读取/);
   assert.equal(sync.pendingList().length, 0, '能力检查必须先于 pending 落盘');
+});
+
+/* ===== 第五轮复审（P1 WD-04 绑定缺口 / P2-01 / P2-03）新增契约 ===== */
+
+test('无事务能力的后端即使已有旧欠账，也不得通过 deferred 分支写入新 pending', async t => {
+  const f = await fixture(t);
+  await f.insert('only', 'a', { updated_at: 5 });
+  writePending(f.mappingFile, [{ sourceUid: 'a', targetUid: 'b', mode: 'move', at: 1, seq: 1 }]);
+  const legacy = { all: f.db.all.bind(f.db), run: f.db.run.bind(f.db) };
+  const sync = f.buildSync({ db: legacy });
+
+  await assert.rejects(sync('c', 'b'), /不支持事务内读取/);
+  const queue = sync.pendingList('b');
+  assert.equal(queue.length, 1, '既不能新增第二条，也不能丢掉原有那条');
+  assert.equal(queue[0].sourceUid, 'a', '原有欠账保持原样');
+  assert.equal(queue[0].at, 1);
+});
+
+test('两条意图 at 相同时，重试不会把记录换位', async t => {
+  const f = await fixture(t);
+  await f.insert('task-a', 'a', { updated_at: 5, name: '甲任务' });
+  await f.insert('task-c', 'c', { updated_at: 5, name: '丙任务' });
+  // 同一毫秒入队：at 完全相等，只能靠 seq 保序。
+  writePending(f.mappingFile, [
+    { sourceUid: 'a', targetUid: 'b', mode: 'move', at: 100, seq: 1 },
+    { sourceUid: 'c', targetUid: 'b', mode: 'move', at: 100, seq: 2 },
+  ]);
+
+  let calls = 0;
+  const flaky = {
+    ...f.db,
+    async writeTransaction(work) {
+      calls++;
+      if (calls === 1) throw new Error('fixture busy');
+      return f.db.writeTransaction(work);
+    },
+  };
+  const sync = f.buildSync({ db: flaky });
+  const result = await sync.resume('b');
+  assert.equal(result.resumed, false);
+  const queue = sync.pendingList('b');
+  assert.deepEqual(queue.map(i => i.sourceUid), ['a', 'c'], 'at 相同也必须保持原始顺序');
+  assert.deepEqual(queue.map(i => i.seq), [1, 2]);
+
+  // 再恢复一次，仍然按 a → c 的顺序执行，并被清空。
+  const retry = await sync.resume('b');
+  assert.equal(retry.drained, 2);
+  assert.equal(sync.pendingList('b').length, 0);
+});
+
+test('分组在同步期间被改名时整笔回滚', async t => {
+  const f = await fixture(t);
+  await f.space('sp-a', 'a', '工作区甲');
+  await f.space('sp-b', 'b', '工作区甲');
+  await f.insert('only', 'a', { updated_at: 3, space_id: 'sp-a' });
+
+  // 预取之后（事务外）把目标分组改名，事务内复核必须发现并回滚。
+  const racing = {
+    ...f.db,
+    async writeTransaction(work) {
+      await f.db.run('UPDATE spaces SET name = ? WHERE id = ?', ['被改名了', 'sp-b']);
+      return f.db.writeTransaction(work);
+    },
+  };
+  await assert.rejects(f.buildSync({ db: racing })('a', 'b'), /分组在同步期间被改名/);
+  const row = (await f.live())[0];
+  assert.equal(row.owner_user_id, 'a', '回滚后归属不变');
 });
