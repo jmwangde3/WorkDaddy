@@ -364,6 +364,17 @@ function startRehomeWatcher() {
         try { alignStartupRoutes(PROFILE.dataRoot, prevUid || newUid); }
         catch (e) { log(`[rehome] startup-route 对齐失败: ${e.message}`); }
       }
+      // 客户端内直接登录不走 /api/switch，也必须同步官方定时任务的归属，
+      // 否则新 move 模型只覆盖手动切号，这类入口仍会留下旧账号的任务。
+      if (prevUid && newUid && prevUid !== newUid
+        && typeof automationSyncEnabled === 'function' && automationSyncEnabled()) {
+        try {
+          const synced = await syncOfficialAccountAutomations(prevUid, newUid);
+          log(`[automation-sync] 直接登录路径同步 ${prevUid}->${newUid} moved=${synced.moved || 0} removed=${synced.removed || 0}`);
+        } catch (error) {
+          log(`[automation-sync] 直接登录路径同步失败: ${error.message}`);
+        }
+      }
       // 客户端内直接登录/无感登录也要把完全访问补回去（不经过 /api/switch）。
       schedulePermissionSync(newUid, { delayMs: 1500 });
       return result;
@@ -738,8 +749,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 //        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
 // 1.3.1：可靠性 + 安全加固（不新增功能）。tag、本常量、package.json 三者必须一致，
 //        release.yml 会当场比对，不一致就拒绝发布。
-const DAEMON_VERSION = '1.3.7';
-const DAEMON_BUILD_ID = 'release-1.3.7-full-fork';
+const DAEMON_VERSION = '1.3.8';
+const DAEMON_BUILD_ID = 'release-1.3.8-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -8424,6 +8435,34 @@ async function syncOfficialAccountAutomations(sourceUid, targetUid) {
   return officialAutomationSyncEngine(assertSessionAccountIdentity(sourceUid), assertSessionAccountIdentity(targetUid));
 }
 
+// 切号成功但任务同步失败时不能把问题永久留给用户：pending 落盘，
+// 下次启动只要已登录账号就是当时的目标账号，就把那次转移续做完。
+async function resumeOfficialAccountAutomations(reason) {
+  if (!officialAutomationSyncEngine || typeof officialAutomationSyncEngine.resume !== 'function') {
+    return { resumed: false };
+  }
+  let held = null;
+  try { held = officialAutomationSyncEngine.pendingSync(); } catch (error) {
+    log(`[automation-sync] 待恢复状态读取失败: ${error.message}`);
+    return { resumed: false };
+  }
+  if (!held) return { resumed: false };
+  const active = currentAccount();
+  const activeUid = String((active && active.uid) || '');
+  if (activeUid !== held.targetUid) {
+    log(`[automation-sync] 存在未完成的定时任务转移 ${held.sourceUid}->${held.targetUid}，当前账号 ${activeUid} 不匹配，稍后重试`);
+    return { resumed: false, pending: held };
+  }
+  try {
+    const result = await officialAutomationSyncEngine.resume();
+    log(`[automation-sync] 恢复未完成的转移 ${held.sourceUid}->${held.targetUid} (${reason}) moved=${result.moved || 0} removed=${result.removed || 0}`);
+    return result;
+  } catch (error) {
+    log(`[automation-sync] 恢复未完成的转移失败 (${reason}): ${error.message}`);
+    return { resumed: false, error: error.message };
+  }
+}
+
 function accountBackupFile(uid) {
   const value = String(uid || '').trim();
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
@@ -14287,6 +14326,8 @@ function startServer() {
       writeUiPortFile(port);
       log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
       startRehomeWatcher();
+      // 上次切号若在任务同步阶段失败，这里把它续做完（账号不匹配则保留 pending）。
+      setTimeout(() => { resumeOfficialAccountAutomations('startup').catch(() => {}); }, 4000);
       // 启动恢复检查：默认只读报告，不改数据库；startupReconcile=true 才自动接管。
       setTimeout(() => {
         const cfg = getRehomeRunner().readConfig();

@@ -5,6 +5,36 @@
 
 格式参考 Keep a Changelog；版本号沿用 `scripts/daemon.js` 里的 `DAEMON_VERSION`。
 
+## [1.3.8] — 未发布（分支 `review/automation-guard-1.3.8`）
+
+第二轮独立复审对 1.3.7 给出 NEEDS_FIX（P0 无、P1 三项）。本版按最小范围修完，
+不改变 move/copy 双模式架构。
+
+### 修复
+
+- **分组纳入任务身份**：`fingerprint` 现在带规范化分组名。同名同内容但属于不同分组的
+  跨账号任务不再被误判为同一任务合并（复审 P1-1）。
+- **规划与写入之间的并发窗口**：新增 `db.writeTransaction`（读+写同一 `BEGIN IMMEDIATE`），
+  move 的转移与软删除语句都带 `updated_at` 条件；命中 0 行说明该行在规划后被改过，
+  整笔回滚并在下次切号重算，不会在旧决策上覆盖用户的新内容（复审 P1-2）。
+- **切号成功但同步失败可自动恢复**：同步前把 `pending {sourceUid,targetUid}` 落盘，
+  成功即清空；daemon 启动时若当前账号等于待处理目标，自动续做（复审 P1-3）。
+- **直接登录路径接入同步**：`startRehomeWatcher` 的 `onSwitch` 现在也调用官方任务同步，
+  客户端内直接登录不再漏掉归属转移（复审 P2-6）。
+- **只对明确的 schema 缺失降级**：`space_id` 探测与 `spaces` 查询仅在 `no such column/table`
+  时降级，库被锁、I/O 失败直接抛出，避免静默丢分组（复审 P2-1）。
+- **同名分组消歧**：目标账号存在多个同名分组时按 `primary_folder_path`/`create_folder_path`
+  唯一匹配；消不了歧就置空并保持不分组，不再按 `created_at` 随意绑定（复审 P2-2）。
+- **同账号多 live 行冲突保护**：历史 mapping 把同账号不同定义的任务连在一起时报 `conflicts`
+  并保持原样，不再选一条退役其余（复审 P2-4）。
+- **`getMode` 每次同步只读一次**，避免两次读取之间设置变化导致语义前后不一致（复审 P2-5）。
+
+### 测试
+
+- 新增 `test/official-automation-sync-guard.test.js`（8 条）锁定上述契约；
+- 旧复制契约 `official-automation-sync.test.js` 的故障注入同时覆盖 `writeTransaction` 路径；
+- `upstream.json` 重算 `daemon.js` 的 sha256/size。
+
 ## [1.3.7] — 未发布（分支 `review/automation-move-1.3.7`）
 
 ### 变更
