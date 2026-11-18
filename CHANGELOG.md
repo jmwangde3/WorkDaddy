@@ -5,7 +5,44 @@
 
 格式参考 Keep a Changelog；版本号沿用 `scripts/daemon.js` 里的 `DAEMON_VERSION`。
 
-## [1.3.8] — 未发布（分支 `review/automation-guard-1.3.8`）
+## [1.3.9] — 未发布（分支 `review/automation-tx-1.3.9`）
+
+第二轮独立复审对 1.3.8 判 NO-GO（P1 三项未闭环）。1.3.8 未发布、未部署。
+本版按复审给出的最小顺序重做三个安全边界，仍不推翻 move/copy 双模式架构。
+
+### 修复
+
+- **历史快照迁移（P1-1）**：新增 `legacyFingerprint()`，完整复现 1.3.7 的纯定义算法。
+  判定「是否被真实修改」时，旧快照命中 v1 或 v2 任一即视为未修改；新快照统一写 v2。
+  升级不再被当成一次全量编辑，`canonical` 不会退化成「谁 `updated_at` 最新谁赢」，
+  真实编辑仍压过调度器跑批造成的更新时间。
+- **事务边界（P1-2）**：`reconcile` 拆成规划与提交两段。规划、canonical 选择、
+  分组解析、SQL 写入全部在同一个 `BEGIN IMMEDIATE`（`db.writeTransaction`）内完成，
+  读取一律走 `tx.all`，不再用事务外的 `db.all`。
+  `retired` 与 `snapshots` 改为**提交成功后**才写回 mapping：事务回滚时这两项完全没动过，
+  下一轮重新读取、重新判定，不会拿上一轮的 retired 标记去删用户刚改过的行。
+  copy 模式仍保留「先落 lineage 再插行」，避免崩溃后出现没有身份的新副本。
+- **恢复记录前置（P1-3）**：`pending` 在任何数据库读取之前落盘，记录 `sourceUid/targetUid/mode`，
+  最多保留 4 条；读取阶段失败（库被锁）同样留下记录。恢复时按记录里的原始 `mode` 执行，
+  不受失败后用户改设置影响。启动检查与 `startRehomeWatcher` 的 `onSwitch` 都会按当前账号
+  匹配 pending 并当场续做。
+- **后端能力 fail-closed（P2-3）**：没有回调式事务的后端拒绝 move 同步并报错，
+  不再保留「看起来有并发保护、实际没有」的降级路径。
+- **分组名口径统一（P2-2）**：目标分组匹配改用与 fingerprint 相同的 `normalizeSpaceName`，
+  不再一边忽略大小写、一边精确匹配。
+- **copy 模式分组（P2-1）**：INSERT/UPDATE 补 `space_id`，值取自目标账号的同名分组，
+  不再出现「副本丢失分组」或「引用别的账号分组」。
+
+### 测试
+
+- `test/official-automation-sync-guard.test.js` 增至 11 条：新增「读取必须走事务内连接」、
+  「1.3.7 历史快照升级后真实编辑仍胜出」、「读取阶段失败也留 pending」、
+  「copy 模式副本带上目标账号分组」。
+- 回归：copy 契约 11、move 7、account-sync 3、transfer 10、workspace-binding 13、
+  session-db 6、fork-sync-contract 1，全部 exit=0、0 fail。
+- `upstream.json` 重算 `daemon.js` 的 sha256/size（size 779818）。
+
+## [1.3.8] — 未发布、已被 1.3.9 取代
 
 第二轮独立复审对 1.3.7 给出 NEEDS_FIX（P0 无、P1 三项）。本版按最小范围修完，
 不改变 move/copy 双模式架构。

@@ -374,6 +374,8 @@ function startRehomeWatcher() {
         } catch (error) {
           log(`[automation-sync] 直接登录路径同步失败: ${error.message}`);
         }
+        // 之前失败留下的 pending 落到这个账号时，这里当场续做，不必等重启。
+        await resumeOfficialAccountAutomations('watcher');
       }
       // 客户端内直接登录/无感登录也要把完全访问补回去（不经过 /api/switch）。
       schedulePermissionSync(newUid, { delayMs: 1500 });
@@ -749,8 +751,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 //        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
 // 1.3.1：可靠性 + 安全加固（不新增功能）。tag、本常量、package.json 三者必须一致，
 //        release.yml 会当场比对，不一致就拒绝发布。
-const DAEMON_VERSION = '1.3.8';
-const DAEMON_BUILD_ID = 'release-1.3.8-full-fork';
+const DAEMON_VERSION = '1.3.9';
+const DAEMON_BUILD_ID = 'release-1.3.9-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -8441,20 +8443,22 @@ async function resumeOfficialAccountAutomations(reason) {
   if (!officialAutomationSyncEngine || typeof officialAutomationSyncEngine.resume !== 'function') {
     return { resumed: false };
   }
+  const active = currentAccount();
+  const activeUid = String((active && active.uid) || '');
   let held = null;
-  try { held = officialAutomationSyncEngine.pendingSync(); } catch (error) {
+  try {
+    held = officialAutomationSyncEngine.pendingSync();
+    if (!held) return { resumed: false };
+    if (!officialAutomationSyncEngine.pendingSync(activeUid)) {
+      log(`[automation-sync] 存在未完成的定时任务转移 ${held.sourceUid}->${held.targetUid}，当前账号 ${activeUid} 不匹配，保留待恢复`);
+      return { resumed: false, pending: held };
+    }
+  } catch (error) {
     log(`[automation-sync] 待恢复状态读取失败: ${error.message}`);
     return { resumed: false };
   }
-  if (!held) return { resumed: false };
-  const active = currentAccount();
-  const activeUid = String((active && active.uid) || '');
-  if (activeUid !== held.targetUid) {
-    log(`[automation-sync] 存在未完成的定时任务转移 ${held.sourceUid}->${held.targetUid}，当前账号 ${activeUid} 不匹配，稍后重试`);
-    return { resumed: false, pending: held };
-  }
   try {
-    const result = await officialAutomationSyncEngine.resume();
+    const result = await officialAutomationSyncEngine.resume(activeUid);
     log(`[automation-sync] 恢复未完成的转移 ${held.sourceUid}->${held.targetUid} (${reason}) moved=${result.moved || 0} removed=${result.removed || 0}`);
     return result;
   } catch (error) {

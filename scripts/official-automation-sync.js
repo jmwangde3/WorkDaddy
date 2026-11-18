@@ -76,12 +76,25 @@ function normalizeSpacePath(value) {
   return String(value || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
-// Only explicit schema drift may be downgraded. Locked/I/O failures must abort
+function normalizeSpaceName(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+// Only explicit schema drift may be downgraded. Locked/I-O failures must abort
 // the sync: treating them as "no such column" would silently drop space refs.
 function isMissingSchema(error, needle) {
   const message = String((error && error.message) || '').toLowerCase();
   if (!/no such (column|table)/.test(message)) return false;
-  return needle ? message.includes(String(needle).toLowerCase()) : true;
+  return needle ? message.includes(String(needle).toLowerCase()) : false;
+}
+
+// 1.3.7 及更早版本写下的快照用的是纯定义哈希。升级不能让它整体失效，
+// 否则「所有副本都像改过」，canonical 会退化成「谁 updated_at 最新谁赢」，
+// 恰好破坏排除 updated_at 的初衷。保留旧算法只用于识别未修改的历史行。
+function legacyFingerprint(row) {
+  return crypto.createHash('sha256')
+    .update(JSON.stringify(DEFINITION_COLUMNS.map((column) => columnValue(row, column))))
+    .digest('hex');
 }
 
 // 分组是任务身份的一部分：同名同内容但属于不同分组的任务不是同一个任务。
@@ -97,7 +110,7 @@ function spaceIdentityOf(row, index) {
   const id = row && row.space_id != null ? String(row.space_id).trim() : '';
   if (!id) return '';
   const record = index.get(id);
-  return record && record.name ? record.name.toLowerCase() : '';
+  return record && record.name ? normalizeSpaceName(record.name) : '';
 }
 
 function taskFreshness(row) {
@@ -125,6 +138,7 @@ function mappingGraph(mapping) {
     graph.get(right).add(left);
   };
   Object.entries(mapping || {}).forEach(([key, value]) => {
+    if (key === '__syncState') return;
     const parts = String(key).split(':');
     if (parts.length < 3 || !value || typeof value !== 'object') return;
     const sourceUid = parts.shift();
@@ -132,9 +146,7 @@ function mappingGraph(mapping) {
     const sourceId = parts.join(':');
     const targetId = String(value.targetAutomationId || '').trim();
     if (!cleanUid(sourceUid) || !cleanUid(targetUid) || !sourceId || !targetId) return;
-    const sourceNode = nodeKey(sourceUid, sourceId);
-    const targetNode = nodeKey(targetUid, targetId);
-    connect(sourceNode, targetNode);
+    connect(nodeKey(sourceUid, sourceId), nodeKey(targetUid, targetId));
   });
   return { graph };
 }
@@ -153,12 +165,11 @@ function componentNodes(graph, start) {
   return seen;
 }
 
-function insertStatement(source, targetUid, id) {
-  const columns = AUTOMATION_COLUMNS;
+function insertStatement(source, targetUid, id, columns) {
   const values = columns.map((column) => {
     if (column === 'id') return id;
     if (column === 'owner_user_id') return targetUid;
-    const value = source[column];
+    const value = column === 'space_id' ? source.__spaceTarget : source[column];
     if (value === undefined || value === null) {
       return Object.prototype.hasOwnProperty.call(AUTOMATION_DEFAULTS, column)
         ? AUTOMATION_DEFAULTS[column] : null;
@@ -192,10 +203,10 @@ function createOfficialAutomationSync(options = {}) {
   // 旧版 WorkBuddy 的 automations 表还没有 space_id 列；只有明确的 schema 缺失才降级。
   // 其它错误（库被锁、I/O 失败）不缓存、不吞掉，直接让本次同步失败。
   let spaceColumn = null;
-  async function ensureSpaceSupport() {
+  async function detectSpaceColumn(read) {
     if (spaceColumn !== null) return spaceColumn;
     try {
-      await db.all('SELECT space_id FROM automations LIMIT 1');
+      await read('SELECT space_id FROM automations LIMIT 1');
       spaceColumn = true;
     } catch (error) {
       if (!isMissingSchema(error, 'space_id')) throw error;
@@ -204,13 +215,12 @@ function createOfficialAutomationSync(options = {}) {
     return spaceColumn;
   }
 
-  async function loadSpaceIndex() {
-    if (!(await ensureSpaceSupport())) return null;
+  async function loadSpaceIndex(read) {
     let rows;
     try {
-      rows = await db.all('SELECT id, name, primary_folder_path, create_folder_path FROM spaces');
+      rows = await read('SELECT id, name, primary_folder_path, create_folder_path FROM spaces');
     } catch (error) {
-      if (isMissingSchema(error, 'spaces')) return null;
+      if (isMissingSchema(error, 'spaces')) return new Map();
       throw error;
     }
     const index = new Map();
@@ -225,23 +235,26 @@ function createOfficialAutomationSync(options = {}) {
 
   // 任务转移账号后，分组引用必须改成目标账号自己的同名分组，否则客户端会引用
   // 别的账号的分组行。找不到同名分组就置空，宁可不分组也不跨账号悬空。
-  async function resolveSpaceFor(spaceId, targetUid, spaceIndex) {
+  async function resolveSpaceFor(read, spaceId, targetUid, spaceIndex) {
     if (!spaceId) return '';
     const record = spaceIndex ? spaceIndex.get(String(spaceId)) : null;
     const name = record && record.name ? record.name : '';
     if (!name) return '';
-    const rows = await db.all(
-      'SELECT id, primary_folder_path, create_folder_path FROM spaces WHERE user_id = ? AND name = ? AND COALESCE(deleted_at, -1) = -1 ORDER BY id ASC',
-      [targetUid, name]
+    const wantedName = normalizeSpaceName(name);
+    const rows = await read(
+      'SELECT id, name, primary_folder_path, create_folder_path FROM spaces WHERE user_id = ? AND COALESCE(deleted_at, -1) = -1 ORDER BY id ASC',
+      [targetUid]
     );
-    if (!rows.length) return '';
-    if (rows.length === 1) return String(rows[0].id).trim();
-    // 目标账号存在多个同名分组：只有路径能唯一对上时才绑定，否则宁可不分组，
-    // 避免把任务挂到语义不同的分组上。
-    const wanted = new Set(record.paths || []);
-    if (!wanted.size) return '';
-    const matched = rows.filter((row) => [row.primary_folder_path, row.create_folder_path]
-      .map(normalizeSpacePath).filter(Boolean).some((value) => wanted.has(value)));
+    // 名称比较与 fingerprint 口径一致（都走 normalizeSpaceName），避免一边忽略大小写
+    // 一边精确匹配，出现「认为是同一个分组却找不到」的自相矛盾。
+    const candidates = rows.filter((row) => normalizeSpaceName(row.name) === wantedName);
+    if (!candidates.length) return '';
+    if (candidates.length === 1) return String(candidates[0].id).trim();
+    // 目标账号存在多个同名分组：只有路径能唯一对上时才绑定，否则宁可不分组。
+    const wantedPaths = new Set(record.paths || []);
+    if (!wantedPaths.size) return '';
+    const matched = candidates.filter((row) => [row.primary_folder_path, row.create_folder_path]
+      .map(normalizeSpacePath).filter(Boolean).some((value) => wantedPaths.has(value)));
     return matched.length === 1 ? String(matched[0].id).trim() : '';
   }
 
@@ -261,49 +274,38 @@ function createOfficialAutomationSync(options = {}) {
     return false;
   }
 
-  async function runStatements(statements) {
-    if (!statements.length) return;
-    if (typeof db.writeTransaction === 'function') {
-      await db.writeTransaction(async (tx) => {
-        for (const statement of statements) {
-          const outcome = tx.run(statement.sql, statement.params);
-          // guard 语句带 updated_at 条件：0 行命中说明该行在规划之后被改过，
-          // 整笔回滚，交给下一次切号重算，绝不在新内容上做旧决策。
-          if (statement.guard && Number(outcome && outcome.changes) === 0) {
-            throw new Error('定时任务在同步期间被修改，本次同步已回滚');
-          }
-        }
-      });
-      return;
-    }
-    await db.transaction(statements.map(({ sql, params }) => ({ sql, params })));
-  }
-
-  async function reconcile(sourceValue, targetValue) {
-    const sourceUid = cleanUid(sourceValue);
-    const targetUid = cleanUid(targetValue);
-    const mode = resolveMode();
-    const result = { mode, copied: 0, updated: 0, moved: 0, removed: 0, skipped: 0, total: 0, conflicts: 0 };
-    if (!sourceUid || !targetUid || sourceUid === targetUid) return result;
-
-    const withSpace = await ensureSpaceSupport();
-    const spaceIndex = withSpace ? await loadSpaceIndex() : null;
+  // 纯规划：所有数据库读取都通过 read（事务内是 tx.all），不写库、不写文件。
+  async function planSync(read, context) {
+    const { sourceUid, targetUid, mode, mapping } = context;
+    const withSpace = await detectSpaceColumn(read);
+    const spaceIndex = withSpace ? await loadSpaceIndex(read) : null;
     // Reconcile the union for all saved accounts, including a third account's
     // unique tasks, before the destination renderer reads its task list.
     const savedUids = options.getAccountUids ? await options.getAccountUids() : [];
     const owners = [...new Set([sourceUid, targetUid, ...savedUids.map(cleanUid)].filter(Boolean))];
     const selectColumns = withSpace ? [...AUTOMATION_COLUMNS, 'space_id'] : AUTOMATION_COLUMNS;
-    const rows = await db.all(`SELECT ${selectColumns.join(', ')} FROM automations
+    const rows = await read(`SELECT ${selectColumns.join(', ')} FROM automations
       WHERE owner_user_id IN (${owners.map(() => '?').join(', ')})`, owners);
-    const mapping = readMapping(mappingFile);
-    const state = mapping.__syncState || {};
+
+    const state = (mapping && mapping.__syncState) || {};
     const snapshots = state.snapshots || {};
     const retired = { ...(state.retired || {}) };
     const nextSnapshots = { ...snapshots };
+    const nextRetired = { ...retired };
+    const lineage = {};
     const { graph } = mappingGraph(mapping);
     const byNode = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), row]));
-    const hashes = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), fingerprint(row, spaceIdentityOf(row, spaceIndex))]));
-    const hashOf = row => hashes.get(nodeKey(row.owner_user_id, row.id));
+    const hashOf = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), fingerprint(row, spaceIdentityOf(row, spaceIndex))]));
+    const legacyOf = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), legacyFingerprint(row)]));
+    // 旧快照既可能是 v1（纯定义），也可能是 v2；两者都算「未修改」，
+    // 让升级本身不被当成一次全量编辑，快照会在成功后统一改写为 v2。
+    const unchanged = (row) => {
+      const key = nodeKey(row.owner_user_id, row.id);
+      const previous = snapshots[key];
+      if (!previous) return false;
+      return previous === hashOf.get(key) || previous === legacyOf.get(key);
+    };
+
     const visited = new Set();
     const groups = [];
     for (const [node] of byNode) {
@@ -316,59 +318,63 @@ function createOfficialAutomationSync(options = {}) {
 
     // Adopt identical pre-existing copies one-to-one across different owners.
     // Never collapse intentionally separate tasks in the same account, nor
-    // once tasks whose scheduled dates differ.
+    // once tasks whose scheduled dates differ. 分组身份已进入 fingerprint，
+    // 因此不同分组的同名任务不会在这里被吸附。
     for (let i = 0; i < groups.length; i++) {
       const ownersInGroup = new Set(groups[i].map(r => r.owner_user_id));
-      const groupHashes = new Set(groups[i].filter(isLive).map(hashOf));
+      const groupHashes = new Set(groups[i].filter(isLive).map(r => hashOf.get(nodeKey(r.owner_user_id, r.id))));
       for (let j = i + 1; j < groups.length; j++) {
         if (!groups[j].length || groups[j].some(r => ownersInGroup.has(r.owner_user_id))) continue;
-        if (!groups[j].some(r => isLive(r) && groupHashes.has(hashOf(r)))) continue;
-        groups[j].forEach(r => { ownersInGroup.add(r.owner_user_id); if (isLive(r)) groupHashes.add(hashOf(r)); });
+        if (!groups[j].some(r => isLive(r) && groupHashes.has(hashOf.get(nodeKey(r.owner_user_id, r.id))))) continue;
+        groups[j].forEach(r => {
+          ownersInGroup.add(r.owner_user_id);
+          if (isLive(r)) groupHashes.add(hashOf.get(nodeKey(r.owner_user_id, r.id)));
+        });
         groups[i].push(...groups[j]);
         groups[j] = [];
       }
     }
 
+    const stats = { copied: 0, updated: 0, moved: 0, removed: 0, skipped: 0, total: 0, conflicts: 0 };
     const statements = [];
     const usedIds = new Set(rows.map(r => r.id));
     const freshnessOrder = (a, b) => taskFreshness(b) - taskFreshness(a) ||
       Number(b.owner_user_id === sourceUid) - Number(a.owner_user_id === sourceUid) ||
       nodeKey(a.owner_user_id, a.id).localeCompare(nodeKey(b.owner_user_id, b.id));
+    let inserts = 0;
+
     if (mode === 'move') {
       const transferSql = withSpace
         ? 'UPDATE automations SET owner_user_id = ?, space_id = ? WHERE id = ? AND owner_user_id = ? AND updated_at IS ?'
         : 'UPDATE automations SET owner_user_id = ? WHERE id = ? AND owner_user_id = ? AND updated_at IS ?';
       for (const members of groups) {
         if (!members.length) continue;
-        // 历史 mapping 把同账号多个不同定义的任务连在一起时，只报冲突不动数据。
-        if (componentHasOwnerConflict(members, hashes)) {
-          result.conflicts++;
+        if (componentHasOwnerConflict(members, hashOf)) {
+          stats.conflicts++;
           continue;
         }
         // 同 copy 模型：一次真实的定义修改压过「只是跑过一次」的更新时间。
-        const changed = members.filter((row) => {
-          const previous = snapshots[nodeKey(row.owner_user_id, row.id)];
-          return previous && previous !== hashOf(row);
-        });
+        const changed = members.filter((row) => snapshots[nodeKey(row.owner_user_id, row.id)] && !unchanged(row));
         const canonical = [...(changed.length ? changed : members)].sort(freshnessOrder)[0];
         // 规范行已删除：删除同步到所有副本，反向切号也不复活。
         if (!isLive(canonical)) {
-          for (const row of members) if (isLive(row)) retired[nodeKey(row.owner_user_id, row.id)] = true;
+          for (const row of members) if (isLive(row)) nextRetired[nodeKey(row.owner_user_id, row.id)] = true;
           continue;
         }
-        result.total++;
+        stats.total++;
         // 其余副本一律停用（软删除，可恢复）：同一任务全局只留一行。
         for (const row of members) {
           if (row.id === canonical.id || !isLive(row)) continue;
-          retired[nodeKey(row.owner_user_id, row.id)] = true;
+          nextRetired[nodeKey(row.owner_user_id, row.id)] = true;
         }
+        const canonicalKey = nodeKey(canonical.owner_user_id, canonical.id);
         if (canonical.owner_user_id === targetUid) {
-          result.skipped++;
-          nextSnapshots[nodeKey(targetUid, canonical.id)] = hashOf(canonical);
+          stats.skipped++;
+          nextSnapshots[canonicalKey] = hashOf.get(canonicalKey);
           continue;
         }
         const ownSpace = withSpace && canonical.space_id != null ? String(canonical.space_id).trim() : '';
-        const nextSpace = ownSpace ? await resolveSpaceFor(ownSpace, targetUid, spaceIndex) : '';
+        const nextSpace = ownSpace ? await resolveSpaceFor(read, ownSpace, targetUid, spaceIndex) : '';
         statements.push({
           sql: transferSql,
           params: withSpace
@@ -376,59 +382,66 @@ function createOfficialAutomationSync(options = {}) {
             : [targetUid, canonical.id, canonical.owner_user_id, canonical.updated_at ?? null],
           guard: true,
         });
-        mapping[taskKey(canonical.owner_user_id, canonical.id, targetUid)] = {
+        lineage[taskKey(canonical.owner_user_id, canonical.id, targetUid)] = {
           targetAutomationId: canonical.id,
           sourceUpdatedAt: canonical.updated_at == null ? null : String(canonical.updated_at),
         };
-        nextSnapshots[nodeKey(targetUid, canonical.id)] = hashOf(canonical);
-        result.moved++;
+        nextSnapshots[nodeKey(targetUid, canonical.id)] = hashOf.get(canonicalKey);
+        stats.moved++;
       }
     }
+
     if (mode === 'copy') for (const members of groups) {
       if (!members.length) continue;
       // A genuine definition edit beats an unchanged copy whose updated_at
       // merely advanced during execution. On first migration use latest edit.
-      const changed = members.filter(row => {
-        const previous = snapshots[nodeKey(row.owner_user_id, row.id)];
-        return previous && previous !== hashOf(row);
-      });
+      const changed = members.filter(row => snapshots[nodeKey(row.owner_user_id, row.id)] && !unchanged(row));
       const canonical = [...(changed.length ? changed : members)].sort(freshnessOrder)[0];
       const live = isLive(canonical);
-      if (live) result.total++;
+      if (live) stats.total++;
+      const canonicalHash = hashOf.get(nodeKey(canonical.owner_user_id, canonical.id));
+      const insertColumns = withSpace ? [...AUTOMATION_COLUMNS, 'space_id'] : AUTOMATION_COLUMNS;
       const survivors = [];
       for (const owner of owners) {
         const candidates = members.filter(row => row.owner_user_id === owner).sort(freshnessOrder);
         let row = candidates[0];
         if (!row && !live) continue; // Do not manufacture deleted history.
+        // copy 模式的副本是另一账号里的独立行，分组必须换成该账号自己的同名分组。
+        const ownerSpace = withSpace && canonical.space_id != null && String(canonical.space_id).trim()
+          ? await resolveSpaceFor(read, String(canonical.space_id).trim(), owner, spaceIndex)
+          : null;
         if (!row) {
           const id = String(idFactory());
           if (!/^[0-9a-f-]{8,128}$/i.test(id) || usedIds.has(id)) throw new Error('官方定时任务 ID 无效');
           usedIds.add(id);
-          statements.push(insertStatement(canonical, owner, id));
+          statements.push(insertStatement({ ...canonical, __spaceTarget: ownerSpace || null }, owner, id, insertColumns));
           row = { ...canonical, id, owner_user_id: owner };
-          result.copied++;
-        } else if (hashOf(row) !== hashOf(canonical)) {
+          stats.copied++;
+          inserts++;
+        } else if (hashOf.get(nodeKey(row.owner_user_id, row.id)) !== canonicalHash) {
           const columns = [...DEFINITION_COLUMNS, 'updated_at'];
           // Renames do not overwrite the target's run history. A changed
           // schedule does need its new next occurrence, as in the official edit.
           if (SCHEDULE_COLUMNS.some(c => columnValue(row, c) !== columnValue(canonical, c))) columns.push('next_run_at');
+          const params = columns.map(c => columnValue(canonical, c));
+          if (withSpace) { columns.push('space_id'); params.push(ownerSpace || null); }
           statements.push({
             sql: `UPDATE automations SET ${columns.map(c => `${c} = ?`).join(', ')} WHERE id = ? AND owner_user_id = ?`,
-            params: [...columns.map(c => columnValue(canonical, c)), row.id, owner],
+            params: [...params, row.id, owner],
           });
-          result.updated++;
-        } else if (live) result.skipped++;
+          stats.updated++;
+        } else if (live) stats.skipped++;
         survivors.push(row);
-        nextSnapshots[nodeKey(owner, row.id)] = hashOf(canonical);
+        nextSnapshots[nodeKey(owner, row.id)] = canonicalHash;
         for (const duplicate of candidates.slice(1)) {
-          retired[nodeKey(owner, duplicate.id)] = true;
+          nextRetired[nodeKey(owner, duplicate.id)] = true;
         }
       }
       // Keep historical edges, including missing old IDs, so old A→B→H
       // mappings still identify reverse copies after upgrading or restarting.
       for (const row of survivors) {
         if (row.id === canonical.id) continue;
-        mapping[taskKey(canonical.owner_user_id, canonical.id, row.owner_user_id)] = {
+        lineage[taskKey(canonical.owner_user_id, canonical.id, row.owner_user_id)] = {
           targetAutomationId: row.id,
           sourceUpdatedAt: canonical.updated_at == null ? null : String(canonical.updated_at),
         };
@@ -436,55 +449,126 @@ function createOfficialAutomationSync(options = {}) {
     }
 
     for (const row of rows) {
-      if (!retired[nodeKey(row.owner_user_id, row.id)] || !isLive(row)) continue;
+      if (!nextRetired[nodeKey(row.owner_user_id, row.id)] || !isLive(row)) continue;
       statements.push({
         sql: 'UPDATE automations SET deleted_at = ? WHERE id = ? AND owner_user_id = ? AND updated_at IS ?',
         params: [Date.now(), row.id, row.owner_user_id, row.updated_at ?? null],
         guard: true,
       });
-      result.removed++;
+      stats.removed++;
     }
-    // Persist identities before SQL so a crash or failed mapping write cannot
-    // leave an inserted task without a lineage. Only advance edit baselines
-    // after the transaction commits. Retired rows are retried after failures.
-    // pending 记录让「切号成功但同步失败」有一个可自动恢复的落点。
-    mapping.__syncState = {
-      snapshots,
-      retired,
-      pending: statements.length ? { sourceUid, targetUid, at: Date.now() } : null,
+
+    return { stats, statements, lineage, snapshots: nextSnapshots, retired: nextRetired, inserts, mode };
+  }
+
+  async function reconcile(sourceValue, targetValue, modeValue) {
+    const sourceUid = cleanUid(sourceValue);
+    const targetUid = cleanUid(targetValue);
+    const mode = SYNC_MODES.has(modeValue) ? modeValue : resolveMode();
+    const result = { mode, copied: 0, updated: 0, moved: 0, removed: 0, skipped: 0, total: 0, conflicts: 0 };
+    if (!sourceUid || !targetUid || sourceUid === targetUid) return result;
+
+    // 阶段 A：先落盘恢复意图，再做任何数据库读取。这样「读取阶段就失败」
+    // 也留下记录，restart 后能续做，不会把问题永久留给用户。
+    const mapping = readMapping(mappingFile);
+    const state = mapping.__syncState || {};
+    const held = Array.isArray(state.pending) ? state.pending : [];
+    const pendingList = held
+      .filter(item => item && cleanUid(item.sourceUid) && cleanUid(item.targetUid))
+      .filter(item => !(item.sourceUid === sourceUid && item.targetUid === targetUid));
+    pendingList.push({ sourceUid, targetUid, mode, at: Date.now() });
+    const pending = pendingList.slice(-4);
+    mapping.__syncState = { ...state, pending };
+    writeMapping(mappingFile, mapping);
+
+    // 没有回调式事务的后端无法保证「读取与写入同一事务」，move 模式直接拒绝，
+    // 不做「看起来有保护、实际没有」的降级。
+    const supportsTx = typeof db.writeTransaction === 'function';
+    if (mode === 'move' && !supportsTx) {
+      throw new Error('当前数据库后端不支持事务内读取，已拒绝单份任务同步');
+    }
+
+    // 阶段 B：读取 + 判定 + 写入。node:sqlite 下三者同处一个 BEGIN IMMEDIATE，
+    // 规划所依赖的数据在提交前不会被外部改动。
+    let plan;
+    if (supportsTx) {
+      plan = await db.writeTransaction(async (tx) => {
+        const read = (sql, params) => tx.all(sql, params);
+        const built = await planSync(read, { sourceUid, targetUid, mode, mapping });
+        // copy 模式会插入新行：先把 lineage 落盘，崩溃后也不会出现没有身份的新副本。
+        if (built.inserts > 0) {
+          writeMapping(mappingFile, { ...mapping, ...built.lineage, __syncState: { ...state, pending } });
+        }
+        for (const statement of built.statements) {
+          const outcome = tx.run(statement.sql, statement.params);
+          if (statement.guard && Number(outcome && outcome.changes) === 0) {
+            throw new Error('定时任务在同步期间被修改，本次同步已回滚');
+          }
+        }
+        return built;
+      });
+    } else {
+      const built = await planSync((sql, params) => db.all(sql, params), { sourceUid, targetUid, mode, mapping });
+      if (built.inserts > 0) {
+        writeMapping(mappingFile, { ...mapping, ...built.lineage, __syncState: { ...state, pending } });
+      }
+      if (built.statements.length) await db.transaction(built.statements.map(({ sql, params }) => ({ sql, params })));
+      plan = built;
+    }
+
+    // 阶段 C：SQLite 提交成功后才写回 snapshots / retired / lineage。
+    // 回滚时这些状态完全没动过，所以下一轮会重新读取、重新判定，
+    // 不会拿上一轮的 retired 标记去删用户刚改过的内容。
+    const latest = readMapping(mappingFile);
+    Object.assign(latest, plan.lineage);
+    const latestState = latest.__syncState || {};
+    latest.__syncState = {
+      ...latestState,
+      snapshots: plan.snapshots,
+      retired: plan.retired,
+      pending: (Array.isArray(latestState.pending) ? latestState.pending : [])
+        .filter(item => !(item && item.sourceUid === sourceUid && item.targetUid === targetUid)),
     };
-    writeMapping(mappingFile, mapping);
-    await runStatements(statements);
-    mapping.__syncState = { snapshots: nextSnapshots, retired, pending: null };
-    writeMapping(mappingFile, mapping);
+    writeMapping(mappingFile, latest);
+    Object.assign(result, plan.stats);
     return result;
   }
 
   // Manual/automation switches can both reach this service; serialize them so
   // they cannot generate two IDs from the same pre-sync snapshot.
   let pending = Promise.resolve();
-  const sync = function syncOfficialAutomations(sourceUid, targetUid) {
-    const run = pending.then(() => reconcile(sourceUid, targetUid));
+  const sync = function syncOfficialAutomations(sourceUid, targetUid, mode) {
+    const run = pending.then(() => reconcile(sourceUid, targetUid, mode));
     pending = run.catch(() => {});
     return run;
   };
 
-  // 上一次同步是否留下未完成的转移（切号成功但同步失败 / 进程中断）。
-  sync.pendingSync = function pendingSync() {
+  // 未完成的转移意图（切号成功但同步失败 / 进程中断）。
+  sync.pendingSync = function pendingSync(targetUid) {
     const state = readMapping(mappingFile).__syncState || {};
-    const value = state.pending;
-    if (!value || !cleanUid(value.sourceUid) || !cleanUid(value.targetUid)) return null;
-    return { sourceUid: cleanUid(value.sourceUid), targetUid: cleanUid(value.targetUid), at: Number(value.at) || 0 };
+    const list = Array.isArray(state.pending) ? state.pending : [];
+    const wanted = cleanUid(targetUid);
+    const match = wanted
+      ? list.find(item => item && cleanUid(item.targetUid) === wanted)
+      : list[list.length - 1];
+    if (!match) return null;
+    return {
+      sourceUid: cleanUid(match.sourceUid),
+      targetUid: cleanUid(match.targetUid),
+      mode: SYNC_MODES.has(match.mode) ? match.mode : 'move',
+      at: Number(match.at) || 0,
+    };
   };
 
-  sync.resume = async function resume() {
-    const held = sync.pendingSync();
+  // 按记录里的原始 mode 恢复，避免失败后用户改了设置、用另一种语义续做。
+  sync.resume = async function resume(targetUid) {
+    const held = sync.pendingSync(targetUid);
     if (!held) return { resumed: false };
-    const result = await sync(held.sourceUid, held.targetUid);
+    const result = await sync(held.sourceUid, held.targetUid, held.mode);
     return { resumed: true, ...result };
   };
 
   return sync;
 }
 
-module.exports = { AUTOMATION_COLUMNS, cleanUid, createOfficialAutomationSync };
+module.exports = { AUTOMATION_COLUMNS, cleanUid, createOfficialAutomationSync, fingerprint, legacyFingerprint };

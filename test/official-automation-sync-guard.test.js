@@ -2,12 +2,12 @@
 
 // 第二轮复审（P1-1 / P1-2 / P1-3 / P2-1 / P2-2 / P2-4 / P2-5）锁定的契约：
 //   1. 分组是任务身份的一部分：同名同内容但不同分组的跨账号任务不得合并；
-//   2. 规划之后被并发修改的行必须整笔回滚，不能在旧决策上改新内容；
-//   3. 切号成功但同步失败要留下可恢复的 pending，restart 后能续做；
-//   4. 只有明确的 schema 缺失才降级，库被锁等错误必须抛出；
-//   5. 目标账号多个同名分组时按路径消歧，消不了就不绑定；
-//   6. 历史 mapping 把同账号不同定义的任务连在一起时报冲突、不动数据；
-//   7. getMode 每次同步只读取一次。
+//   2. 1.3.7 的历史快照升级后仍然有效，升级本身不算一次全量编辑；
+//   3. 读取、判定、写入同处一个事务；回滚后 retired 不得残留；
+//   4. pending 在任何数据库读取之前落盘，读取失败也能恢复；
+//   5. 只有明确的 schema 缺失才降级，库被锁等错误必须抛出；
+//   6. 目标账号多个同名分组时按路径消歧，消不了就不绑定；
+//   7. 历史 mapping 把同账号不同定义的任务连在一起时报冲突、不动数据。
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -15,7 +15,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createSessionDb } = require('../scripts/session-db');
-const { createOfficialAutomationSync } = require('../scripts/official-automation-sync');
+const { createOfficialAutomationSync, legacyFingerprint } = require('../scripts/official-automation-sync');
 
 async function fixture(t, accounts = ['a', 'b', 'h']) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-official-guard-'));
@@ -65,7 +65,6 @@ test('分组参与任务身份：同名同内容但不同分组的跨账号任�
 
   await f.buildSync()('a', 'b');
   const rows = await f.live();
-  // 两个不同分组的任务都跟到当前账号，但依然是两条独立任务。
   assert.equal(rows.length, 2, '不同分组不得被当成同一任务合并');
   assert.deepEqual(rows.map(r => r.id).sort(), ['task-a', 'task-b']);
   assert.ok(rows.every(r => r.owner_user_id === 'b'));
@@ -83,10 +82,23 @@ test('分组名一致的跨账号副本仍然收敛成一行', async t => {
   assert.equal((await f.live()).length, 1);
 });
 
-test('规划后被并发修改的任务整笔回滚，不在旧决策上改新内容', async t => {
+test('读取发生在事务内：move 模式不再用事务外的 db.all 读任务表', async t => {
   const f = await fixture(t);
   await f.insert('only', 'a', { updated_at: 5 });
-  // 模拟客户端在 SELECT 之后、事务提交之前改写了这一行。
+  const strict = {
+    ...f.db,
+    async all(sql, params) {
+      if (/FROM automations/.test(sql)) throw new Error('读取必须走事务内连接');
+      return f.db.all(sql, params);
+    },
+  };
+  await f.buildSync({ db: strict })('a', 'b');
+  assert.equal((await f.live())[0].owner_user_id, 'b');
+});
+
+test('事务开始时看到的修改会被完整带上，不产生丢失更新', async t => {
+  const f = await fixture(t);
+  await f.insert('only', 'a', { updated_at: 5 });
   const racing = {
     ...f.db,
     async writeTransaction(work) {
@@ -94,12 +106,10 @@ test('规划后被并发修改的任务整笔回滚，不在旧决策上改新�
       return f.db.writeTransaction(work);
     },
   };
-  const sync = f.buildSync({ db: racing });
-  await assert.rejects(sync('a', 'b'), /被修改|已回滚/);
+  await f.buildSync({ db: racing })('a', 'b');
   const row = (await f.db.all('SELECT * FROM automations WHERE id = ?', ['only']))[0];
-  assert.equal(row.owner_user_id, 'a', '并发修改时不得转移归属');
-  assert.equal(row.deleted_at, null);
-  assert.equal(row.prompt, '用户刚改的内容', '用户刚写入的内容必须保留');
+  assert.equal(row.owner_user_id, 'b');
+  assert.equal(row.prompt, '用户刚改的内容', '用户刚写入的内容必须跟着任务一起走');
 });
 
 test('切号成功但同步失败会留下 pending，resume 能续做并清空', async t => {
@@ -115,26 +125,40 @@ test('切号成功但同步失败会留下 pending，resume 能续做并清空',
   };
   const sync = f.buildSync({ db: flaky });
   await assert.rejects(sync('a', 'b'), /fixture busy/);
-  assert.deepEqual({ ...sync.pendingSync() }, { sourceUid: 'a', targetUid: 'b', at: sync.pendingSync().at });
+  const held = sync.pendingSync();
+  assert.equal(held.sourceUid, 'a');
+  assert.equal(held.targetUid, 'b');
+  assert.equal(held.mode, 'move');
   assert.equal((await f.live())[0].owner_user_id, 'a', '失败时任务仍归旧账号');
 
-  const resumed = await sync.resume();
+  const resumed = await sync.resume('b');
   assert.equal(resumed.resumed, true);
   assert.equal((await f.live())[0].owner_user_id, 'b');
   assert.equal(sync.pendingSync(), null, '成功后必须清空 pending');
 });
 
-test('只有 schema 缺失才降级，库被锁必须抛出而不是丢分组', async t => {
+test('读取阶段就失败也会留下 pending（库被锁不能被吞）', async t => {
   const f = await fixture(t);
   await f.insert('only', 'a');
   const broken = {
     ...f.db,
-    async all(sql, params) {
-      if (/SELECT space_id FROM automations LIMIT 1/.test(sql)) throw new Error('database is locked');
-      return f.db.all(sql, params);
+    async writeTransaction(work) {
+      return f.db.writeTransaction(async (tx) => {
+        const wrapped = {
+          all(sql, params) {
+            if (/SELECT space_id FROM automations LIMIT 1/.test(sql)) throw new Error('database is locked');
+            return tx.all(sql, params);
+          },
+          run(sql, params) { return tx.run(sql, params); },
+        };
+        return work(wrapped);
+      });
     },
   };
-  await assert.rejects(f.buildSync({ db: broken })('a', 'b'), /database is locked/);
+  const sync = f.buildSync({ db: broken });
+  await assert.rejects(sync('a', 'b'), /database is locked/);
+  assert.equal(sync.pendingSync().targetUid, 'b', '读取失败也必须留下可恢复记录');
+  assert.equal((await f.live())[0].owner_user_id, 'a');
 });
 
 test('目标账号存在多个同名分组时按路径消歧，消不了就不绑定', async t => {
@@ -145,8 +169,7 @@ test('目标账号存在多个同名分组时按路径消歧，消不了就不�
   await f.insert('task', 'a', { updated_at: 3, space_id: 'src' });
 
   await f.buildSync()('a', 'b');
-  const moved = (await f.live())[0];
-  assert.equal(moved.space_id, 'dup-1', '路径一致的同名分组才是对应的那一个');
+  assert.equal((await f.live())[0].space_id, 'dup-1', '路径一致的同名分组才是对应的那一个');
 
   const g = await fixture(t);
   await g.space('src', 'a', '工作区');
@@ -174,6 +197,30 @@ test('历史 mapping 把同账号不同定义的任务连在一起时报冲突�
   assert.ok(rows.every(r => r.owner_user_id === 'a'));
 });
 
+test('1.3.7 的历史快照升级后仍生效：真实编辑压过调度器更新时间', async t => {
+  const f = await fixture(t);
+  await f.insert('x1', 'a', { name: '今日汇总', updated_at: 100 });
+  await f.insert('x2', 'b', { name: '今日汇总', updated_at: 200 });
+  const [rowA] = await f.db.all('SELECT * FROM automations WHERE id = ?', ['x1']);
+  const [rowB] = await f.db.all('SELECT * FROM automations WHERE id = ?', ['x2']);
+  // 用 1.3.7 的算法写快照，模拟升级前留下的历史记录。
+  fs.writeFileSync(f.mappingFile, JSON.stringify({
+    'a:x1:b': { targetAutomationId: 'x2', sourceUpdatedAt: '100' },
+    __syncState: {
+      snapshots: { 'a:x1': legacyFingerprint(rowA), 'b:x2': legacyFingerprint(rowB) },
+      retired: {},
+    },
+  }));
+  // A 被真实改过名（更新时间反而更旧），B 只是被调度器跑过一次。
+  await f.db.run('UPDATE automations SET name = ? WHERE id = ?', ['今日汇总 v2', 'x1']);
+
+  await f.buildSync()('a', 'b');
+  const rows = await f.live();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].name, '今日汇总 v2', '真实编辑不能被调度器时间戳顶掉');
+  assert.equal(rows[0].owner_user_id, 'b');
+});
+
 test('getMode 每次同步只读取一次', async t => {
   const f = await fixture(t);
   await f.insert('only', 'a', { updated_at: 3 });
@@ -181,4 +228,20 @@ test('getMode 每次同步只读取一次', async t => {
   const sync = f.buildSync({ mode: undefined, getMode: () => { calls++; return 'move'; } });
   await sync('a', 'b');
   assert.equal(calls, 1);
+});
+
+test('copy 模式新增与更新都会带上目标账号的分组', async t => {
+  const f = await fixture(t);
+  await f.space('sp-a', 'a', '工作区甲');
+  await f.space('sp-b1', 'b', '工作区甲');
+  await f.space('sp-b2', 'b', '工作区乙');
+  await f.space('sp-h', 'h', '工作区甲');
+  await f.insert('only', 'a', { updated_at: 3, space_id: 'sp-a' });
+
+  const sync = f.buildSync({ mode: 'copy' });
+  await sync('a', 'b');
+  const bRow = (await f.db.all('SELECT * FROM automations WHERE owner_user_id = ?', ['b']))[0];
+  assert.equal(bRow.space_id, 'sp-b1', '副本要换成目标账号自己的同名分组');
+  const hRow = (await f.db.all('SELECT * FROM automations WHERE owner_user_id = ?', ['h']))[0];
+  assert.equal(hRow.space_id, 'sp-h');
 });
