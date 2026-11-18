@@ -364,6 +364,10 @@ function startRehomeWatcher() {
         try { alignStartupRoutes(PROFILE.dataRoot, prevUid || newUid); }
         catch (e) { log(`[rehome] startup-route 对齐失败: ${e.message}`); }
       }
+      // 顺序要紧：先把该账号的旧欠账按「记录里的原始 mode」还完，再执行本次切号
+      // 的同步。反过来的话，新 move 成功之后旧 copy 再执行，会把刚收敛的副本
+      // 重新造出来（第三轮复审 P1）。恢复本身不受同步开关限制。
+      await pumpAutomationResume('watcher');
       // 客户端内直接登录不走 /api/switch，也必须同步官方定时任务的归属，
       // 否则新 move 模型只覆盖手动切号，这类入口仍会留下旧账号的任务。
       if (prevUid && newUid && prevUid !== newUid
@@ -374,8 +378,8 @@ function startRehomeWatcher() {
         } catch (error) {
           log(`[automation-sync] 直接登录路径同步失败: ${error.message}`);
         }
-        // 之前失败留下的 pending 落到这个账号时，这里当场续做，不必等重启。
-        await resumeOfficialAccountAutomations('watcher');
+        // 本次同步若失败会自己留下 pending，这里立刻按退避继续尝试。
+        await pumpAutomationResume('watcher-after-sync');
       }
       // 客户端内直接登录/无感登录也要把完全访问补回去（不经过 /api/switch）。
       schedulePermissionSync(newUid, { delayMs: 1500 });
@@ -751,8 +755,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 //        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
 // 1.3.1：可靠性 + 安全加固（不新增功能）。tag、本常量、package.json 三者必须一致，
 //        release.yml 会当场比对，不一致就拒绝发布。
-const DAEMON_VERSION = '1.3.9';
-const DAEMON_BUILD_ID = 'release-1.3.9-full-fork';
+const DAEMON_VERSION = '1.3.10';
+const DAEMON_BUILD_ID = 'release-1.3.10-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -4332,6 +4336,8 @@ function automationSwitchAccount(account, options = {}) {
         try { Object.assign(officialAutomationSync, await syncOfficialAccountAutomations(sourceUid, uid)); }
         catch (error) { officialAutomationSync.error = '官方定时任务同步失败'; log(`[automation-switch] 官方定时任务同步失败: ${error.message}`); }
       }
+      // 开关关着也要把该账号的历史欠账还完：pending 是上一轮切号成功后的遗留。
+      await pumpAutomationResume('switch');
       pendingAutomationAccountSwitch = { account: { uid: acct.uid, nickname: acct.nickname } };
       await reloadWorkBuddyPage({ account: acct });
       if (pendingAutomationAccountSwitch) {
@@ -5232,6 +5238,7 @@ const officialAutomationSyncEngine = PROFILE.kind === 'workbuddy'
     getAccountUids: () => listAccounts(DATA_DIR).map(account => assertSessionAccountIdentity(account.uid)),
     // move = 单份任务跟着当前账号走；copy = 旧的多账号各一份模型。
     getMode: () => readAutomationSyncSettings(DATA_DIR).mode,
+    log: (msg) => { try { log(msg); } catch (_) {} },
   })
   : null;
 const CODEBUDDY_SESSIONS = PROFILE.kind === 'codebuddy' ? createCodeBuddySessionStore({
@@ -8445,26 +8452,67 @@ async function resumeOfficialAccountAutomations(reason) {
   }
   const active = currentAccount();
   const activeUid = String((active && active.uid) || '');
-  let held = null;
+  if (!activeUid) return { resumed: false };
+  let held = [];
   try {
-    held = officialAutomationSyncEngine.pendingSync();
-    if (!held) return { resumed: false };
-    if (!officialAutomationSyncEngine.pendingSync(activeUid)) {
-      log(`[automation-sync] 存在未完成的定时任务转移 ${held.sourceUid}->${held.targetUid}，当前账号 ${activeUid} 不匹配，保留待恢复`);
-      return { resumed: false, pending: held };
-    }
+    held = typeof officialAutomationSyncEngine.pendingList === 'function'
+      ? officialAutomationSyncEngine.pendingList(activeUid)
+      : [];
+    if (!held.length) return { resumed: false };
   } catch (error) {
     log(`[automation-sync] 待恢复状态读取失败: ${error.message}`);
     return { resumed: false };
   }
   try {
     const result = await officialAutomationSyncEngine.resume(activeUid);
-    log(`[automation-sync] 恢复未完成的转移 ${held.sourceUid}->${held.targetUid} (${reason}) moved=${result.moved || 0} removed=${result.removed || 0}`);
+    log(`[automation-sync] 恢复未完成的转移 ${held.length} 条 (${reason}) 完成=${result.drained || 0} 剩余=${result.pending || 0}`);
     return result;
   } catch (error) {
     log(`[automation-sync] 恢复未完成的转移失败 (${reason}): ${error.message}`);
     return { resumed: false, error: error.message };
   }
+}
+
+// 恢复不受「同步开关」限制：pending 是切号已经成功后留下的欠账，
+// 用户关掉开关只是不想再自动同步，不代表可以永久不把欠账还上。
+// 失败则按指数退避重排，直到队列清空或账号不再匹配（下次切回再续）。
+let automationResumeTimer = null;
+let automationResumeDelay = 5000;
+function scheduleAutomationResume(reason) {
+  if (automationResumeTimer) return;
+  const delay = Math.min(automationResumeDelay, 300000);
+  automationResumeDelay = Math.min(automationResumeDelay * 2, 300000);
+  automationResumeTimer = setTimeout(() => {
+    automationResumeTimer = null;
+    pumpAutomationResume(reason).catch(() => {});
+  }, delay);
+  if (automationResumeTimer.unref) automationResumeTimer.unref();
+}
+async function pumpAutomationResume(reason) {
+  if (!officialAutomationSyncEngine || typeof officialAutomationSyncEngine.pendingList !== 'function') {
+    return { resumed: false };
+  }
+  const active = currentAccount();
+  const activeUid = String((active && active.uid) || '');
+  let pendingAll = [];
+  try { pendingAll = officialAutomationSyncEngine.pendingList() || []; }
+  catch (error) {
+    log(`[automation-sync] 待恢复队列读取失败: ${error.message}`);
+    scheduleAutomationResume(reason);
+    return { resumed: false };
+  }
+  if (!pendingAll.length) { automationResumeDelay = 5000; return { resumed: false, pending: 0 }; }
+  const mine = activeUid ? pendingAll.filter(item => item.targetUid === activeUid) : [];
+  if (!mine.length) {
+    // 队列是别的账号的欠账：低频轮询，等切回该账号时再续做。
+    automationResumeDelay = 60000;
+    scheduleAutomationResume(reason);
+    return { resumed: false, pending: pendingAll.length };
+  }
+  const result = await resumeOfficialAccountAutomations(reason);
+  if (result && result.resumed) { automationResumeDelay = 5000; return result; }
+  scheduleAutomationResume(reason);
+  return result;
 }
 
 function accountBackupFile(uid) {
@@ -13962,6 +14010,8 @@ function handleApi(req, res) {
             log(`[switch] 官方定时任务同步失败: ${error.message}`);
           }
         }
+        // 开关关着也要把该账号的历史欠账还完：pending 是上一轮切号成功后的遗留。
+        await pumpAutomationResume('switch');
         let reloaded = false;
         if (body.reload) {
           try {
@@ -14330,8 +14380,9 @@ function startServer() {
       writeUiPortFile(port);
       log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
       startRehomeWatcher();
-      // 上次切号若在任务同步阶段失败，这里把它续做完（账号不匹配则保留 pending）。
-      setTimeout(() => { resumeOfficialAccountAutomations('startup').catch(() => {}); }, 4000);
+      // 上次切号若在任务同步阶段失败，这里把它续做完；失败按指数退避重排，
+      // 账号不匹配则低频轮询，切回该账号时继续（恢复不受同步开关限制）。
+      setTimeout(() => { pumpAutomationResume('startup').catch(() => {}); }, 4000);
       // 启动恢复检查：默认只读报告，不改数据库；startupReconcile=true 才自动接管。
       setTimeout(() => {
         const cfg = getRehomeRunner().readConfig();

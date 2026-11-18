@@ -245,3 +245,142 @@ test('copy 模式新增与更新都会带上目标账号的分组', async t => {
   const hRow = (await f.db.all('SELECT * FROM automations WHERE owner_user_id = ?', ['h']))[0];
   assert.equal(hRow.space_id, 'sp-h');
 });
+
+/* ===== 第三轮复审（P1-A / P1-B / P1-C / P2-1 / P2-2 / P2-4）新增契约 ===== */
+
+test('旧 mapping 已关联、定义相同但分组不同的跨账号任务：判冲突不合并不删除', async t => {
+  // v1 快照不含分组，兼容判定会把这两行都当成「未修改」。若继续执行 move，
+  // 就会把两个本来属于不同分组的任务合成一个并软删一条。
+  const f = await fixture(t);
+  await f.space('sp-a', 'a', '工作区甲');
+  await f.space('sp-b', 'b', '工作区乙');
+  await f.insert('x1', 'a', { updated_at: 3, space_id: 'sp-a' });
+  await f.insert('x2', 'b', { updated_at: 3, space_id: 'sp-b' });
+  const [rowA] = await f.db.all('SELECT * FROM automations WHERE id = ?', ['x1']);
+  const [rowB] = await f.db.all('SELECT * FROM automations WHERE id = ?', ['x2']);
+  fs.writeFileSync(f.mappingFile, JSON.stringify({
+    'a:x1:b': { targetAutomationId: 'x2', sourceUpdatedAt: '3' },
+    __syncState: {
+      snapshots: { 'a:x1': legacyFingerprint(rowA), 'b:x2': legacyFingerprint(rowB) },
+      retired: {},
+    },
+  }));
+
+  const result = await f.buildSync()('a', 'b');
+  assert.equal(result.conflicts, 1, '跨账号分组漂移必须报冲突');
+  assert.equal(result.removed, 0, '冲突时不得软删除任何一条');
+  const rows = await f.live();
+  assert.equal(rows.length, 2, '两个不同分组的任务都必须保留');
+  assert.deepEqual(rows.map(r => r.id).sort(), ['x1', 'x2']);
+  assert.equal(rows.find(r => r.id === 'x1').owner_user_id, 'a', '冲突时不得转移归属');
+});
+
+test('pending 里的旧 copy 不会在新 move 成功之后反向执行', async t => {
+  const f = await fixture(t);
+  await f.insert('only', 'a', { updated_at: 5 });
+  // 先制造一条 a->b 的 copy 欠账（模拟上次切号同步失败）。
+  let failOnce = true;
+  const flaky = {
+    ...f.db,
+    async writeTransaction(work) {
+      if (failOnce) { failOnce = false; throw new Error('fixture busy'); }
+      return f.db.writeTransaction(work);
+    },
+  };
+  const cold = f.buildSync({ db: flaky, mode: 'copy' });
+  await assert.rejects(cold('a', 'b'), /fixture busy/);
+  assert.equal(cold.pendingSync('b').mode, 'copy', '欠账记录原始 mode');
+
+  // 用户改成 move 后再切一次同样的账号：新意图必须压过旧欠账，
+  // 不能出现「move 刚收敛完、旧 copy 又造出副本」。
+  const warm = f.buildSync({ mode: 'move' });
+  const result = await warm('a', 'b');
+  assert.equal(result.moved, 1);
+  assert.equal(result.drained, undefined, '同 source/target 的旧欠账不单独重放');
+  const rows = await f.live();
+  assert.equal(rows.length, 1, '同一任务只能剩一行');
+  assert.equal(rows[0].owner_user_id, 'b');
+  assert.equal(warm.pendingSync('b'), null, '成功后必须清空欠账');
+});
+
+test('不同 source 的同目标欠账先于本次同步执行（FIFO，不被新结果顶掉）', async t => {
+  const f = await fixture(t);
+  await f.insert('task-a', 'a', { updated_at: 5, name: '甲任务' });
+  await f.insert('task-c', 'c', { updated_at: 5, name: '丙任务' });
+  fs.writeFileSync(f.mappingFile, JSON.stringify({
+    __syncState: {
+      snapshots: {}, retired: {},
+      pending: [{ sourceUid: 'a', targetUid: 'b', mode: 'copy', at: 1 }],
+    },
+  }));
+
+  const result = await f.buildSync({ mode: 'move' })('c', 'b');
+  assert.equal(result.drained, 1, '同目标的旧欠账必须先执行');
+  const rows = await f.live();
+  // 旧 copy 把甲任务复制到各账号；新 move 把丙任务转到 b。
+  assert.ok(rows.some(r => r.name === '甲任务' && r.owner_user_id === 'b'), '旧 copy 已按原始 mode 完成');
+  assert.ok(rows.some(r => r.name === '丙任务' && r.owner_user_id === 'b'), '新 move 也已执行');
+});
+
+test('resume 一次把该目标账号的欠账全部做完并清空', async t => {
+  const f = await fixture(t);
+  await f.insert('t1', 'a', { updated_at: 5, name: '任务一', rrule: 'FREQ=DAILY;BYHOUR=9' });
+  await f.insert('t2', 'c', { updated_at: 5, name: '任务二', rrule: 'FREQ=DAILY;BYHOUR=11' });
+  fs.writeFileSync(f.mappingFile, JSON.stringify({
+    __syncState: {
+      snapshots: {}, retired: {},
+      pending: [
+        { sourceUid: 'a', targetUid: 'b', mode: 'move', at: 1 },
+        { sourceUid: 'c', targetUid: 'b', mode: 'move', at: 2 },
+      ],
+    },
+  }));
+
+  const sync = f.buildSync();
+  assert.equal(sync.pendingList('b').length, 2);
+  const result = await sync.resume('b');
+  assert.equal(result.resumed, true);
+  assert.equal(result.drained, 2, '两条欠账都要处理');
+  assert.equal(sync.pendingList('b').length, 0, '全部完成后必须清空');
+  const rows = await f.live();
+  assert.ok(rows.every(r => r.owner_user_id === 'b'), '两条任务都要落到目标账号');
+  assert.equal(rows.length, 2);
+});
+
+test('待恢复队列满载时拒绝新增，不静默丢弃最旧记录', async t => {
+  const f = await fixture(t);
+  await f.insert('only', 'a', { updated_at: 5 });
+  const full = [];
+  for (let i = 0; i < 32; i++) {
+    full.push({ sourceUid: `u${i}`, targetUid: `t${i}`, mode: 'move', at: i + 1 });
+  }
+  fs.writeFileSync(f.mappingFile, JSON.stringify({ __syncState: { snapshots: {}, retired: {}, pending: full } }));
+  const sync = f.buildSync();
+  await assert.rejects(sync('a', 'b'), /待恢复队列已满/);
+  assert.equal(sync.pendingList().length, 32, '满载时既不能丢旧的，也不能塞新的');
+});
+
+test('copy 模式纠正跨账号错误分组引用', async t => {
+  const f = await fixture(t);
+  await f.space('sp-a', 'a', '工作区甲');
+  await f.space('sp-b', 'b', '工作区甲');
+  await f.insert('x1', 'a', { updated_at: 3, space_id: 'sp-a' });
+  // B 的副本名称一致，但 space_id 错误地指向 A 账号的分组。
+  await f.insert('x2', 'b', { updated_at: 3, space_id: 'sp-a' });
+  fs.writeFileSync(f.mappingFile, JSON.stringify({
+    'a:x1:b': { targetAutomationId: 'x2', sourceUpdatedAt: '3' },
+    __syncState: { snapshots: {}, retired: {} },
+  }));
+
+  await f.buildSync({ mode: 'copy' })('a', 'b');
+  const bRow = (await f.db.all('SELECT * FROM automations WHERE id = ?', ['x2']))[0];
+  assert.equal(bRow.space_id, 'sp-b', '必须改回 B 自己的同名分组，不能留跨账号悬空引用');
+});
+
+test('没有回调式事务的后端，copy 也必须拒绝（不再降级）', async t => {
+  const f = await fixture(t);
+  await f.insert('only', 'a', { updated_at: 5 });
+  const legacy = { all: f.db.all.bind(f.db), run: f.db.run.bind(f.db) };
+  await assert.rejects(f.buildSync({ db: legacy, mode: 'copy' })('a', 'b'), /不支持事务内读取/);
+  assert.equal((await f.live())[0].owner_user_id, 'a', '拒绝时不得留下半成品');
+});

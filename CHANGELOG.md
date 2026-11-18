@@ -5,6 +5,49 @@
 
 格式参考 Keep a Changelog；版本号沿用 `scripts/daemon.js` 里的 `DAEMON_VERSION`。
 
+## [1.3.10] — 未发布（分支 `review/automation-order-1.3.10`）
+
+第三轮独立复审对 1.3.9 判 NO-GO（P0 零项、P1 三项）。事务与 retired 的核心边界已被
+确认通过，不需要重新设计；本版只按复审给出的最小顺序补三个缺口与四条 P2。
+
+### 修复
+
+- **恢复顺序（P1-A）**：`sync()` 在串行链内部先按 `pending` 里记录的**原始 mode**
+  把该目标账号的旧欠账按 FIFO 全部还完，再执行本次调用。此前 watcher 是
+  「先新同步、后恢复」，新 `move` 成功之后旧 `copy` 还会反向执行，重新造出副本。
+  同一 `source/target` 的旧记录不单独重放：新调用即该任务的最新意图，
+  成功后在阶段 C 一并清掉。
+- **v1 快照兼容缺口（P1-B）**：`legacyFingerprint()` 只证明定义字段没变，不证明分组
+  身份一致。新增 `componentHasCrossOwnerGroupDrift()`：历史 mapping 已把「定义相同、
+  分组不同」的跨账号任务连在一起时报 `conflicts` 并原样保留，不合并、不转移、不软删。
+  这是 v1 算法本身缺分组字段导致的确定性漏判，不是哈希碰撞。
+- **恢复可达性（P1-C）**：恢复不再受「同步开关」限制——pending 是切号成功后的欠账，
+  关开关只是不想再自动同步，不等于可以不还。新增 `pumpAutomationResume()`：
+  启动、切号、直接登录三条路径都会触发；失败按 5s→300s 指数退避重排，
+  账号不匹配时降到 60s 低频轮询，切回该账号即续做。`resume()` 一次把该目标账号的
+  欠账全部做完（FIFO），不再只处理一条。
+
+### 修复（P2）
+
+- **copy 分组纠正（P2-1）**：指纹用的是分组名而非分组 id，目标账号的副本若引用了
+  源账号的同名分组，两边哈希相等会让 UPDATE 被跳过，跨账号悬空引用就留下来了。
+  新增 `spaceChanged` 作为更新条件之一。
+- **降级路径收敛（P2-2）**：`copy` 与 `move` 一样要求回调式事务，没有就拒绝。
+  一条路径有守卫、另一条没有，比两条都拒绝更危险。
+- **缩短持锁（P2-3）**：`getAccountUids()` 与分组表读取移出事务，分组改为一次性
+  预取成 `byId`/`byOwner` 索引，`resolveSpaceFor()` 变成纯内存查询；
+  `BEGIN IMMEDIATE` 期间不再有非数据库工作。有 `space_id` 列却读不到分组表时
+  直接失败，避免把 `space_id` 写成空值。
+- **队列语义（P2-4）**：`pending` 改为完整 FIFO 队列，上限 32 条，满载时拒绝新增并
+  明确报错；不再用 `slice(-4)` 静默丢弃最旧记录。`pendingSync()` 无参数返回队首。
+
+### 测试
+
+`test/official-automation-sync-guard.test.js` 增至 18 条，新增覆盖：旧 mapping 跨账号
+分组漂移必须报冲突、同 pair 旧 copy 不重放、不同 source 欠账先于本次同步、
+`resume` 一次清空多条 FIFO、队列满载拒绝新增、copy 纠正错误分组引用、
+无事务后端连 copy 也拒绝。
+
 ## [1.3.9] — 未发布（分支 `review/automation-tx-1.3.9`）
 
 第二轮独立复审对 1.3.8 判 NO-GO（P1 三项未闭环）。1.3.8 未发布、未部署。

@@ -109,7 +109,7 @@ function spaceIdentityOf(row, index) {
   if (!index) return '';
   const id = row && row.space_id != null ? String(row.space_id).trim() : '';
   if (!id) return '';
-  const record = index.get(id);
+  const record = index.byId ? index.byId.get(id) : index.get(id);
   return record && record.name ? normalizeSpaceName(record.name) : '';
 }
 
@@ -215,47 +215,54 @@ function createOfficialAutomationSync(options = {}) {
     return spaceColumn;
   }
 
+  // 分组表一次性读成内存索引：事务里不再反复 SELECT spaces，缩短 BEGIN IMMEDIATE
+  // 的持锁时间。索引同时保留 id→记录 与 owner→候选行 两份视图。
   async function loadSpaceIndex(read) {
     let rows;
     try {
-      rows = await read('SELECT id, name, primary_folder_path, create_folder_path FROM spaces');
+      rows = await read('SELECT id, name, primary_folder_path, create_folder_path, user_id FROM spaces WHERE COALESCE(deleted_at, -1) = -1 ORDER BY id ASC');
     } catch (error) {
-      if (isMissingSchema(error, 'spaces')) return new Map();
+      if (isMissingSchema(error, 'spaces')) return null;
       throw error;
     }
-    const index = new Map();
-    for (const row of rows) {
-      index.set(String(row.id), {
+    const byId = new Map();
+    const byOwner = new Map();
+    for (const row of rows || []) {
+      const record = {
+        id: String(row.id).trim(),
         name: String(row.name || '').trim(),
         paths: [row.primary_folder_path, row.create_folder_path].map(normalizeSpacePath).filter(Boolean),
-      });
+      };
+      byId.set(record.id, record);
+      const owner = String(row.user_id || '').trim();
+      if (!owner) continue;
+      const list = byOwner.get(owner) || [];
+      list.push(record);
+      byOwner.set(owner, list);
     }
-    return index;
+    return { byId, byOwner };
   }
 
   // 任务转移账号后，分组引用必须改成目标账号自己的同名分组，否则客户端会引用
   // 别的账号的分组行。找不到同名分组就置空，宁可不分组也不跨账号悬空。
-  async function resolveSpaceFor(read, spaceId, targetUid, spaceIndex) {
-    if (!spaceId) return '';
-    const record = spaceIndex ? spaceIndex.get(String(spaceId)) : null;
+  // 纯内存查询：候选行来自一次性预取的 byOwner 索引。
+  function resolveSpaceFor(spaceId, targetUid, spaceIndex) {
+    if (!spaceId || !spaceIndex) return '';
+    const record = spaceIndex.byId.get(String(spaceId).trim());
     const name = record && record.name ? record.name : '';
     if (!name) return '';
-    const wantedName = normalizeSpaceName(name);
-    const rows = await read(
-      'SELECT id, name, primary_folder_path, create_folder_path FROM spaces WHERE user_id = ? AND COALESCE(deleted_at, -1) = -1 ORDER BY id ASC',
-      [targetUid]
-    );
     // 名称比较与 fingerprint 口径一致（都走 normalizeSpaceName），避免一边忽略大小写
     // 一边精确匹配，出现「认为是同一个分组却找不到」的自相矛盾。
-    const candidates = rows.filter((row) => normalizeSpaceName(row.name) === wantedName);
+    const wantedName = normalizeSpaceName(name);
+    const candidates = (spaceIndex.byOwner.get(String(targetUid)) || [])
+      .filter((row) => normalizeSpaceName(row.name) === wantedName);
     if (!candidates.length) return '';
-    if (candidates.length === 1) return String(candidates[0].id).trim();
+    if (candidates.length === 1) return candidates[0].id;
     // 目标账号存在多个同名分组：只有路径能唯一对上时才绑定，否则宁可不分组。
     const wantedPaths = new Set(record.paths || []);
     if (!wantedPaths.size) return '';
-    const matched = candidates.filter((row) => [row.primary_folder_path, row.create_folder_path]
-      .map(normalizeSpacePath).filter(Boolean).some((value) => wantedPaths.has(value)));
-    return matched.length === 1 ? String(matched[0].id).trim() : '';
+    const matched = candidates.filter((row) => row.paths.some((value) => wantedPaths.has(value)));
+    return matched.length === 1 ? matched[0].id : '';
   }
 
   // 同一逻辑任务组里，同一个账号出现多条 live 行且定义不同，说明历史 mapping
@@ -274,14 +281,40 @@ function createOfficialAutomationSync(options = {}) {
     return false;
   }
 
+  // 1.3.7 的旧快照不含分组，升级时「旧定义哈希命中」只能证明定义字段没变，
+  // 不能证明分组身份一致。若历史 mapping 已经把「定义相同、分组不同」的两个
+  // 跨账号任务连在一起，v1 兼容会把它们全部判成未修改，move 就会误并、
+  // 甚至软删掉其中一条。这种情形必须报冲突并原样保留，交给人工消歧。
+  function componentHasCrossOwnerGroupDrift(members, legacyOf, identities) {
+    const live = members.filter(isLive);
+    for (let i = 0; i < live.length; i++) {
+      for (let j = i + 1; j < live.length; j++) {
+        const left = live[i];
+        const right = live[j];
+        if (left.owner_user_id === right.owner_user_id) continue;
+        const leftId = nodeKey(left.owner_user_id, left.id);
+        const rightId = nodeKey(right.owner_user_id, right.id);
+        // 定义本来就不同：不是「同一定义被拆到两个分组」，交给正常判定。
+        if (legacyOf.get(leftId) !== legacyOf.get(rightId)) continue;
+        if ((identities.get(leftId) || '') !== (identities.get(rightId) || '')) return true;
+      }
+    }
+    return false;
+  }
+
   // 纯规划：所有数据库读取都通过 read（事务内是 tx.all），不写库、不写文件。
   async function planSync(read, context) {
     const { sourceUid, targetUid, mode, mapping } = context;
     const withSpace = await detectSpaceColumn(read);
-    const spaceIndex = withSpace ? await loadSpaceIndex(read) : null;
-    // Reconcile the union for all saved accounts, including a third account's
-    // unique tasks, before the destination renderer reads its task list.
-    const savedUids = options.getAccountUids ? await options.getAccountUids() : [];
+    // 分组索引与账号列表由 reconcile 在事务外预取：这两项不在同步语义的
+    // 一致性边界内，放进写事务只会无谓地拉长 BEGIN IMMEDIATE 的持锁时间。
+    const spaceIndex = withSpace ? (context.spaceIndex || null) : null;
+    // 有 space_id 列却读不到分组表：无法判断目标账号的分组，继续执行会把
+    // space_id 写成空值，等于悄悄清掉用户的分组归属。宁可整次失败。
+    if (withSpace && !spaceIndex) {
+      throw new Error('无法读取分组表，已放弃定时任务同步以避免清空分组引用');
+    }
+    const savedUids = Array.isArray(context.savedUids) ? context.savedUids : [];
     const owners = [...new Set([sourceUid, targetUid, ...savedUids.map(cleanUid)].filter(Boolean))];
     const selectColumns = withSpace ? [...AUTOMATION_COLUMNS, 'space_id'] : AUTOMATION_COLUMNS;
     const rows = await read(`SELECT ${selectColumns.join(', ')} FROM automations
@@ -295,7 +328,8 @@ function createOfficialAutomationSync(options = {}) {
     const lineage = {};
     const { graph } = mappingGraph(mapping);
     const byNode = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), row]));
-    const hashOf = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), fingerprint(row, spaceIdentityOf(row, spaceIndex))]));
+    const identities = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), spaceIdentityOf(row, spaceIndex)]));
+    const hashOf = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), fingerprint(row, identities.get(nodeKey(row.owner_user_id, row.id)))]));
     const legacyOf = new Map(rows.map(row => [nodeKey(row.owner_user_id, row.id), legacyFingerprint(row)]));
     // 旧快照既可能是 v1（纯定义），也可能是 v2；两者都算「未修改」，
     // 让升级本身不被当成一次全量编辑，快照会在成功后统一改写为 v2。
@@ -353,6 +387,12 @@ function createOfficialAutomationSync(options = {}) {
           stats.conflicts++;
           continue;
         }
+        // 旧 mapping 已把「定义相同、分组不同」的跨账号任务连在一起：v1 兼容
+        // 会把它们都判成未修改，继续执行就会误并/误删。原样保留并报冲突。
+        if (componentHasCrossOwnerGroupDrift(members, legacyOf, identities)) {
+          stats.conflicts++;
+          continue;
+        }
         // 同 copy 模型：一次真实的定义修改压过「只是跑过一次」的更新时间。
         const changed = members.filter((row) => snapshots[nodeKey(row.owner_user_id, row.id)] && !unchanged(row));
         const canonical = [...(changed.length ? changed : members)].sort(freshnessOrder)[0];
@@ -374,7 +414,7 @@ function createOfficialAutomationSync(options = {}) {
           continue;
         }
         const ownSpace = withSpace && canonical.space_id != null ? String(canonical.space_id).trim() : '';
-        const nextSpace = ownSpace ? await resolveSpaceFor(read, ownSpace, targetUid, spaceIndex) : '';
+        const nextSpace = ownSpace ? resolveSpaceFor(ownSpace, targetUid, spaceIndex) : '';
         statements.push({
           sql: transferSql,
           params: withSpace
@@ -408,8 +448,12 @@ function createOfficialAutomationSync(options = {}) {
         if (!row && !live) continue; // Do not manufacture deleted history.
         // copy 模式的副本是另一账号里的独立行，分组必须换成该账号自己的同名分组。
         const ownerSpace = withSpace && canonical.space_id != null && String(canonical.space_id).trim()
-          ? await resolveSpaceFor(read, String(canonical.space_id).trim(), owner, spaceIndex)
+          ? resolveSpaceFor(String(canonical.space_id).trim(), owner, spaceIndex)
           : null;
+        // fingerprint 用的是规范化分组名，不是分组 id：B 账号的副本若引用了 A 账号
+        // 的同名分组，两边哈希相等，只比哈希会跳过 UPDATE，让跨账号悬空引用留下来。
+        const spaceChanged = withSpace && ownerSpace !== null
+          && String(row ? (row.space_id || '') : '') !== String(ownerSpace || '');
         if (!row) {
           const id = String(idFactory());
           if (!/^[0-9a-f-]{8,128}$/i.test(id) || usedIds.has(id)) throw new Error('官方定时任务 ID 无效');
@@ -418,7 +462,7 @@ function createOfficialAutomationSync(options = {}) {
           row = { ...canonical, id, owner_user_id: owner };
           stats.copied++;
           inserts++;
-        } else if (hashOf.get(nodeKey(row.owner_user_id, row.id)) !== canonicalHash) {
+        } else if (hashOf.get(nodeKey(row.owner_user_id, row.id)) !== canonicalHash || spaceChanged) {
           const columns = [...DEFINITION_COLUMNS, 'updated_at'];
           // Renames do not overwrite the target's run history. A changed
           // schedule does need its new next occurrence, as in the official edit.
@@ -461,7 +505,47 @@ function createOfficialAutomationSync(options = {}) {
     return { stats, statements, lineage, snapshots: nextSnapshots, retired: nextRetired, inserts, mode };
   }
 
-  async function reconcile(sourceValue, targetValue, modeValue) {
+  // 待恢复意图上限。队列按 FIFO 处理，满载时拒绝新增而不是静默丢弃最旧记录：
+  // 静默丢弃会让「切号已经完成、任务却没跟过来」变成无人知晓的状态。
+  const PENDING_LIMIT = 32;
+
+  function readPendingList() {
+    const state = readMapping(mappingFile).__syncState || {};
+    return Array.isArray(state.pending) ? state.pending : [];
+  }
+
+  function normalizePending(item) {
+    if (!item) return null;
+    const sourceUid = cleanUid(item.sourceUid);
+    const targetUid = cleanUid(item.targetUid);
+    if (!sourceUid || !targetUid || sourceUid === targetUid) return null;
+    return {
+      sourceUid,
+      targetUid,
+      mode: SYNC_MODES.has(item.mode) ? item.mode : 'move',
+      at: Number(item.at) || 0,
+    };
+  }
+
+  // 事务外预取：账号列表与分组索引不在「读取与写入同一快照」的一致性边界内，
+  // 放进 BEGIN IMMEDIATE 只会延长持锁时间（第三轮复审 P2-3）。每次同步只取一次。
+  function makePrefetchCache() {
+    let promise = null;
+    return function getPrefetch() {
+      if (!promise) {
+        promise = (async () => {
+          const savedUids = options.getAccountUids ? await options.getAccountUids() : [];
+          // 分组表读不到就不能安全重映射：继续执行会把 space_id 写成空，
+          // 等价于悄悄清掉用户的分组归属。这里 fail-closed。
+          const spaceIndex = await loadSpaceIndex((sql, params) => db.all(sql, params));
+          return { savedUids, spaceIndex };
+        })();
+      }
+      return promise;
+    };
+  }
+
+  async function reconcile(sourceValue, targetValue, modeValue, getPrefetch) {
     const sourceUid = cleanUid(sourceValue);
     const targetUid = cleanUid(targetValue);
     const mode = SYNC_MODES.has(modeValue) ? modeValue : resolveMode();
@@ -474,47 +558,54 @@ function createOfficialAutomationSync(options = {}) {
     const state = mapping.__syncState || {};
     const held = Array.isArray(state.pending) ? state.pending : [];
     const pendingList = held
-      .filter(item => item && cleanUid(item.sourceUid) && cleanUid(item.targetUid))
-      .filter(item => !(item.sourceUid === sourceUid && item.targetUid === targetUid));
+      .map(normalizePending)
+      .filter(Boolean)
+      .filter(item => !(item.sourceUid === sourceUid && item.targetUid === targetUid))
+      .sort((a, b) => a.at - b.at);
+    if (pendingList.length >= PENDING_LIMIT) {
+      throw new Error(`定时任务待恢复队列已满（${PENDING_LIMIT} 条），请先完成现有恢复`);
+    }
     pendingList.push({ sourceUid, targetUid, mode, at: Date.now() });
-    const pending = pendingList.slice(-4);
+    const pending = pendingList;
     mapping.__syncState = { ...state, pending };
     writeMapping(mappingFile, mapping);
 
-    // 没有回调式事务的后端无法保证「读取与写入同一事务」，move 模式直接拒绝，
-    // 不做「看起来有保护、实际没有」的降级。
+    // 没有回调式事务的后端无法保证「读取与写入同一事务」：updated_at 守卫与
+    // retired 后置都依赖该保证，copy 与 move 一视同仁，一律拒绝降级路径。
     const supportsTx = typeof db.writeTransaction === 'function';
-    if (mode === 'move' && !supportsTx) {
-      throw new Error('当前数据库后端不支持事务内读取，已拒绝单份任务同步');
+    if (!supportsTx) {
+      throw new Error('当前数据库后端不支持事务内读取，已拒绝定时任务同步');
     }
+
+    // 预取发生在 pending 落盘之后：读取阶段即使被锁，也不丢恢复记录。
+    const prefetched = typeof getPrefetch === 'function'
+      ? await getPrefetch()
+      : { savedUids: [], spaceIndex: null };
 
     // 阶段 B：读取 + 判定 + 写入。node:sqlite 下三者同处一个 BEGIN IMMEDIATE，
     // 规划所依赖的数据在提交前不会被外部改动。
-    let plan;
-    if (supportsTx) {
-      plan = await db.writeTransaction(async (tx) => {
-        const read = (sql, params) => tx.all(sql, params);
-        const built = await planSync(read, { sourceUid, targetUid, mode, mapping });
-        // copy 模式会插入新行：先把 lineage 落盘，崩溃后也不会出现没有身份的新副本。
-        if (built.inserts > 0) {
-          writeMapping(mappingFile, { ...mapping, ...built.lineage, __syncState: { ...state, pending } });
-        }
-        for (const statement of built.statements) {
-          const outcome = tx.run(statement.sql, statement.params);
-          if (statement.guard && Number(outcome && outcome.changes) === 0) {
-            throw new Error('定时任务在同步期间被修改，本次同步已回滚');
-          }
-        }
-        return built;
+    const plan = await db.writeTransaction(async (tx) => {
+      const read = (sql, params) => tx.all(sql, params);
+      const built = await planSync(read, {
+        sourceUid,
+        targetUid,
+        mode,
+        mapping,
+        savedUids: prefetched.savedUids,
+        spaceIndex: prefetched.spaceIndex,
       });
-    } else {
-      const built = await planSync((sql, params) => db.all(sql, params), { sourceUid, targetUid, mode, mapping });
+      // copy 模式会插入新行：先把 lineage 落盘，崩溃后也不会出现没有身份的新副本。
       if (built.inserts > 0) {
         writeMapping(mappingFile, { ...mapping, ...built.lineage, __syncState: { ...state, pending } });
       }
-      if (built.statements.length) await db.transaction(built.statements.map(({ sql, params }) => ({ sql, params })));
-      plan = built;
-    }
+      for (const statement of built.statements) {
+        const outcome = tx.run(statement.sql, statement.params);
+        if (statement.guard && Number(outcome && outcome.changes) === 0) {
+          throw new Error('定时任务在同步期间被修改，本次同步已回滚');
+        }
+      }
+      return built;
+    });
 
     // 阶段 C：SQLite 提交成功后才写回 snapshots / retired / lineage。
     // 回滚时这些状态完全没动过，所以下一轮会重新读取、重新判定，
@@ -534,38 +625,86 @@ function createOfficialAutomationSync(options = {}) {
     return result;
   }
 
+  // 队列里的旧意图必须早于本次调用完成：否则「新 move 已成功、旧 copy 又反向
+  // 执行」会把刚收敛的副本重新造出来（第三轮复审 P1）。drain 在串行链内部
+  // 直接调 reconcile，不经过 sync()，避免重入自己造成死锁。
+  async function drainPending(targetUid, skip, getPrefetch) {
+    const queue = readPendingList()
+      .map(normalizePending)
+      .filter(Boolean)
+      .filter(item => item.targetUid === targetUid)
+      .filter(item => !(skip && item.sourceUid === skip.sourceUid && item.targetUid === skip.targetUid))
+      .sort((a, b) => a.at - b.at);
+    let done = 0;
+    for (const item of queue) {
+      try {
+        await reconcile(item.sourceUid, item.targetUid, item.mode, getPrefetch);
+        done++;
+      } catch (error) {
+        // 旧意图失败不阻断本次：记录仍在队列里，退避重试会继续尝试。
+        if (typeof options.log === 'function') {
+          options.log(`[automation-sync] 待恢复意图 ${item.sourceUid}->${item.targetUid} (${item.mode}) 失败: ${error.message}`);
+        }
+        break;
+      }
+    }
+    return done;
+  }
+
   // Manual/automation switches can both reach this service; serialize them so
   // they cannot generate two IDs from the same pre-sync snapshot.
-  let pending = Promise.resolve();
+  let tail = Promise.resolve();
   const sync = function syncOfficialAutomations(sourceUid, targetUid, mode) {
-    const run = pending.then(() => reconcile(sourceUid, targetUid, mode));
-    pending = run.catch(() => {});
+    const run = tail.then(async () => {
+      const source = cleanUid(sourceUid);
+      const target = cleanUid(targetUid);
+      const resolved = SYNC_MODES.has(mode) ? mode : resolveMode();
+      if (!source || !target || source === target) {
+        return { mode: resolved, copied: 0, updated: 0, moved: 0, removed: 0, skipped: 0, total: 0, conflicts: 0 };
+      }
+      const getPrefetch = makePrefetchCache();
+      // 先清该目标的旧意图（各自按记录里的原始 mode），再执行本次调用：
+      // 最终状态由最新的用户意图决定，旧语义不会在新结果上反悔。
+      const drained = await drainPending(target, { sourceUid: source, targetUid: target }, getPrefetch);
+      const result = await reconcile(source, target, resolved, getPrefetch);
+      if (drained) result.drained = drained;
+      return result;
+    });
+    tail = run.catch(() => {});
     return run;
   };
 
-  // 未完成的转移意图（切号成功但同步失败 / 进程中断）。
+  // 未完成的转移意图（切号成功但同步失败 / 进程中断）。无参数时返回队首
+  // （最早的一条），保证调用方的处理顺序与写入顺序一致。
   sync.pendingSync = function pendingSync(targetUid) {
-    const state = readMapping(mappingFile).__syncState || {};
-    const list = Array.isArray(state.pending) ? state.pending : [];
     const wanted = cleanUid(targetUid);
-    const match = wanted
-      ? list.find(item => item && cleanUid(item.targetUid) === wanted)
-      : list[list.length - 1];
-    if (!match) return null;
-    return {
-      sourceUid: cleanUid(match.sourceUid),
-      targetUid: cleanUid(match.targetUid),
-      mode: SYNC_MODES.has(match.mode) ? match.mode : 'move',
-      at: Number(match.at) || 0,
-    };
+    const queue = readPendingList().map(normalizePending).filter(Boolean).sort((a, b) => a.at - b.at);
+    const match = wanted ? queue.find(item => item.targetUid === wanted) : queue[0];
+    return match || null;
   };
 
-  // 按记录里的原始 mode 恢复，避免失败后用户改了设置、用另一种语义续做。
+  sync.pendingList = function pendingList(targetUid) {
+    const wanted = cleanUid(targetUid);
+    return readPendingList()
+      .map(normalizePending)
+      .filter(Boolean)
+      .filter(item => !wanted || item.targetUid === wanted)
+      .sort((a, b) => a.at - b.at);
+  };
+
+  // 按记录里的原始 mode 恢复。一次把该目标账号的待恢复意图全部做完（FIFO）：
+  // 只处理一条会留下「恢复了一半」的中间状态，后续判定也会基于半成品。
   sync.resume = async function resume(targetUid) {
-    const held = sync.pendingSync(targetUid);
-    if (!held) return { resumed: false };
-    const result = await sync(held.sourceUid, held.targetUid, held.mode);
-    return { resumed: true, ...result };
+    const wanted = cleanUid(targetUid);
+    if (!wanted) return { resumed: false, drained: 0, pending: 0 };
+    if (!sync.pendingList(wanted).length) return { resumed: false, drained: 0, pending: 0 };
+    const run = tail.then(async () => {
+      const getPrefetch = makePrefetchCache();
+      const done = await drainPending(wanted, null, getPrefetch);
+      return { resumed: done > 0, drained: done, pending: sync.pendingList(wanted).length };
+    });
+    tail = run.catch(() => {});
+    return run;
   };
 
   return sync;
