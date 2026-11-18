@@ -384,3 +384,94 @@ test('没有回调式事务的后端，copy 也必须拒绝（不再降级）', 
   await assert.rejects(f.buildSync({ db: legacy, mode: 'copy' })('a', 'b'), /不支持事务内读取/);
   assert.equal((await f.live())[0].owner_user_id, 'a', '拒绝时不得留下半成品');
 });
+
+/* ===== 第四轮复审（P1-A1 / P1-A2 / P1-C）新增契约 ===== */
+
+const writePending = (file, list) => fs.writeFileSync(file, JSON.stringify({
+  __syncState: { snapshots: {}, retired: {}, pending: list },
+}));
+
+test('旧欠账没还完时暂缓本次同步，新意图排到队尾而不是硬执行', async t => {
+  const f = await fixture(t);
+  await f.insert('task-a', 'a', { updated_at: 5, name: '甲任务' });
+  await f.insert('task-c', 'c', { updated_at: 5, name: '丙任务' });
+  writePending(f.mappingFile, [{ sourceUid: 'a', targetUid: 'b', mode: 'copy', at: 1 }]);
+
+  // 第一个事务（旧欠账）失败，后续调用正常。
+  let calls = 0;
+  const flaky = {
+    ...f.db,
+    async writeTransaction(work) {
+      calls++;
+      if (calls === 1) throw new Error('fixture busy');
+      return f.db.writeTransaction(work);
+    },
+  };
+  const sync = f.buildSync({ db: flaky, mode: 'move' });
+  const result = await sync('c', 'b');
+  assert.equal(result.deferred, true, '旧账未清时必须暂缓本次同步');
+  assert.equal(result.moved, 0, '暂缓时不得执行新 move');
+
+  const rows = await f.live();
+  assert.equal(rows.find(r => r.name === '丙任务').owner_user_id, 'c', '新任务不得先动');
+  const queue = sync.pendingList('b');
+  assert.equal(queue.length, 2, '旧欠账与新意图都要留在队列里');
+  assert.deepEqual(queue.map(i => i.sourceUid), ['a', 'c'], '新意图必须排在队尾');
+});
+
+test('重试保留原始 at，失败不会把该条推到队尾打乱 FIFO', async t => {
+  const f = await fixture(t);
+  await f.insert('task-a', 'a', { updated_at: 5, name: '甲任务' });
+  await f.insert('task-c', 'c', { updated_at: 5, name: '丙任务' });
+  writePending(f.mappingFile, [
+    { sourceUid: 'a', targetUid: 'b', mode: 'move', at: 1 },
+    { sourceUid: 'c', targetUid: 'b', mode: 'move', at: 2 },
+  ]);
+
+  let calls = 0;
+  const flaky = {
+    ...f.db,
+    async writeTransaction(work) {
+      calls++;
+      if (calls === 1) throw new Error('fixture busy');
+      return f.db.writeTransaction(work);
+    },
+  };
+  const sync = f.buildSync({ db: flaky });
+  // resume 把单条失败收敛成「未完成」而不是抛出：调用方看 pending 决定是否重试。
+  const result = await sync.resume('b');
+  assert.equal(result.resumed, false);
+  assert.equal(result.pending, 2, '一条都没成功时两条都要留着');
+
+  const queue = sync.pendingList('b');
+  assert.equal(queue[0].sourceUid, 'a', '失败的那条仍应排在队首');
+  assert.equal(queue[0].at, 1, '原始 at 必须保留，不能被重写成当前时间');
+  assert.equal(queue[1].at, 2);
+});
+
+test('部分恢复成功时 resume 必须报告剩余条数，不能只报 resumed', async t => {
+  const f = await fixture(t);
+  await f.insert('task-a', 'a', { updated_at: 5, name: '甲任务' });
+  await f.insert('task-c', 'c', { updated_at: 5, name: '丙任务' });
+  writePending(f.mappingFile, [
+    { sourceUid: 'a', targetUid: 'b', mode: 'move', at: 1 },
+    { sourceUid: 'c', targetUid: 'b', mode: 'move', at: 2 },
+  ]);
+
+  // 第一条成功，第二条失败：resumed=true 但 pending 仍为 1。
+  let calls = 0;
+  const flaky = {
+    ...f.db,
+    async writeTransaction(work) {
+      calls++;
+      if (calls === 2) throw new Error('fixture busy');
+      return f.db.writeTransaction(work);
+    },
+  };
+  const sync = f.buildSync({ db: flaky });
+  const result = await sync.resume('b');
+  assert.equal(result.resumed, true, '前一条确实成功了');
+  assert.equal(result.drained, 1);
+  assert.equal(result.pending, 1, '剩余条数必须如实返回，调用方据此继续重试');
+  assert.equal(sync.pendingList('b').length, 1);
+});

@@ -545,7 +545,26 @@ function createOfficialAutomationSync(options = {}) {
     };
   }
 
-  async function reconcile(sourceValue, targetValue, modeValue, getPrefetch) {
+  // 把一条「待恢复意图」写进队列。重试时必须沿用原始 at：否则每次失败都会把
+  // 该条推到队尾，FIFO 顺序被反复打乱，早晚出现「新意图先跑、旧意图后跑」。
+  function writePendingIntent(sourceUid, targetUid, mode, options = {}) {
+    const mapping = readMapping(mappingFile);
+    const state = mapping.__syncState || {};
+    const normalized = (Array.isArray(state.pending) ? state.pending : []).map(normalizePending).filter(Boolean);
+    const existing = normalized.find(item => item.sourceUid === sourceUid && item.targetUid === targetUid);
+    const rest = normalized.filter(item => !(item.sourceUid === sourceUid && item.targetUid === targetUid));
+    if (rest.length >= PENDING_LIMIT) {
+      throw new Error(`定时任务待恢复队列已满（${PENDING_LIMIT} 条），请先完成现有恢复`);
+    }
+    const at = options.keepAt && existing ? existing.at : Date.now();
+    rest.push({ sourceUid, targetUid, mode, at });
+    rest.sort((a, b) => a.at - b.at);
+    mapping.__syncState = { ...state, pending: rest };
+    writeMapping(mappingFile, mapping);
+    return rest;
+  }
+
+  async function reconcile(sourceValue, targetValue, modeValue, getPrefetch, intent) {
     const sourceUid = cleanUid(sourceValue);
     const targetUid = cleanUid(targetValue);
     const mode = SYNC_MODES.has(modeValue) ? modeValue : resolveMode();
@@ -554,21 +573,11 @@ function createOfficialAutomationSync(options = {}) {
 
     // 阶段 A：先落盘恢复意图，再做任何数据库读取。这样「读取阶段就失败」
     // 也留下记录，restart 后能续做，不会把问题永久留给用户。
+    // 重试沿用原始 at（见 writePendingIntent），FIFO 顺序才稳定。
+    writePendingIntent(sourceUid, targetUid, mode, { keepAt: !!(intent && intent.keepAt) });
     const mapping = readMapping(mappingFile);
     const state = mapping.__syncState || {};
-    const held = Array.isArray(state.pending) ? state.pending : [];
-    const pendingList = held
-      .map(normalizePending)
-      .filter(Boolean)
-      .filter(item => !(item.sourceUid === sourceUid && item.targetUid === targetUid))
-      .sort((a, b) => a.at - b.at);
-    if (pendingList.length >= PENDING_LIMIT) {
-      throw new Error(`定时任务待恢复队列已满（${PENDING_LIMIT} 条），请先完成现有恢复`);
-    }
-    pendingList.push({ sourceUid, targetUid, mode, at: Date.now() });
-    const pending = pendingList;
-    mapping.__syncState = { ...state, pending };
-    writeMapping(mappingFile, mapping);
+    const pending = Array.isArray(state.pending) ? state.pending : [];
 
     // 没有回调式事务的后端无法保证「读取与写入同一事务」：updated_at 守卫与
     // retired 后置都依赖该保证，copy 与 move 一视同仁，一律拒绝降级路径。
@@ -628,27 +637,37 @@ function createOfficialAutomationSync(options = {}) {
   // 队列里的旧意图必须早于本次调用完成：否则「新 move 已成功、旧 copy 又反向
   // 执行」会把刚收敛的副本重新造出来（第三轮复审 P1）。drain 在串行链内部
   // 直接调 reconcile，不经过 sync()，避免重入自己造成死锁。
+  // 返回 { done, pending }：pending 是处理完后仍然排在该目标账号队列里的条数，
+  // 调用方必须据此判断「是否真的清空了」，不能只看 done。
   async function drainPending(targetUid, skip, getPrefetch) {
+    const isSkipped = item => !!(skip && item.sourceUid === skip.sourceUid && item.targetUid === skip.targetUid);
     const queue = readPendingList()
       .map(normalizePending)
       .filter(Boolean)
       .filter(item => item.targetUid === targetUid)
-      .filter(item => !(skip && item.sourceUid === skip.sourceUid && item.targetUid === skip.targetUid))
+      .filter(item => !isSkipped(item))
       .sort((a, b) => a.at - b.at);
     let done = 0;
     for (const item of queue) {
       try {
-        await reconcile(item.sourceUid, item.targetUid, item.mode, getPrefetch);
+        await reconcile(item.sourceUid, item.targetUid, item.mode, getPrefetch, { keepAt: true });
         done++;
       } catch (error) {
-        // 旧意图失败不阻断本次：记录仍在队列里，退避重试会继续尝试。
+        // 旧意图失败不阻断「队列里其它旧意图」的重试机会，但调用方不能在此基础上
+        // 继续执行新同步：那正是「新操作成功、旧操作随后反悔」的入口。
         if (typeof options.log === 'function') {
           options.log(`[automation-sync] 待恢复意图 ${item.sourceUid}->${item.targetUid} (${item.mode}) 失败: ${error.message}`);
         }
         break;
       }
     }
-    return done;
+    const pending = readPendingList()
+      .map(normalizePending)
+      .filter(Boolean)
+      .filter(item => item.targetUid === targetUid)
+      .filter(item => !isSkipped(item))
+      .length;
+    return { done, pending };
   }
 
   // Manual/automation switches can both reach this service; serialize them so
@@ -666,8 +685,21 @@ function createOfficialAutomationSync(options = {}) {
       // 先清该目标的旧意图（各自按记录里的原始 mode），再执行本次调用：
       // 最终状态由最新的用户意图决定，旧语义不会在新结果上反悔。
       const drained = await drainPending(target, { sourceUid: source, targetUid: target }, getPrefetch);
+      if (drained.pending > 0) {
+        // 旧账没还完：把本次意图排到队尾（保留 mode），交给恢复流程按顺序处理。
+        // 此时若继续执行，旧 copy 可能在新 move 成功后又跑一遍，把刚收敛的副本
+        // 重新造出来 —— 正是本轮要消除的路径。
+        writePendingIntent(source, target, resolved);
+        return {
+          mode: resolved,
+          copied: 0, updated: 0, moved: 0, removed: 0, skipped: 0, total: 0, conflicts: 0,
+          drained: drained.done,
+          deferred: true,
+          pending: sync.pendingList(target).length,
+        };
+      }
       const result = await reconcile(source, target, resolved, getPrefetch);
-      if (drained) result.drained = drained;
+      if (drained.done) result.drained = drained.done;
       return result;
     });
     tail = run.catch(() => {});
@@ -700,8 +732,8 @@ function createOfficialAutomationSync(options = {}) {
     if (!sync.pendingList(wanted).length) return { resumed: false, drained: 0, pending: 0 };
     const run = tail.then(async () => {
       const getPrefetch = makePrefetchCache();
-      const done = await drainPending(wanted, null, getPrefetch);
-      return { resumed: done > 0, drained: done, pending: sync.pendingList(wanted).length };
+      const drained = await drainPending(wanted, null, getPrefetch);
+      return { resumed: drained.done > 0, drained: drained.done, pending: drained.pending };
     });
     tail = run.catch(() => {});
     return run;

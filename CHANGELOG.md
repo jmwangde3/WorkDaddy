@@ -5,6 +5,34 @@
 
 格式参考 Keep a Changelog；版本号沿用 `scripts/daemon.js` 里的 `DAEMON_VERSION`。
 
+## [1.3.11] — 未发布（分支 `review/automation-drain-1.3.11`）
+
+第四轮独立复审对 1.3.10 判 NO-GO（P0 零项、P1 三项）。三条都成立，全部出在
+「恢复队列」这一层，与事务架构无关；本版只修这三处。
+
+### 修复
+
+- **旧欠账没还完就暂缓新同步（P1-A1）**：`drainPending()` 原先失败后只 `break`，
+  `sync()` 仍无条件执行本次 `reconcile`。于是「旧 `C→B/copy` 恢复失败 → 新
+  `A→B/move` 照常成功 → 下次恢复再把旧 copy 跑一遍」，本轮要消除的反向执行路径
+  还在。现在 `drainPending()` 返回 `{done, pending}`，只要该目标账号队列没清空，
+  本次同步就不执行：新意图用 `writePendingIntent()` 排到队尾，返回
+  `{deferred: true, pending}`，交给恢复流程按顺序处理。
+- **重试不再打乱 FIFO（P1-A2）**：`reconcile()` 重写 pending 时用的是 `Date.now()`，
+  一条失败记录会被推到队尾，下次排序就跑到更晚的意图后面。抽出
+  `writePendingIntent(source, target, mode, {keepAt})`：恢复路径传 `keepAt: true`
+  沿用原始 `at`，只有用户新发起的调用才取当前时间。
+- **部分恢复必须继续重试（P1-C）**：daemon 原先用 `if (result.resumed)` 判断完成，
+  而 `resume()` 在「前 2 条成功、第 3 条失败」时返回 `resumed: true, pending: 1`，
+  剩下那条就再也没人管。现在以 `pending === 0` 为唯一完成判据，只要还有剩余就重排
+  退避重试；异常路径也会带上剩余条数，不再出现「抛错就丢掉重试」。
+
+### 测试
+
+`test/official-automation-sync-guard.test.js` 增至 21 条，新增覆盖：旧欠账未清时
+新同步必须 `deferred` 且新意图排在队尾、重试保留原始 `at`、部分成功时
+`resume()` 必须如实返回 `pending`。
+
 ## [1.3.10] — 未发布（分支 `review/automation-order-1.3.10`）
 
 第三轮独立复审对 1.3.9 判 NO-GO（P0 零项、P1 三项）。事务与 retired 的核心边界已被

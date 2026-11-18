@@ -755,8 +755,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 //        起改用 1.3.x，避免与上游版本号混淆；合并上游 1.2.22 后仍保留本行。
 // 1.3.1：可靠性 + 安全加固（不新增功能）。tag、本常量、package.json 三者必须一致，
 //        release.yml 会当场比对，不一致就拒绝发布。
-const DAEMON_VERSION = '1.3.10';
-const DAEMON_BUILD_ID = 'release-1.3.10-full-fork';
+const DAEMON_VERSION = '1.3.11';
+const DAEMON_BUILD_ID = 'release-1.3.11-full-fork';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -8469,7 +8469,11 @@ async function resumeOfficialAccountAutomations(reason) {
     return result;
   } catch (error) {
     log(`[automation-sync] 恢复未完成的转移失败 (${reason}): ${error.message}`);
-    return { resumed: false, error: error.message };
+    let left = 0;
+    try {
+      left = (officialAutomationSyncEngine.pendingList(activeUid) || []).length;
+    } catch (_) {}
+    return { resumed: false, error: error.message, pending: left };
   }
 }
 
@@ -8510,6 +8514,14 @@ async function pumpAutomationResume(reason) {
     return { resumed: false, pending: pendingAll.length };
   }
   const result = await resumeOfficialAccountAutomations(reason);
+  // 「恢复了一部分」不等于「恢复完成」：只要队列里还有该账号的欠账，
+  // 就必须继续排下一次重试，否则剩下的那几条会一直躺着。
+  const left = Number(result && result.pending) || 0;
+  if (left > 0) {
+    automationResumeDelay = 5000;
+    scheduleAutomationResume(reason);
+    return result;
+  }
   if (result && result.resumed) { automationResumeDelay = 5000; return result; }
   scheduleAutomationResume(reason);
   return result;
