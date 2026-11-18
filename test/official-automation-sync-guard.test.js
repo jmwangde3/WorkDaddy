@@ -605,3 +605,67 @@ test('分组在同步期间被改名时整笔回滚', async t => {
   const row = (await f.live())[0];
   assert.equal(row.owner_user_id, 'a', '回滚后归属不变');
 });
+
+/* ===== 第六轮复审（P2-03 升级兼容 / P2-04 删除与改属）新增契约 ===== */
+
+test('1.3.12 遗留的无 seq 队列：升级后首次重试不换位，且迁移只发生一次', async t => {
+  const f = await fixture(t);
+  await f.insert('task-a', 'a', { updated_at: 5, name: '甲任务' });
+  await f.insert('task-c', 'c', { updated_at: 5, name: '丙任务' });
+  // 旧格式：at 相同（同一毫秒），没有 seq 字段。
+  fs.writeFileSync(f.mappingFile, JSON.stringify({
+    __syncState: {
+      snapshots: {}, retired: {},
+      pending: [
+        { sourceUid: 'a', targetUid: 'b', mode: 'move', at: 100 },
+        { sourceUid: 'c', targetUid: 'b', mode: 'move', at: 100 },
+      ],
+    },
+  }));
+
+  let calls = 0;
+  const flaky = {
+    ...f.db,
+    async writeTransaction(work) {
+      calls++;
+      if (calls === 1) throw new Error('fixture busy');
+      return f.db.writeTransaction(work);
+    },
+  };
+  const sync = f.buildSync({ db: flaky });
+  const first = await sync.resume('b');
+  assert.equal(first.resumed, false, '第一条失败，一条都没成功');
+
+  const migrated = sync.pendingList('b');
+  assert.deepEqual(migrated.map(i => i.sourceUid), ['a', 'c'], '升级后队首仍是 a');
+  assert.ok(migrated.every(i => i.seq > 0), '旧记录必须补上唯一序号');
+  assert.equal(new Set(migrated.map(i => i.seq)).size, 2, '序号不得重复');
+
+  // 再恢复一轮：必须仍然按 a → c 执行，并全部清空。
+  const second = await sync.resume('b');
+  assert.equal(second.drained, 2);
+  assert.equal(sync.pendingList('b').length, 0);
+});
+
+test('预取后目标分组被软删除或改属时整笔回滚', async t => {
+  for (const [label, mutate] of [
+    ['软删除', db => db.run('UPDATE spaces SET deleted_at = ? WHERE id = ?', [Date.now(), 'sp-b'])],
+    ['改属', db => db.run('UPDATE spaces SET user_id = ? WHERE id = ?', ['h', 'sp-b'])],
+  ]) {
+    const f = await fixture(t);
+    await f.space('sp-a', 'a', '工作区甲');
+    await f.space('sp-b', 'b', '工作区甲');
+    await f.insert('only', 'a', { updated_at: 3, space_id: 'sp-a' });
+
+    const racing = {
+      ...f.db,
+      async writeTransaction(work) {
+        await mutate(f.db);
+        return f.db.writeTransaction(work);
+      },
+    };
+    await assert.rejects(f.buildSync({ db: racing })('a', 'b'), /分组在同步期间被删除或改属/, `${label} 必须回滚`);
+    const row = (await f.live())[0];
+    assert.equal(row.owner_user_id, 'a', `${label} 后归属不变`);
+  }
+});

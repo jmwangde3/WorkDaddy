@@ -622,7 +622,20 @@ function createOfficialAutomationSync(options = {}) {
   function writePendingIntent(sourceUid, targetUid, mode, options = {}) {
     const mapping = readMapping(mappingFile);
     const state = mapping.__syncState || {};
-    const normalized = (Array.isArray(state.pending) ? state.pending : []).map(normalizePending).filter(Boolean);
+    const raw = Array.isArray(state.pending) ? state.pending : [];
+    const normalized = raw.map(normalizePending).filter(Boolean);
+    // 一次性迁移：1.3.12 及更早写下的队列没有 seq，全部读成 0，排序键完全相同，
+    // 重试「删旧记录再追加」会让它悄悄换位。按数组现有顺序补唯一序号，使升级
+    // 前后的 FIFO 完全一致。新旧混排时，缺号的排在已有号之后。
+    const allLegacy = normalized.every(item => !(item.seq > 0));
+    if (allLegacy) {
+      normalized.forEach((item, index) => { item.seq = index + 1; });
+    } else {
+      let maxSeq = normalized.reduce((max, item) => Math.max(max, item.seq), 0);
+      for (const item of normalized) {
+        if (!(item.seq > 0)) item.seq = ++maxSeq;
+      }
+    }
     const existing = normalized.find(item => item.sourceUid === sourceUid && item.targetUid === targetUid);
     const rest = normalized.filter(item => !(item.sourceUid === sourceUid && item.targetUid === targetUid));
     if (rest.length >= PENDING_LIMIT) {
