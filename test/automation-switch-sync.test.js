@@ -19,6 +19,9 @@ function harness() {
     dispatchAutomationEvent() {}, mainFrameNavigationSerial: 1,
     beginRendererReloadPriority: () => { reloadPriority++; return () => { reloadPriority--; }; },
     getAutoCopyRules: () => ({ allSessions: true }),
+    // 切片外的依赖：接管模式关着（否则不发上游复制任务），恢复泵在切号后必须被调用但不该阻塞断言。
+    getRehomeRunner: () => ({ readConfig: () => ({ enabled: false }) }),
+    pumpAutomationResume: async () => { ctx.pumpedAutomationResume = (ctx.pumpedAutomationResume || 0) + 1; },
     autoCopyJobs: new Map(), autoCopyQueue: [], autoCopyWorkerRunning: false,
     sessionCopyLocks: new Map(), sleep: tick,
     startAutoCopyJob: (_from, to) => {
