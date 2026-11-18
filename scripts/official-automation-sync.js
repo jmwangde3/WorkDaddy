@@ -624,18 +624,12 @@ function createOfficialAutomationSync(options = {}) {
     const state = mapping.__syncState || {};
     const raw = Array.isArray(state.pending) ? state.pending : [];
     const normalized = raw.map(normalizePending).filter(Boolean);
-    // 一次性迁移：1.3.12 及更早写下的队列没有 seq，全部读成 0，排序键完全相同，
-    // 重试「删旧记录再追加」会让它悄悄换位。按数组现有顺序补唯一序号，使升级
-    // 前后的 FIFO 完全一致。新旧混排时，缺号的排在已有号之后。
-    const allLegacy = normalized.every(item => !(item.seq > 0));
-    if (allLegacy) {
-      normalized.forEach((item, index) => { item.seq = index + 1; });
-    } else {
-      let maxSeq = normalized.reduce((max, item) => Math.max(max, item.seq), 0);
-      for (const item of normalized) {
-        if (!(item.seq > 0)) item.seq = ++maxSeq;
-      }
-    }
+    // 先按持久化顺序归一（at 优先，同 at 保持数组顺序），再把序号整体重排成 1..n。
+    // 三种队列都要照顾：纯旧格式（全无 seq）、纯新格式、以及 1.3.13 产生的混排
+    // （旧记录 seq=0 + 新记录 seq>0）。只给缺号记录补 max+1 会让旧记录跳到队尾，
+    // 恰好破坏它本来就在前面的 FIFO 顺序。
+    normalized.sort(byQueueOrder);
+    normalized.forEach((item, index) => { item.seq = index + 1; });
     const existing = normalized.find(item => item.sourceUid === sourceUid && item.targetUid === targetUid);
     const rest = normalized.filter(item => !(item.sourceUid === sourceUid && item.targetUid === targetUid));
     if (rest.length >= PENDING_LIMIT) {

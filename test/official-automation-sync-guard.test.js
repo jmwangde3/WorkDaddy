@@ -669,3 +669,41 @@ test('预取后目标分组被软删除或改属时整笔回滚', async t => {
     assert.equal(row.owner_user_id, 'a', `${label} 后归属不变`);
   }
 });
+
+test('新旧混合队列（旧记录 seq=0 + 新记录 seq>0）：迁移后仍按原顺序恢复', async t => {
+  const f = await fixture(t);
+  await f.insert('ta', 'a', { updated_at: 5, name: '甲任务' });
+  await f.insert('tc', 'c', { updated_at: 5, name: '丙任务' });
+  await f.insert('th', 'h', { updated_at: 5, name: '丁任务' });
+  // 1.3.13 的产物：两条旧记录 seq 缺失，一条新记录已经有 seq=1，at 全部相同。
+  fs.writeFileSync(f.mappingFile, JSON.stringify({
+    __syncState: {
+      snapshots: {}, retired: {},
+      pending: [
+        { sourceUid: 'a', targetUid: 'b', mode: 'move', at: 100 },
+        { sourceUid: 'c', targetUid: 'b', mode: 'move', at: 100 },
+        { sourceUid: 'h', targetUid: 'b', mode: 'move', at: 100, seq: 1 },
+      ],
+    },
+  }));
+
+  let calls = 0;
+  const flaky = {
+    ...f.db,
+    async writeTransaction(work) {
+      calls++;
+      if (calls === 1) throw new Error('fixture busy');
+      return f.db.writeTransaction(work);
+    },
+  };
+  const sync = f.buildSync({ db: flaky });
+  await sync.resume('b');
+
+  const queue = sync.pendingList('b');
+  assert.deepEqual(queue.map(i => i.sourceUid), ['a', 'c', 'h'], '旧记录不得被新记录挤出队首');
+  assert.deepEqual(queue.map(i => i.seq), [1, 2, 3], '序号必须整体重排成 1..n');
+
+  const second = await sync.resume('b');
+  assert.equal(second.drained, 3, '三条按顺序恢复');
+  assert.equal(sync.pendingList('b').length, 0);
+});
