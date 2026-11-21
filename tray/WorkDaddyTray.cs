@@ -24,6 +24,7 @@
 //   * 命令行动作（结果同时写入 %TEMP%\WorkDaddyTray-cli.txt，便于自动化验证）：
 //       --status / --selftest / --start / --stop / --restart / --autoon / --autooff
 //       --ports / --check-binding / --mutex-check / --mutex-hold
+//       --accounts（取数结果）/ --menu（真跑一遍二级菜单渲染，打印标题与每一项）
 //
 // 注意：C# 5 语法（Framework 4.0 自带编译器），不使用字符串插值 / ?. / out var。
 
@@ -2016,6 +2017,54 @@ namespace WorkDaddyTray
             return JsonDouble(usage, "used", out used) ? TrimNumber(used) : "-";
         }
 
+        // 把 /api/accounts 的返回解析成菜单行。后台刷新与 --menu 诊断共用同一份，
+        // 否则「诊断通过、菜单不对」这种假绿灯迟早会出现。
+        private static List<AccountRow> BuildAccountRows(Dictionary<string, object> root, out string currentNick)
+        {
+            currentNick = "";
+            List<AccountRow> rows = new List<AccountRow>();
+            if (root == null || !JsonBool(root, "ok")) return rows;
+
+            string currentUid = "";
+            object currObj;
+            if (root.TryGetValue("current", out currObj) && currObj != null)
+            {
+                Dictionary<string, object> curr = currObj as Dictionary<string, object>;
+                if (curr != null)
+                {
+                    currentUid = JsonString(curr, "uid");
+                    currentNick = JsonString(curr, "nickname");
+                }
+            }
+            object acctsObj;
+            if (root.TryGetValue("accounts", out acctsObj) && acctsObj != null)
+            {
+                List<object> list = acctsObj as List<object>;
+                if (list != null)
+                {
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        Dictionary<string, object> acct = list[i] as Dictionary<string, object>;
+                        if (acct == null) continue;
+                        string uid = JsonString(acct, "uid");
+                        string nick = JsonString(acct, "nickname");
+                        if (string.IsNullOrEmpty(nick)) nick = uid;
+                        bool isCurrent = !string.IsNullOrEmpty(currentUid) && uid == currentUid;
+                        if (isCurrent && !string.IsNullOrEmpty(nick)) currentNick = nick;
+                        AccountRow row = new AccountRow();
+                        row.Uid = uid;
+                        row.Nick = nick;
+                        row.CreditsText = FormatCredits(acct);
+                        row.UsedText = FormatUsed(acct);
+                        row.IsCurrent = isCurrent;
+                        row.Valid = !string.IsNullOrEmpty(uid);
+                        rows.Add(row);
+                    }
+                }
+            }
+            return rows;
+        }
+
         // 60 秒节流：每次悬停都打一次 5s 超时的接口，daemon 一挂就会让菜单明显迟滞。
         private static void RequestAccountsRefreshThrottled()
         {
@@ -2038,51 +2087,8 @@ namespace WorkDaddyTray
                 string errText = null;
                 try
                 {
-                    Dictionary<string, object> root = FetchAccounts();
-                    if (root == null || !JsonBool(root, "ok"))
-                    {
-                        errText = "账号列表暂时不可用";
-                    }
-                    else
-                    {
-                        string currentUid = "";
-                        object currObj;
-                        if (root.TryGetValue("current", out currObj) && currObj != null)
-                        {
-                            Dictionary<string, object> curr = currObj as Dictionary<string, object>;
-                            if (curr != null)
-                            {
-                                currentUid = JsonString(curr, "uid");
-                                currentNick = JsonString(curr, "nickname");
-                            }
-                        }
-                        object acctsObj;
-                        if (root.TryGetValue("accounts", out acctsObj) && acctsObj != null)
-                        {
-                            List<object> list = acctsObj as List<object>;
-                            if (list != null)
-                            {
-                                for (int i = 0; i < list.Count; i++)
-                                {
-                                    Dictionary<string, object> acct = list[i] as Dictionary<string, object>;
-                                    if (acct == null) continue;
-                                    string uid = JsonString(acct, "uid");
-                                    string nick = JsonString(acct, "nickname");
-                                    if (string.IsNullOrEmpty(nick)) nick = uid;
-                                    bool isCurrent = !string.IsNullOrEmpty(currentUid) && uid == currentUid;
-                                    if (isCurrent && !string.IsNullOrEmpty(nick)) currentNick = nick;
-                                    AccountRow row = new AccountRow();
-                                    row.Uid = uid;
-                                    row.Nick = nick;
-                                    row.CreditsText = FormatCredits(acct);
-                                    row.UsedText = FormatUsed(acct);
-                                    row.IsCurrent = isCurrent;
-                                    row.Valid = !string.IsNullOrEmpty(uid);
-                                    rows.Add(row);
-                                }
-                            }
-                        }
-                    }
+                    rows = BuildAccountRows(FetchAccounts(), out currentNick);
+                    if (rows.Count == 0) errText = "账号列表暂时不可用";
                 }
                 catch { errText = "账号列表暂时不可用"; }
 
@@ -2616,6 +2622,36 @@ namespace WorkDaddyTray
                     }
                     break;
 
+                case "--menu":
+                    // 真造一份 s_accounts 并调真正的 RenderAccountsMenu(true)：菜单展开
+                    // 那一下无法在无点击环境里触发，这里把同一段渲染代码跑一遍，
+                    // 验收标题行、项数、每项文字与可用态（当前账号必须不可点）。
+                    string menuCurNick;
+                    List<AccountRow> menuRows = BuildAccountRows(FetchAccounts(), out menuCurNick);
+                    if (menuRows.Count == 0)
+                    {
+                        sb.AppendLine("menu       : （账号列表暂时不可用）");
+                        break;
+                    }
+                    s_accountsCache = menuRows;
+                    s_currentNick = menuCurNick;
+                    s_accounts = new ToolStripMenuItem();
+                    RenderAccountsMenu(true);
+                    sb.AppendLine("title      : " + s_accounts.Text);
+                    sb.AppendLine("items      : " + s_accounts.DropDownItems.Count);
+                    for (int i = 0; i < s_accounts.DropDownItems.Count; i++)
+                    {
+                        ToolStripMenuItem mi = s_accounts.DropDownItems[i] as ToolStripMenuItem;
+                        if (mi == null)
+                        {
+                            sb.AppendLine("item       : (分隔线)");
+                            continue;
+                        }
+                        sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                            "item       : {0} | {1}", mi.Enabled ? "可点" : "灰", mi.Text));
+                    }
+                    break;
+
                 case "--selftest":
                     sb.AppendLine("=== WorkDaddyTray.exe self-test ===");
                     sb.AppendLine("exe        : " + Application.ExecutablePath);
@@ -2664,7 +2700,7 @@ namespace WorkDaddyTray
                     break;
                 default:
                     sb.AppendLine("unknown action: " + action);
-                    sb.AppendLine("valid: --status --ports --selftest --start --stop --restart --autoon --autooff --check-binding --mutex-check");
+                    sb.AppendLine("valid: --status --ports --accounts --menu --selftest --start --stop --restart --autoon --autooff --check-binding --mutex-check");
                     break;
             }
             Emit(sb.ToString());
