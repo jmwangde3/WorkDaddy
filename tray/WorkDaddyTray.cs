@@ -2577,6 +2577,45 @@ namespace WorkDaddyTray
                     sb.AppendLine("source     : " + s_bindingSource);
                     break;
 
+                case "--accounts":
+                    // 与二级菜单同一套取数与格式化：无 UI 环境下也能验收
+                    // 「余额/今日已用到底显示成什么」，也方便排查菜单里为什么是 "-"。
+                    sb.AppendLine("endpoint   : " + DaemonUri + "/api/accounts");
+                    Dictionary<string, object> accountsRoot = FetchAccounts();
+                    if (accountsRoot == null || !JsonBool(accountsRoot, "ok"))
+                    {
+                        sb.AppendLine("menu       : （账号列表暂时不可用）");
+                        break;
+                    }
+                    string accountsCurUid = "";
+                    object accountsCurObj;
+                    if (accountsRoot.TryGetValue("current", out accountsCurObj) && accountsCurObj != null)
+                    {
+                        Dictionary<string, object> accountsCur = accountsCurObj as Dictionary<string, object>;
+                        if (accountsCur != null) accountsCurUid = JsonString(accountsCur, "uid");
+                    }
+                    object accountsListObj;
+                    accountsRoot.TryGetValue("accounts", out accountsListObj);
+                    List<object> accountsList = accountsListObj as List<object>;
+                    if (accountsList == null || accountsList.Count == 0)
+                    {
+                        sb.AppendLine("menu       : （账号列表暂时不可用）");
+                        break;
+                    }
+                    for (int i = 0; i < accountsList.Count; i++)
+                    {
+                        Dictionary<string, object> acct = accountsList[i] as Dictionary<string, object>;
+                        if (acct == null) continue;
+                        string uid = JsonString(acct, "uid");
+                        string nick = JsonString(acct, "nickname");
+                        if (string.IsNullOrEmpty(nick)) nick = uid;
+                        bool isCur = !string.IsNullOrEmpty(accountsCurUid) && uid == accountsCurUid;
+                        sb.AppendLine("menu       : " + (isCur ? "✓ " : "") +
+                            string.Format(CultureInfo.InvariantCulture, "{0}   余 {1}   今日 {2}",
+                                nick, FormatCredits(acct), FormatUsed(acct)));
+                    }
+                    break;
+
                 case "--selftest":
                     sb.AppendLine("=== WorkDaddyTray.exe self-test ===");
                     sb.AppendLine("exe        : " + Application.ExecutablePath);
