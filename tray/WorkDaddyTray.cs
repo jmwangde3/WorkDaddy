@@ -24,7 +24,7 @@
 //   * 命令行动作（结果同时写入 %TEMP%\WorkDaddyTray-cli.txt，便于自动化验证）：
 //       --status / --selftest / --start / --stop / --restart / --autoon / --autooff
 //       --ports / --check-binding / --mutex-check / --mutex-hold
-//       --accounts（取数结果）/ --menu（真跑一遍二级菜单渲染，打印标题与每一项）
+//       --accounts（取数结果）/ --menu（真跑一遍二级菜单渲染）/ --switch-probe（切号传输面）
 //
 // 注意：C# 5 语法（Framework 4.0 自带编译器），不使用字符串插值 / ?. / out var。
 
@@ -2185,28 +2185,21 @@ namespace WorkDaddyTray
             s_switchErrText = null;
             Thread worker = new Thread(delegate()
             {
+                string okNick;
+                string errText;
                 try
                 {
-                    string body = "{\"uid\":\"" + uid.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\",\"reload\":true}";
-                    Dictionary<string, object> resp = SimpleJson.ParseObject(PostJson("/api/switch", body));
-                    if (resp != null && JsonBool(resp, "ok"))
-                    {
-                        string respNick = JsonString(resp, "nickname");
-                        s_switchOkText = string.IsNullOrEmpty(respNick) ? nickDisplay : respNick;
-                        s_switchResult = 1;
-                    }
-                    else
-                    {
-                        string reason = resp != null ? JsonString(resp, "error") : "";
-                        s_switchErrText = string.IsNullOrEmpty(reason) ? "请求未成功" : reason;
-                        s_switchResult = -1;
-                    }
+                    errText = SwitchAccountPost(uid, true, out okNick);
                 }
                 catch (Exception ex)
                 {
-                    s_switchErrText = string.IsNullOrEmpty(ex.Message) ? "网络或服务异常" : ex.Message;
-                    s_switchResult = -1;
+                    errText = string.IsNullOrEmpty(ex.Message) ? "网络或服务异常" : ex.Message;
+                    okNick = "";
                 }
+                if (errText == null) okNick = string.IsNullOrEmpty(okNick) ? nickDisplay : okNick;
+                s_switchOkText = okNick;
+                s_switchErrText = errText;
+                s_switchResult = errText == null ? 1 : -1;
             });
             worker.IsBackground = true;
             try { worker.Start(); }
@@ -2215,6 +2208,25 @@ namespace WorkDaddyTray
                 s_switchErrText = ex.Message;
                 s_switchResult = -1;
             }
+        }
+
+        // POST /api/switch 的传输与错误面：切号 worker 与 --switch-probe 共用，
+        // 否则「探测通过、真切失败」或反之都查不出来。
+        // 返回 null 表示服务端回了 ok=true，此时 okNick 是服务端确认的昵称；
+        // 否则返回可直接展示的错误文本（含服务端正文，不是光秃秃的 HTTP 状态）。
+        private static string SwitchAccountPost(string uid, bool reload, out string okNick)
+        {
+            okNick = "";
+            string body = "{\"uid\":\"" + uid.Replace("\\", "\\\\").Replace("\"", "\\\"")
+                + "\",\"reload\":" + (reload ? "true" : "false") + "}";
+            Dictionary<string, object> resp = SimpleJson.ParseObject(PostJson("/api/switch", body));
+            if (resp != null && JsonBool(resp, "ok"))
+            {
+                okNick = JsonString(resp, "nickname");
+                return null;
+            }
+            string reason = resp != null ? JsonString(resp, "error") : "";
+            return string.IsNullOrEmpty(reason) ? "请求未成功" : reason;
         }
 
         private static string OpenPageTip()
@@ -2652,6 +2664,17 @@ namespace WorkDaddyTray
                     }
                     break;
 
+                case "--switch-probe":
+                    // 空 uid 会被服务端在动手之前挡掉（缺字段），所以这条探测只验证
+                    // 传输面：路径、token 头、JSON 体、以及错误正文有没有被读出来。
+                    // 绝不用真实 uid：那会真的切号。
+                    string probeNick;
+                    string probeErr = SwitchAccountPost("", false, out probeNick);
+                    sb.AppendLine("endpoint   : " + DaemonUri + "/api/switch");
+                    sb.AppendLine("rejected   : " + (probeErr != null ? "yes" : "no"));
+                    sb.AppendLine("error      : " + (probeErr == null ? "(无)" : probeErr));
+                    break;
+
                 case "--selftest":
                     sb.AppendLine("=== WorkDaddyTray.exe self-test ===");
                     sb.AppendLine("exe        : " + Application.ExecutablePath);
@@ -2700,7 +2723,7 @@ namespace WorkDaddyTray
                     break;
                 default:
                     sb.AppendLine("unknown action: " + action);
-                    sb.AppendLine("valid: --status --ports --accounts --menu --selftest --start --stop --restart --autoon --autooff --check-binding --mutex-check");
+                    sb.AppendLine("valid: --status --ports --accounts --menu --switch-probe --selftest --start --stop --restart --autoon --autooff --check-binding --mutex-check");
                     break;
             }
             Emit(sb.ToString());

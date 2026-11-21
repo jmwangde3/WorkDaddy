@@ -14,9 +14,19 @@
 - 托盘右键菜单增加**「切换账号」二级菜单**：每行显示 `昵称  余 <余额>  今日 <已用>`，当前账号带 `✓` 且不可点；点击其它账号先弹确认框（默认「否」），确认后调 `POST /api/switch`（带 `x-workdaddy-token`，body `{uid, reload:true}`），后台线程执行、结果由 2s 心跳收口并气泡提示；末尾有「刷新账号与积分」。数据来自 `GET /api/accounts`，余额取 `credits`（`creditUnlimited` 显示 `∞`），今日已用取 `todayUsage.used`，缺失一律显示 `-`。展开时先用缓存渲染，再按 60s 节流异步刷新；菜单展开期间不重建 `DropDownItems`（WinForms 会抛 items are being displayed），刷新结果留到下次展开生效。
 - 托盘右键菜单增加**「启动 WorkBuddy 时自动开 CDP」**开关：写用户级环境变量 `WORKBUDDY_REMOTE_DEBUGGING_PORT`（值 = 当前 profile 的 CDP 端口）。WorkBuddy 的 `app.asar` 在 `applyCliCommandLineSwitches` 里读这个变量，纯数字就 `appendSwitch('remote-debugging-port')` 并配好 `remote-allow-origins`，因此**从开始菜单/任务栏/桌面启动的 WorkBuddy 都会自带调试端口**，不必再「重开窗口」。关闭时写空串（客户端正则不匹配即忽略）。默认关闭：调试端口对本机进程开放，是否开启由用户决定。
 
+### 诊断入口（验收用，不影响托盘行为）
+
+菜单展开那一下在无点击环境里没法触发，所以把同一段代码搬出来跑：
+
+- `--accounts`：只打印取数结果（每行 `昵称 余 X 今日 Y`），与菜单同一套 `FormatCredits`/`FormatUsed`。
+- `--menu`：真造一个 `ToolStripMenuItem` 当 `s_accounts`，调**真正的** `RenderAccountsMenu(true)`，打印标题行、项数、每项的可用态与文字。实测输出 4 个账号（当前账号带 `✓` 且置灰）+ 分隔线 + 刷新项。
+- `--switch-probe`：用空 uid 打 `POST /api/switch`。服务端在动手前就以 `缺少 uid` 挡回，所以这条只验证传输面（路径、token 头、JSON 体、**错误正文有没有被读出来**，而不是只剩「远程服务器返回错误」），不会真的切号。
+
 ### 验证
 
-- `test/tray-build.test.js`、`tray-launch-chain`、`tray-ports-binding`、`tray-profile-mutex`、`tray-stop-ownership` 全绿；`installer/build-tray.ps1 -Verify` 自检通过。
+- `test/tray-build.test.js`、`tray-launch-chain`、`tray-ports-binding`、`tray-profile-mutex`、`tray-stop-ownership`、`fork-sync-contract`、`package-hygiene` 全绿；`installer/build-tray.ps1 -Verify` 自检通过。
+- 实机 `--menu`：`切换账号（当前: 157****5718）` / 4 项 / `✓ 157****5718 余 2178.45 今日 -`（置灰）、`166****8966 余 2499.47 今日 305.98`、`王冠林michael 余 3119.54 今日 -`、`153****2997 余 3752.16 今日 0`。
+- 实机 `--switch-probe`：`rejected: yes` / `error: 缺少 uid`（证明 token 与错误正文链路都通）。
 
 ## [1.3.15] — 未发布（分支 `review/automation-renumber-1.3.15`）
 
