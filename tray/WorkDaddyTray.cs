@@ -1794,8 +1794,14 @@ namespace WorkDaddyTray
             s_accounts.ToolTipText = "全部可切换账号；显示余额与今日已用，点击即切换（会先确认）";
             s_accounts.DropDownOpening += delegate
             {
-                RenderAccountsMenu(true);
-                RequestAccountsRefreshThrottled();
+                // 菜单展开路径无法被单测覆盖，任何异常冒出去都会让托盘整只退出，
+                // 这里整体兜底：宁可二级菜单空着，也不能把托盘弄崩。
+                try
+                {
+                    RenderAccountsMenu(true);
+                    RequestAccountsRefreshThrottled();
+                }
+                catch { }
             };
             s_menu.Items.Add(s_accounts);
             s_menu.Items.Add(new ToolStripSeparator());
@@ -2110,7 +2116,7 @@ namespace WorkDaddyTray
                 : "切换账号（当前: " + s_currentNick + "）";
 
             try { s_accounts.DropDownItems.Clear(); }
-            catch (InvalidOperationException) { return; }
+            catch (Exception) { return; }
             if (s_accountsCache == null || s_accountsCache.Count == 0)
             {
                 ToolStripMenuItem empty = new ToolStripMenuItem("（账号列表暂时不可用）");
