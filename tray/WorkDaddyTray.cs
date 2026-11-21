@@ -6,7 +6,8 @@
 //
 // 功能：
 //   * 托盘图标（绿=运行中 / 灰=已停止 / 橙=切换中），运行时绘制，无外部 .ico
-//   * 右键菜单：状态 / 启动 / 关闭 / 重启 / 恢复 CDP / 开机自启动 / 打开管理页 / 退出托盘
+//   * 右键菜单：状态 / 启动 / 关闭 / 重启 / 恢复 CDP / 自动开 CDP / 开机自启动 /
+//     切换账号（二级菜单：账号名 · 余额 · 今日已用，点击即切号）/ 打开管理页 / 退出托盘
 //   * 单实例 Mutex：已在运行时再启动一次静默退出（不弹「已在运行」模态框）
 //   * 桌面快捷方式 WorkDaddy.lnk 直接指向本 exe —— 托盘就是唯一入口；
 //     安装器不再生成 launcher-hidden.vbs 那条 wscript 链
@@ -123,6 +124,7 @@ namespace WorkDaddyTray
         private static ToolStripMenuItem s_stop;
         private static ToolStripMenuItem s_restart;
         private static ToolStripMenuItem s_cdp;
+        private static ToolStripMenuItem s_cdpAuto;
         private static ToolStripMenuItem s_auto;
         private static ToolStripMenuItem s_open;
         private static volatile bool s_busy;
@@ -134,6 +136,33 @@ namespace WorkDaddyTray
         private static bool s_waitingCdp;
         private static int s_cdpWaitTicks;
         private static volatile bool s_cdpRequestFailed;
+
+        // ---------- 切换账号二级菜单 ----------
+        // 账号行的不可变快照：后台线程构建、主线程消费，控件只在 UI 线程被碰。
+        private sealed class AccountRow
+        {
+            public string Uid;
+            public string Nick;
+            public string CreditsText;
+            public string UsedText;
+            public bool IsCurrent;
+            public bool Valid;
+        }
+
+        private static ToolStripMenuItem s_accounts;
+        private static List<AccountRow> s_accountsCache = new List<AccountRow>();
+        private static string s_currentNick = "";
+        private static long s_accountsFetchedAt;
+        private static volatile bool s_accountsLoading;
+        private static volatile bool s_hasPendingAccounts;
+        private static List<AccountRow> s_pendingAccounts;
+        private static string s_pendingCurrentNick;
+        private static string s_pendingAccountsError;
+        // 切号独立于 RunBusy：全局 s_busy 会把整份菜单锁住，切号只是菜单里的一个动作。
+        private static volatile bool s_switching;
+        private static int s_switchResult;            // 0=进行中 1=成功 -1=失败
+        private static string s_switchOkText;
+        private static string s_switchErrText;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool AttachConsole(int dwProcessId);
@@ -1673,6 +1702,39 @@ namespace WorkDaddyTray
             catch { return false; }
         }
 
+        // ---------- 让 WorkBuddy 启动即自带调试端口（环境变量法，免重开窗口）----------
+        // 客户端 app.asar 的 applyCliCommandLineSwitches 会读 WORKBUDDY_REMOTE_DEBUGGING_PORT，
+        // 值满足「纯数字」时就 appendSwitch('remote-debugging-port', 值)，并把
+        // remote-allow-origins 一并配好。所以把它写进**用户级**环境变量后，用户从
+        // 开始菜单 / 任务栏 / 桌面怎么启动都会自带 CDP，不再需要「重开窗口」那一步。
+        // 关闭时写空串而不是删键：空串不匹配数字规则，客户端等价于没设置；
+        // 而 .NET 的 SetEnvironmentVariable(..., User) 写完会广播 WM_SETTINGCHANGE，
+        // 资源管理器能立即拿到新值（删键没有等价的托管 API 能保证广播）。
+        private const string CdpAutoEnvName = "WORKBUDDY_REMOTE_DEBUGGING_PORT";
+
+        private static bool CdpAutoEnabled()
+        {
+            try
+            {
+                string value = Environment.GetEnvironmentVariable(CdpAutoEnvName, EnvironmentVariableTarget.User);
+                if (string.IsNullOrEmpty(value)) return false;
+                int port;
+                return int.TryParse(value.Trim(), out port) && port > 0 && port <= 65535;
+            }
+            catch { return false; }
+        }
+
+        private static bool SetCdpAuto(bool on)
+        {
+            try
+            {
+                string value = on ? CdpPort.ToString(CultureInfo.InvariantCulture) : "";
+                Environment.SetEnvironmentVariable(CdpAutoEnvName, value, EnvironmentVariableTarget.User);
+                return CdpAutoEnabled() == on;
+            }
+            catch { return false; }
+        }
+
         // ------------------------------------------------------------ 图标
         private static Icon NewDotIcon(Color fill)
         {
@@ -1715,10 +1777,27 @@ namespace WorkDaddyTray
             s_stop = AddItem("关闭 WorkDaddy", "停止 watchdog + daemon，保留全部账号与会话数据");
             s_restart = AddItem("重启 WorkDaddy", "先停止再启动");
             s_cdp = AddItem("恢复 CDP（会重开 WorkBuddy 窗口）", "POST /api/client/relaunch，带调试端口重开 WorkBuddy");
+            // WorkBuddy 自己会读 WORKBUDDY_REMOTE_DEBUGGING_PORT（见 app.asar 的
+            // applyCliCommandLineSwitches）：非空且为数字就 appendSwitch remote-debugging-port。
+            // 把它写进用户级环境变量后，用户从开始菜单/任务栏/桌面怎么开都自带调试端口，
+            // 不必再靠「重开窗口」；代价是本机进程都能连这个调试端口，所以默认关闭、由用户显式开启。
+            s_cdpAuto = AddItem("启动 WorkBuddy 时自动开 CDP", "写入用户级环境变量 WORKBUDDY_REMOTE_DEBUGGING_PORT；对之后启动的 WorkBuddy 生效，无需重开窗口");
+            s_cdpAuto.Checked = CdpAutoEnabled();
             s_menu.Items.Add(new ToolStripSeparator());
 
             s_auto = AddItem("开机自启动", "开关 HKCU Run；开启后登录时自动启动托盘并拉起 WorkDaddy");
             s_auto.Checked = GetAutoStart();
+            s_menu.Items.Add(new ToolStripSeparator());
+
+            // 账号二级菜单：展开时先用缓存渲染（首帧不空白），再异步刷新。
+            s_accounts = new ToolStripMenuItem("切换账号");
+            s_accounts.ToolTipText = "全部可切换账号；显示余额与今日已用，点击即切换（会先确认）";
+            s_accounts.DropDownOpening += delegate
+            {
+                RenderAccountsMenu(true);
+                RequestAccountsRefreshThrottled();
+            };
+            s_menu.Items.Add(s_accounts);
             s_menu.Items.Add(new ToolStripSeparator());
 
             // 管理页地址必须跟着当前 profile 的实际 UI 端口：写死 47832 的话，
@@ -1742,6 +1821,20 @@ namespace WorkDaddyTray
                 }, "已请求恢复 CDP；WorkBuddy 将重开，约 1 分钟，完成后会再提示");
             };
             s_open.Click += delegate { OpenPage(); };
+            s_cdpAuto.Click += delegate
+            {
+                bool target = !CdpAutoEnabled();
+                bool actual = SetCdpAuto(target);
+                s_cdpAuto.Checked = actual;
+                if (!actual)
+                {
+                    ShowBalloon("自动开 CDP 设置失败（写用户环境变量被拒绝）", ToolTipIcon.Warning);
+                    return;
+                }
+                ShowBalloon(target
+                    ? "已开启：之后启动的 WorkBuddy 会自动带调试端口；当前窗口仍要重开一次才生效"
+                    : "已关闭：WorkBuddy 启动时不再自动带调试端口", ToolTipIcon.Info);
+            };
             s_auto.Click += delegate
             {
                 bool target = !GetAutoStart();
@@ -1767,6 +1860,349 @@ namespace WorkDaddyTray
                 else RunBusy(StartWd, StartOkText, delegate { return s_startError; });
             };
             s_notify.BalloonTipClicked += delegate { OpenPage(); };
+        }
+
+        // ---------------------------------------------------- 切换账号（二级菜单）
+        // 数据源：GET /api/accounts（需 x-workdaddy-token）。返回里每个账号带
+        // credits（余额，null 表示无限制/未知）、creditUnlimited、todayUsage.used（今日已用）。
+        // 这些字段可能整体缺失，缺了显示 "-"，绝不显示 null / NaN。
+        private static Dictionary<string, object> FetchAccounts()
+        {
+            if (!DaemonRunning()) return null;
+            int port = DaemonPort;
+            if (port <= 0) port = FindDaemonPort();
+            if (port <= 0) return null;
+            try
+            {
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + "/api/accounts");
+                req.Method = "GET";
+                req.Timeout = 5000;
+                req.ReadWriteTimeout = 5000;
+                req.Proxy = null;
+                string token = ReadApiToken();
+                if (!string.IsNullOrEmpty(token)) req.Headers["x-workdaddy-token"] = token;
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (Stream stream = resp.GetResponseStream())
+                using (StreamReader sr = new StreamReader(stream, Encoding.UTF8))
+                {
+                    return SimpleJson.ParseObject(sr.ReadToEnd());
+                }
+            }
+            catch { return null; }
+        }
+
+        // 4xx/5xx 的正文里带 ok=false 与 error 字段：直接让 GetResponse 抛异常
+        // 就只剩「远程服务器返回错误」，用户看不到真正原因，所以先读错误流再抛。
+        private static string PostJson(string path, string body)
+        {
+            int port = DaemonPort;
+            if (port <= 0) port = FindDaemonPort();
+            if (port <= 0) throw new InvalidOperationException("未找到可用的后台端口");
+
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + path);
+            req.Method = "POST";
+            req.ContentType = "application/json; charset=utf-8";
+            req.Timeout = 20000;
+            req.ReadWriteTimeout = 20000;
+            req.Proxy = null;
+            string token = ReadApiToken();
+            if (!string.IsNullOrEmpty(token)) req.Headers["x-workdaddy-token"] = token;
+
+            byte[] payload = Encoding.UTF8.GetBytes(body ?? "{}");
+            req.ContentLength = payload.Length;
+            using (Stream reqStream = req.GetRequestStream())
+            {
+                reqStream.Write(payload, 0, payload.Length);
+            }
+            try
+            {
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (Stream stream = resp.GetResponseStream())
+                using (StreamReader sr = new StreamReader(stream, Encoding.UTF8))
+                {
+                    return sr.ReadToEnd();
+                }
+            }
+            catch (WebException ex)
+            {
+                if (ex.Response != null)
+                {
+                    try
+                    {
+                        using (Stream errStream = ex.Response.GetResponseStream())
+                        using (StreamReader er = new StreamReader(errStream, Encoding.UTF8))
+                        {
+                            string text = er.ReadToEnd();
+                            if (!string.IsNullOrEmpty(text)) return text;
+                        }
+                    }
+                    catch { }
+                }
+                throw;
+            }
+        }
+
+        private static string JsonString(Dictionary<string, object> dict, string key)
+        {
+            if (dict == null || string.IsNullOrEmpty(key)) return "";
+            object val;
+            if (!dict.TryGetValue(key, out val) || val == null) return "";
+            return Convert.ToString(val, CultureInfo.InvariantCulture);
+        }
+
+        private static bool JsonBool(Dictionary<string, object> dict, string key)
+        {
+            if (dict == null) return false;
+            object val;
+            if (!dict.TryGetValue(key, out val) || val == null) return false;
+            if (val is bool) return (bool)val;
+            bool parsed;
+            return bool.TryParse(val.ToString(), out parsed) && parsed;
+        }
+
+        private static bool JsonDouble(Dictionary<string, object> dict, string key, out double result)
+        {
+            result = 0;
+            if (dict == null) return false;
+            object val;
+            if (!dict.TryGetValue(key, out val) || val == null) return false;
+            if (val is double)
+            {
+                double d = (double)val;
+                if (double.IsNaN(d) || double.IsInfinity(d)) return false;
+                result = d;
+                return true;
+            }
+            if (val is int || val is long || val is float || val is decimal)
+            {
+                result = Convert.ToDouble(val, CultureInfo.InvariantCulture);
+                return true;
+            }
+            double parsed;
+            if (!double.TryParse(val.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out parsed)) return false;
+            if (double.IsNaN(parsed) || double.IsInfinity(parsed)) return false;
+            result = parsed;
+            return true;
+        }
+
+        private static string TrimNumber(double value)
+        {
+            string text = Math.Round(value, 2).ToString("0.##", CultureInfo.InvariantCulture);
+            return string.IsNullOrEmpty(text) || text == "-0" ? "0" : text;
+        }
+
+        private static string FormatCredits(Dictionary<string, object> acct)
+        {
+            if (acct == null) return "-";
+            double credits;
+            if (!JsonDouble(acct, "credits", out credits)) return JsonBool(acct, "creditUnlimited") ? "∞" : "-";
+            return TrimNumber(credits);
+        }
+
+        private static string FormatUsed(Dictionary<string, object> acct)
+        {
+            if (acct == null) return "-";
+            object usageObj;
+            if (!acct.TryGetValue("todayUsage", out usageObj) || usageObj == null) return "-";
+            Dictionary<string, object> usage = usageObj as Dictionary<string, object>;
+            if (usage == null) return "-";
+            double used;
+            return JsonDouble(usage, "used", out used) ? TrimNumber(used) : "-";
+        }
+
+        // 60 秒节流：每次悬停都打一次 5s 超时的接口，daemon 一挂就会让菜单明显迟滞。
+        private static void RequestAccountsRefreshThrottled()
+        {
+            if (s_accountsFetchedAt != 0)
+            {
+                long age = unchecked((long)Environment.TickCount - s_accountsFetchedAt);
+                if (age >= 0 && age < 60000) return;
+            }
+            RequestAccountsRefresh();
+        }
+
+        private static void RequestAccountsRefresh()
+        {
+            if (s_accountsLoading) return;
+            s_accountsLoading = true;
+            Thread worker = new Thread(delegate()
+            {
+                List<AccountRow> rows = new List<AccountRow>();
+                string currentNick = "";
+                string errText = null;
+                try
+                {
+                    Dictionary<string, object> root = FetchAccounts();
+                    if (root == null || !JsonBool(root, "ok"))
+                    {
+                        errText = "账号列表暂时不可用";
+                    }
+                    else
+                    {
+                        string currentUid = "";
+                        object currObj;
+                        if (root.TryGetValue("current", out currObj) && currObj != null)
+                        {
+                            Dictionary<string, object> curr = currObj as Dictionary<string, object>;
+                            if (curr != null)
+                            {
+                                currentUid = JsonString(curr, "uid");
+                                currentNick = JsonString(curr, "nickname");
+                            }
+                        }
+                        object acctsObj;
+                        if (root.TryGetValue("accounts", out acctsObj) && acctsObj != null)
+                        {
+                            List<object> list = acctsObj as List<object>;
+                            if (list != null)
+                            {
+                                for (int i = 0; i < list.Count; i++)
+                                {
+                                    Dictionary<string, object> acct = list[i] as Dictionary<string, object>;
+                                    if (acct == null) continue;
+                                    string uid = JsonString(acct, "uid");
+                                    string nick = JsonString(acct, "nickname");
+                                    if (string.IsNullOrEmpty(nick)) nick = uid;
+                                    bool isCurrent = !string.IsNullOrEmpty(currentUid) && uid == currentUid;
+                                    if (isCurrent && !string.IsNullOrEmpty(nick)) currentNick = nick;
+                                    AccountRow row = new AccountRow();
+                                    row.Uid = uid;
+                                    row.Nick = nick;
+                                    row.CreditsText = FormatCredits(acct);
+                                    row.UsedText = FormatUsed(acct);
+                                    row.IsCurrent = isCurrent;
+                                    row.Valid = !string.IsNullOrEmpty(uid);
+                                    rows.Add(row);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch { errText = "账号列表暂时不可用"; }
+
+                s_pendingAccounts = rows;
+                s_pendingCurrentNick = currentNick;
+                s_pendingAccountsError = errText;
+                s_hasPendingAccounts = true;
+                s_accountsLoading = false;
+            });
+            worker.IsBackground = true;
+            try { worker.Start(); }
+            catch { s_accountsLoading = false; }
+        }
+
+        // 只在 UI 线程调用：重建二级项、改文本。
+        private static void RenderAccountsMenu()
+        {
+            RenderAccountsMenu(false);
+        }
+
+        // force=true 用于 DropDownOpening（这一刻集合还没显示，必须重建出内容）；
+        // 刷新回填走 force=false：菜单正展开时清空并重建 ToolStripItem 集合，WinForms
+        // 会抛 InvalidOperationException（items are being displayed）。此时数据已经落到
+        // s_accountsCache，下次展开自然会用上，没必要冒险动集合。
+        private static void RenderAccountsMenu(bool force)
+        {
+            if (s_accounts == null) return;
+            if (!force && s_accounts.DropDown != null && s_accounts.DropDown.Visible) return;
+            s_accounts.Text = string.IsNullOrEmpty(s_currentNick)
+                ? "切换账号"
+                : "切换账号（当前: " + s_currentNick + "）";
+
+            try { s_accounts.DropDownItems.Clear(); }
+            catch (InvalidOperationException) { return; }
+            if (s_accountsCache == null || s_accountsCache.Count == 0)
+            {
+                ToolStripMenuItem empty = new ToolStripMenuItem("（账号列表暂时不可用）");
+                empty.Enabled = false;
+                s_accounts.DropDownItems.Add(empty);
+            }
+            else
+            {
+                for (int i = 0; i < s_accountsCache.Count; i++)
+                {
+                    AccountRow row = s_accountsCache[i];
+                    if (row == null) continue;
+                    string nick = string.IsNullOrEmpty(row.Nick) ? row.Uid : row.Nick;
+                    string creditsText = string.IsNullOrEmpty(row.CreditsText) ? "-" : row.CreditsText;
+                    string usedText = string.IsNullOrEmpty(row.UsedText) ? "-" : row.UsedText;
+                    string label = (row.IsCurrent ? "✓ " : "")
+                        + string.Format(CultureInfo.InvariantCulture, "{0}   余 {1}   今日 {2}", nick, creditsText, usedText);
+
+                    ToolStripMenuItem item = new ToolStripMenuItem(label);
+                    item.ToolTipText = "uid: " + row.Uid + "\n昵称: " + nick + "\n余额: " + creditsText
+                        + "\n今日已用: " + usedText + "\n" + (row.IsCurrent ? "当前账号" : "点击切换");
+                    // 当前账号点自己没意义；切号进行中也不许再点（防并发）。
+                    item.Enabled = !row.IsCurrent && row.Valid && !s_switching;
+
+                    string capUid = row.Uid;
+                    string capNick = nick;
+                    string capCredits = creditsText;
+                    string capUsed = usedText;
+                    bool capCurrent = row.IsCurrent;
+                    item.Click += delegate
+                    {
+                        if (capCurrent || s_switching) return;
+                        BeginSwitchAccount(capUid, capNick, capCredits, capUsed);
+                    };
+                    s_accounts.DropDownItems.Add(item);
+                }
+            }
+            s_accounts.DropDownItems.Add(new ToolStripSeparator());
+            ToolStripMenuItem refresh = new ToolStripMenuItem("刷新账号与积分");
+            refresh.Enabled = !s_accountsLoading;
+            refresh.Click += delegate { RequestAccountsRefresh(); };
+            s_accounts.DropDownItems.Add(refresh);
+        }
+
+        private static void BeginSwitchAccount(string uid, string nick, string creditsText, string usedText)
+        {
+            if (s_switching || s_busy || string.IsNullOrEmpty(uid)) return;
+            string nickDisplay = string.IsNullOrEmpty(nick) ? uid : nick;
+            string confirmText = "切换到「" + nickDisplay + "」？\n"
+                + "余额 " + creditsText + " · 今日已用 " + usedText + "\n"
+                + "切换会刷新 WorkBuddy 窗口，未保存的输入可能丢失。是否继续？";
+            DialogResult dr = MessageBox.Show(confirmText, "切换账号", MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (dr != DialogResult.Yes) return;
+            if (s_switching) return;
+
+            s_switching = true;
+            s_switchResult = 0;
+            s_switchOkText = null;
+            s_switchErrText = null;
+            Thread worker = new Thread(delegate()
+            {
+                try
+                {
+                    string body = "{\"uid\":\"" + uid.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\",\"reload\":true}";
+                    Dictionary<string, object> resp = SimpleJson.ParseObject(PostJson("/api/switch", body));
+                    if (resp != null && JsonBool(resp, "ok"))
+                    {
+                        string respNick = JsonString(resp, "nickname");
+                        s_switchOkText = string.IsNullOrEmpty(respNick) ? nickDisplay : respNick;
+                        s_switchResult = 1;
+                    }
+                    else
+                    {
+                        string reason = resp != null ? JsonString(resp, "error") : "";
+                        s_switchErrText = string.IsNullOrEmpty(reason) ? "请求未成功" : reason;
+                        s_switchResult = -1;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    s_switchErrText = string.IsNullOrEmpty(ex.Message) ? "网络或服务异常" : ex.Message;
+                    s_switchResult = -1;
+                }
+            });
+            worker.IsBackground = true;
+            try { worker.Start(); }
+            catch (Exception ex)
+            {
+                s_switchErrText = ex.Message;
+                s_switchResult = -1;
+            }
         }
 
         private static string OpenPageTip()
@@ -1812,6 +2248,50 @@ namespace WorkDaddyTray
             s_open.Enabled = run;
             s_open.ToolTipText = OpenPageTip();
             s_auto.Checked = GetAutoStart();
+            if (s_cdpAuto != null) s_cdpAuto.Checked = CdpAutoEnabled();
+            if (s_accounts != null) s_accounts.Enabled = run;
+
+            // 后台拉取的账号快照在这里收口：控件只在 UI 线程改。
+            if (s_hasPendingAccounts)
+            {
+                s_hasPendingAccounts = false;
+                string pendingErr = s_pendingAccountsError;
+                List<AccountRow> pendingRows = s_pendingAccounts;
+                string pendingNick = s_pendingCurrentNick;
+                s_pendingAccounts = null;
+                s_pendingCurrentNick = null;
+                s_pendingAccountsError = null;
+                if (string.IsNullOrEmpty(pendingErr) && pendingRows != null)
+                {
+                    s_accountsCache = pendingRows;
+                    s_currentNick = pendingNick == null ? "" : pendingNick;
+                    s_accountsFetchedAt = unchecked((long)Environment.TickCount);
+                }
+                RenderAccountsMenu();
+            }
+
+            // 切号结果同样在心跳里收口，保证弹窗/气泡都在 UI 线程。
+            if (s_switchResult != 0)
+            {
+                int result = s_switchResult;
+                string okNick = s_switchOkText;
+                string errMsg = s_switchErrText;
+                s_switchResult = 0;
+                s_switchOkText = null;
+                s_switchErrText = null;
+                s_switching = false;
+                if (result > 0)
+                {
+                    if (!string.IsNullOrEmpty(okNick)) s_currentNick = okNick;
+                    RenderAccountsMenu();
+                    ShowBalloon("已切换到 " + (okNick == null ? "" : okNick), ToolTipIcon.Info);
+                }
+                else
+                {
+                    ShowBalloon("切换失败: " + (string.IsNullOrEmpty(errMsg) ? "未知错误" : errMsg), ToolTipIcon.Warning);
+                }
+                RequestAccountsRefresh();
+            }
         }
 
         private static string StartOkText()

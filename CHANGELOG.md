@@ -5,6 +5,19 @@
 
 格式参考 Keep a Changelog；版本号沿用 `scripts/daemon.js` 里的 `DAEMON_VERSION`。
 
+## [1.3.16] — 未发布
+
+只改托盘（`tray/WorkDaddyTray.cs` + 重编 `tray/WorkDaddyTray.exe`），daemon 无 API 变更。
+
+### 新增
+
+- 托盘右键菜单增加**「切换账号」二级菜单**：每行显示 `昵称  余 <余额>  今日 <已用>`，当前账号带 `✓` 且不可点；点击其它账号先弹确认框（默认「否」），确认后调 `POST /api/switch`（带 `x-workdaddy-token`，body `{uid, reload:true}`），后台线程执行、结果由 2s 心跳收口并气泡提示；末尾有「刷新账号与积分」。数据来自 `GET /api/accounts`，余额取 `credits`（`creditUnlimited` 显示 `∞`），今日已用取 `todayUsage.used`，缺失一律显示 `-`。展开时先用缓存渲染，再按 60s 节流异步刷新；菜单展开期间不重建 `DropDownItems`（WinForms 会抛 items are being displayed），刷新结果留到下次展开生效。
+- 托盘右键菜单增加**「启动 WorkBuddy 时自动开 CDP」**开关：写用户级环境变量 `WORKBUDDY_REMOTE_DEBUGGING_PORT`（值 = 当前 profile 的 CDP 端口）。WorkBuddy 的 `app.asar` 在 `applyCliCommandLineSwitches` 里读这个变量，纯数字就 `appendSwitch('remote-debugging-port')` 并配好 `remote-allow-origins`，因此**从开始菜单/任务栏/桌面启动的 WorkBuddy 都会自带调试端口**，不必再「重开窗口」。关闭时写空串（客户端正则不匹配即忽略）。默认关闭：调试端口对本机进程开放，是否开启由用户决定。
+
+### 验证
+
+- `test/tray-build.test.js`、`tray-launch-chain`、`tray-ports-binding`、`tray-profile-mutex`、`tray-stop-ownership` 全绿；`installer/build-tray.ps1 -Verify` 自检通过。
+
 ## [1.3.15] — 未发布（分支 `review/automation-renumber-1.3.15`）
 
 第七轮验收对 1.3.14 判 NO-GO（明确「不是 P0/P1」），只卡混合队列的序号重排。
