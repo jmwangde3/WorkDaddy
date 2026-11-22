@@ -48,3 +48,30 @@ test('check-in iteration freezes cached expiry order, remains sequential and lea
   await automation.executeTask({ id: 'other', steps: [{ op: 'account.forEach', accounts: 'all', steps: [] }] }, options);
   assert.equal(sorts, 1);
 });
+
+test('isStale：老文件按 mtime 判新旧，查不到钱的空壳永远算过期', t => {
+  const { root } = fixture(t);
+  const file = path.join(root, 'account-credit-cache.json');
+  fs.writeFileSync(file, JSON.stringify({ old: { credits: 10, creditSegments: [] }, fresh: { credits: 10, creditSegments: [] } }));
+  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(file, tenMinutesAgo, tenMinutesAgo);
+  const stale = createAccountCreditCache(root);
+  assert.equal(stale.isStale('old', 5 * 60 * 1000), true);
+  assert.equal(stale.isStale('missing', 5 * 60 * 1000), true);
+
+  fs.utimesSync(file, new Date(), new Date());
+  const fresh = createAccountCreditCache(root);
+  assert.equal(fresh.isStale('fresh', 5 * 60 * 1000), false);
+
+  const { cache } = fixture(t);
+  const now = Date.now();
+  cache.set('edge', { credits: 1, segments: [] }, now);
+  assert.equal(cache.isStale('edge', 1000, now + 999), false);
+  assert.equal(cache.isStale('edge', 1000, now + 1000), true);
+  cache.set('nullish', { credits: null, unlimited: false, segments: [] }, now);
+  assert.equal(cache.isStale('nullish', 5 * 60 * 1000, now), true);
+  cache.set('unlimited', { credits: null, unlimited: true, segments: [] }, now);
+  assert.equal(cache.isStale('unlimited', 5 * 60 * 1000, now), false);
+  assert.equal(cache.get('unlimited').credits, null);
+  assert.equal(cache.get('unlimited').creditUnlimited, true);
+});

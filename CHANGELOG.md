@@ -7,7 +7,11 @@
 
 ## [1.3.16] — 未发布
 
-只改托盘（`tray/WorkDaddyTray.cs` + 重编 `tray/WorkDaddyTray.exe`），daemon 无 API 变更。
+托盘新增账号二级菜单与 CDP 开关；daemon 侧补一条「按需补拉积分缓存」（接口字段不变）。
+
+### 修复
+
+- **托盘读不到当前账号余额，必须重启才读出**：`GET /api/accounts` 只回放 `accountCreditCache`，而唯一写这个缓存的是 `POST /api/credits` —— 只有注入面板在调。于是面板一打开就有数，托盘却只能显示 `-`，直到面板拉过一次或 daemon 重启重读缓存文件。现在 `/api/accounts` 先按 TTL 补拉缺失/过期的账号：5 分钟 TTL、并发 2、单 uid 在途去重、整体预算 2.5s（托盘请求超时 5s，留足余量），当前账号排最前；超预算先返回已有缓存、剩余在后台补齐；身份过期/401 直接跳过，绝不把 `credits: null` 写进去覆盖旧值。缓存条目新增 `updatedAt`，老文件没有该字段时回退到文件 mtime，既不会把老条目全当新鲜、也不会全当过期。实测：删掉当前账号缓存条目并重启 daemon，第一次 `GET /api/accounts` 用 0.39s 自动补到 `credits=2131.3`，第二次 0.011s（TTL 命中）。
 
 ### 新增
 
@@ -25,6 +29,8 @@
 ### 验证
 
 - `test/tray-build.test.js`、`tray-launch-chain`、`tray-ports-binding`、`tray-profile-mutex`、`tray-stop-ownership`、`fork-sync-contract`、`package-hygiene` 全绿；`installer/build-tray.ps1 -Verify` 自检通过。
+- 新增 `test/account-credit-warm.test.js`（8 条）：只补缺失/过期、当前账号优先、补齐后 TTL 内不再补、并发峰值 ≤2、同 uid 在途只发一次、超预算先返回且后台补完、401 不覆盖旧值、过期账号与无 token 备份直接跳过。
+- `test/account-credit-cache.test.js` 增补 `isStale`：老文件按 mtime 判新旧、TTL 边界、`credits: null` 判过期而 `creditUnlimited` 不算。
 - 实机 `--menu`：`切换账号（当前: 157****5718）` / 4 项 / `✓ 157****5718 余 2178.45 今日 -`（置灰）、`166****8966 余 2499.47 今日 305.98`、`王冠林michael 余 3119.54 今日 -`、`153****2997 余 3752.16 今日 0`。
 - 实机 `--switch-probe`：`rejected: yes` / `error: 缺少 uid`（证明 token 与错误正文链路都通）。
 

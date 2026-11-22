@@ -36,6 +36,7 @@ const { createSessionPinSync, readPinsInRenderer, applyPinsInRenderer } = requir
 const { installChildLifecycle } = require('./lifecycle-child.js');
 const {createCodeBuddyFiles} = require('./codebuddy-files.js');
 const { createAccountCreditCache } = require('./account-credit-cache.js');
+const { createAccountCreditWarmer } = require('./account-credit-warm.js');
 const { spawn, spawnSync, execFile } = require('child_process');
 const { createWallpaperRotation, updateWallpaperInRenderer, pickWallpaperDirectory } = require('./wallpaper-rotation');
 const {
@@ -482,6 +483,24 @@ function codeBuddyForeignOwnerIds() {
 }
 const codeBuddyNative = PROFILE.kind === 'codebuddy' ? createCodeBuddyNative({profile: PROFILE, WebSocketCtor}) : null;
 const accountCreditCache = createAccountCreditCache(DATA_DIR);
+// /api/accounts 只回放上面的缓存；唯一写它的是 /api/credits（只有注入面板在调）。
+// 面板没打开过、或刚切到新账号时，托盘菜单就只剩 "-"。这个 warmer 负责按 TTL 补拉。
+const accountCreditWarmer = createAccountCreditWarmer({
+  cache: accountCreditCache,
+  fetchCredits,
+  readBackup: (uid) => {
+    const file = accountBackupFile(uid);
+    if (!fs.existsSync(file)) return null;
+    const j = wdCompatDecryptAuthJson(JSON.parse(fs.readFileSync(file, 'utf8'))); // [wd-compat]
+    return { token: wdCompatAuthToken(j.auth), account: j.account };
+  },
+  isExpired: (account) => isAccountIdentityExpired(account),
+  currentUid: () => {
+    const current = currentAccount();
+    return current && current.uid ? String(current.uid) : '';
+  },
+  log,
+});
 const thirdPartyModels = createThirdPartyImport({ targetFile: workbuddyModelsFile(), dataDir: DATA_DIR });
 const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.existsSync(accountBackupFile(uid)));
 // 版本号：改动 daemon/inject/theme-patches/builtin 资产后递增，launcher 检测到运行中版本不一致会强制用 app 内置代码重启
@@ -11987,12 +12006,19 @@ function handleApi(req, res) {
     const checkinAutomationEnabled = readCurrentAutomations().some(task => task.enabled && stepsContainCheckin(task.steps));
     const cache = loadCheckinCache();
     const today = todayStr();
-    return CREDIT_USAGE_STORE.listDailyCheckins(accounts.map((a) => a.uid), today)
-      .catch((error) => {
-        log('[checkin] 读取 SQLite 标记失败: ' + error.message);
-        return {};
-      })
-      .then((dbCheckins) => {
+    return Promise.all([
+      CREDIT_USAGE_STORE.listDailyCheckins(accounts.map((a) => a.uid), today)
+        .catch((error) => {
+          log('[checkin] 读取 SQLite 标记失败: ' + error.message);
+          return {};
+        }),
+      // 缺失/过期的余额在这里补：托盘只读这个接口，不补就永远是 "-"。
+      // 预算、并发、在途去重都在 warmer 里；失败只记日志，不影响下面的 200。
+      accountCreditWarmer.warm(accounts).catch((error) => {
+        log('[credits] 按需补拉异常: ' + error.message);
+      }),
+    ])
+      .then(([dbCheckins]) => {
         const enriched = accounts.map((a) => {
           const c = dbCheckins[a.uid] || cache[a.uid];
           const checked = c && c.ok && (c.verified === true || classifyCheckinResult({ httpOk: true, code: c.code, message: c.message }).ok)
